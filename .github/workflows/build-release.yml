@@ -40,7 +40,7 @@ jobs:
         id: build
         run: |
           python3 build.py
-          asset="opencode-config-editor-${version}.py"
+          asset="opencode-config-editor-${{ steps.meta.outputs.version }}.py"
           cp opencode-config-editor.py "$asset"
           echo "asset_path=$asset" >> "$GITHUB_OUTPUT"
           echo "Generated $asset ($(wc -l < "$asset") lines)"
