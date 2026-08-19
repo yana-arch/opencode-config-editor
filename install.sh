@@ -1,63 +1,118 @@
 #!/bin/bash
 set -euo pipefail
 
+# ============================================================
+# opencode-config-editor installer
+# Tải release mới nhất từ GitHub, di chuyển vào /opt và cài đặt.
+#
+# Cách dùng:
+#   curl -fsSL https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh | sudo bash
+#   hoặc: sudo bash install.sh
+#
+# Tuỳ biến:
+#   REPO=<owner/repo> bash install.sh    # đổi nguồn tải (mặc định yana-arch/opencode-config-editor)
+#   VERSION=<x.y.z>    bash install.sh   # cài phiên bản cụ thể thay vì mới nhất
+#   NO_DEPS=1          bash install.sh   # bỏ qua cài python3/pyside6
+# ============================================================
+
 APP_NAME="opencode-editor"
+BIN_NAME="opencode-editor"
 INSTALL_DIR="/opt/$APP_NAME"
-VERSION="4.0.0"
-SOURCE_FILE="opencode-config-editor.py"
+DESKTOP_NAME="$APP_NAME.desktop"
 
-echo "Đang cài đặt $APP_NAME v$VERSION..."
+# Nguồn tải mặc định
+REPO="${REPO:-yana-arch/opencode-config-editor}"
+VERSION="${VERSION:-latest}"
+NO_DEPS="${NO_DEPS:-0}"
 
-# 1. Kiểm tra quyền root
-if [[ $EUID -ne 0 ]]; then
-  echo "Vui lòng chạy script này với quyền sudo (ví dụ: sudo bash install.sh)."
-  exit 1
-fi
-
-# 2. Cài đặt Python và PySide6 (Dependencies)
-echo "Đang kiểm tra và cài đặt phụ thuộc hệ thống..."
-if command -v pacman &> /dev/null; then
-    echo "OK"
-    # pacman -S python python3-pyside6
-elif command -v apt &> /dev/null; then
-    apt update && apt install -y python3 python3-pyside6
-elif command -v dnf &> /dev/null; then
-    dnf install -y python3 python3-pyside6
-else
-    echo "Cảnh báo: Không tìm thấy trình quản lý gói phổ biến. Hãy cài đặt python3-pyside6 thủ công."
-fi
-
-# 3. Thiết lập thư mục cài đặt
-echo "Đang thiết lập thư mục tại $INSTALL_DIR..."
-mkdir -p "$INSTALL_DIR"
-mkdir -p "/usr/local/bin"
-
-# Copy file v4 vào thư mục cài đặt
-if [[ -f "$SOURCE_FILE" ]]; then
-    cp "$SOURCE_FILE" "$INSTALL_DIR/main.py"
-    echo "Đã copy $SOURCE_FILE vào hệ thống."
-else
-    echo "Lỗi: Không tìm thấy file $SOURCE_FILE. Hãy đảm bảo bạn đang chạy script này bên trong thư mục chứa code."
+# ---------- Hàm ----------
+die() {
+    echo "Lỗi: $*" >&2
     exit 1
-fi
+}
 
-chmod +x "$INSTALL_DIR/main.py"
+banner() {
+    echo "========================================================"
+    echo " opencode-config-editor — Installer"
+    echo " Repo   : $REPO"
+    echo " Version: $VERSION"
+    echo "========================================================"
+}
 
-# 4. Tạo script khởi chạy nhanh (Wrapper)
-echo "Đang tạo lệnh khởi chạy nhanh '/usr/local/bin/$APP_NAME'..."
-cat << EOF > /usr/local/bin/$APP_NAME
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        die "Vui lòng chạy script với quyền root (sudo bash install.sh)."
+    fi
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+get_latest_version() {
+    # Lấy tag mới nhất từ GitHub API
+    local url="https://api.github.com/repos/$REPO/releases/latest"
+    local tag
+    tag=$(curl -fsSL "$url" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+    [[ -n "$tag" ]] || die "Không lấy được phiên bản mới nhất từ $url"
+    echo "${tag#v}"
+}
+
+install_deps() {
+    if [[ "$NO_DEPS" == "1" ]]; then
+        echo "(bỏ qua cài phụ thuộc theo NO_DEPS=1)"
+        return
+    fi
+    echo "Đang cài phụ thuộc: python3, python3-pyside6..."
+    if have pacman; then
+        pacman -Sy --noconfirm python python-pyside6
+    elif have apt; then
+        apt update && apt install -y python3 python3-pyside6
+    elif have dnf; then
+        dnf install -y python3 python3-pyside6
+    elif have zypper; then
+        zypper --non-interactive install python3 python3-PySide6
+    else
+        echo "Cảnh báo: Không tìm thấy trình quản lý gói. Hãy tự cài python3 và PySide6."
+    fi
+}
+
+download() {
+    # Tải file release về thư mục tạm. Hỗ trợ 'latest' hoặc phiên bản cụ thể.
+    local ver="$1"
+    local dest="$2"
+    local tag="v$ver"
+    local url
+    if [[ "$ver" == "latest" ]]; then
+        ver="$(get_latest_version)"
+        tag="v$ver"
+    fi
+    url="https://github.com/$REPO/releases/download/$tag/opencode-config-editor-$ver.py"
+    echo "Đang tải: $url"
+    curl -fL --retry 3 -o "$dest" "$url" \
+        || die "Tải file thất bại. Kiểm tra tag $tag và asset 'opencode-config-editor-$ver.py' có tồn tại."
+}
+
+install_files() {
+    local src="$1"
+    mkdir -p "$INSTALL_DIR" /usr/local/bin
+    cp "$src" "$INSTALL_DIR/main.py"
+    chmod +x "$INSTALL_DIR/main.py"
+
+    # Wrapper
+    cat > /usr/local/bin/$BIN_NAME <<EOF
 #!/bin/bash
-python3 $INSTALL_DIR/main.py "\$PWD"
+exec python3 $INSTALL_DIR/main.py "\$PWD"
 EOF
-chmod +x /usr/local/bin/$APP_NAME
+    chmod +x /usr/local/bin/$BIN_NAME
 
-# 5. Tạo Shortcut ứng dụng (.desktop)
-echo "Đang tạo Shortcut trong Menu ứng dụng..."
-cat << EOF | tee /usr/share/applications/$APP_NAME.desktop > /dev/null
+    # Shortcut .desktop
+    cat > /usr/share/applications/$DESKTOP_NAME <<EOF
 [Desktop Entry]
 Name=OpenCode Config Editor
-Comment=Chỉnh sửa cấu hình opencode.json và tui.json
-Exec=$APP_NAME
+Name[vi]=Trình sửa cấu hình OpenCode
+Comment=Edit opencode.json and tui.json
+Exec=$BIN_NAME
 Icon=preferences-system
 Terminal=false
 Type=Application
@@ -65,9 +120,27 @@ Categories=Development;Settings;
 Keywords=opencode;config;json;
 EOF
 
-echo "-------------------------------------------------------"
-echo "Cài đặt hoàn tất thành công!"
-echo "Cách sử dụng:"
-echo "1. Mở Terminal và gõ: $APP_NAME"
-echo "2. Hoặc tìm 'OpenCode Config Editor' trong danh sách ứng dụng."
-echo "-------------------------------------------------------"
+    rm -f "$src"
+}
+
+# ---------- Chạy ----------
+banner
+check_root
+
+have curl || die "Cần 'curl' để tải release (cài: apt/pacman/dnf install curl)."
+install_deps
+
+echo "Đang chuẩn bị tải..."
+TMP_FILE="$(mktemp /tmp/$APP_NAME.XXXXXX.py)"
+trap 'rm -f "$TMP_FILE"' EXIT
+download "$VERSION" "$TMP_FILE"
+
+echo "Đang cài đặt vào $INSTALL_DIR ..."
+install_files "$TMP_FILE"
+
+echo "--------------------------------------------------------"
+echo "Cài đặt hoàn tất!"
+echo "Cách dùng:"
+echo "  1. Gõ lệnh:  $BIN_NAME"
+echo "  2. Hoặc tìm 'OpenCode Config Editor' trong menu ứng dụng."
+echo "--------------------------------------------------------"

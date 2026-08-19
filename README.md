@@ -32,13 +32,19 @@ phải sửa JSON thủ công, với hỗ trợ xác thực theo schema, import/
 
 ## Cài đặt
 
-### Cách 1: Cài đặt hệ thống (khuyến nghị)
+### Cách 1: Tự tải release từ GitHub (khuyến nghị)
+
+`install.sh` tự tải release mới nhất từ GitHub về, di chuyển vào `/opt/opencode-editor/`,
+tạo lệnh `opencode-editor` và shortcut trong menu ứng dụng:
 
 ```bash
-# 1. Build file duy nhất từ các module trong src/
-python3 build.py
+curl -fsSL https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh | sudo bash
+```
 
-# 2. Cài đặt (cần quyền root)
+Hoặc tải script về rồi chạy:
+
+```bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh
 sudo bash install.sh
 ```
 
@@ -48,9 +54,22 @@ Sau khi cài đặt, chạy bằng lệnh:
 opencode-editor
 ```
 
-hoặc tìm "OpenCode Config Editor" trong menu ứng dụng (file `.desktop` được tạo tự động).
+hoặc tìm "OpenCode Config Editor" trong menu ứng dụng.
 
-### Cách 2: Chạy trực tiếp (không cài đặt)
+**Tuỳ biến cài đặt:**
+
+```bash
+# Cài từ repo khác
+REPO=<owner/repo> sudo bash install.sh
+
+# Cài phiên bản cụ thể (mặc định: mới nhất)
+VERSION=4.0.0 sudo bash install.sh
+
+# Bỏ qua cài đặt phụ thuộc
+NO_DEPS=1 sudo bash install.sh
+```
+
+### Cách 2: Build thủ công từ mã nguồn
 
 ```bash
 pip install PySide6
@@ -90,19 +109,30 @@ python3 opencode-config-editor.py
 │   ├── 04_main_window.py     # Cửa sổ chính (menu, toolbar, logic save/load)
 │   └── 05_main.py            # Điểm vào (entrypoint)
 ├── build.py                  # Ghép các module src/ thành một file duy nhất
-├── install.sh                # Script cài đặt hệ thống
+├── install.sh                # Script tự tải release từ GitHub và cài đặt
+├── .github/workflows/        # GitHub Actions: build + release tự động
 ├── opencode-config-editor.py # File đã build (đầu ra của build.py)
 └── .archives/                # Các phiên bản cũ (v1 → v4)
 ```
 
-## Build
+## Build & Release (CI/CD)
+
+GitHub Actions tự động build file và tạo **GitHub Release** khi bạn đẩy tag:
 
 ```bash
-python3 build.py
+git tag v4.0.0
+git push origin v4.0.0
 ```
 
-Script `build.py` ghép các file trong `src/` theo thứ tự khai báo trong `ORDER`
-thành một file `opencode-config-editor.py` duy nhất, thuận tiện để phân phối và chạy.
+- Workflow: `.github/workflows/build-release.yml`
+- Chạy `python3 build.py`, đóng gói asset `opencode-config-editor-<version>.py`
+  kèm `CHANGELOG.md` / `CHANGELOG_EN.md`.
+- Cũng có thể kích hoạt thủ công từ tab **Actions** → *Build & Release* → *Run workflow*
+  (lúc đó asset được đính kèm dạng artifact, không phải release).
+
+> **Ghi chú**: Workflow dùng `github.repository` tự động nên không cần cấu hình thêm.
+> Nguồn tải mặc định của `install.sh` là `yana-arch/opencode-config-editor`; nếu fork,
+> đặt biến `REPO` khi chạy để trỏ tới repo của bạn.
 
 ## Xác thực schema
 

@@ -1,0 +1,65 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release asset
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      asset_path: ${{ steps.build.outputs.asset_path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Derive version
+        id: meta
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-$(date +%Y%m%d%H%M%S)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version=$version"
+
+      - name: Build single-file script
+        id: build
+        run: |
+          python3 build.py
+          asset="opencode-config-editor-${version}.py"
+          cp opencode-config-editor.py "$asset"
+          echo "asset_path=$asset" >> "$GITHUB_OUTPUT"
+          echo "Generated $asset ($(wc -l < "$asset") lines)"
+
+      - name: Upload artifact (workflow_dispatch)
+        uses: actions/upload-artifact@v4
+        if: github.ref_type != 'tag'
+        with:
+          name: opencode-config-editor
+          path: ${{ steps.build.outputs.asset_path }}
+
+      - name: Upload asset to GitHub Release (tagged)
+        uses: softprops/action-gh-release@v2
+        if: github.ref_type == 'tag'
+        with:
+          name: opencode-config-editor ${{ steps.meta.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.build.outputs.asset_path }}
+            CHANGELOG.md
+            CHANGELOG_EN.md

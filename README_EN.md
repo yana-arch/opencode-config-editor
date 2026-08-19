@@ -33,25 +33,44 @@ and advanced model management.
 
 ## Installation
 
-### Option 1: System-wide Installation (Recommended)
+### Option 1: Auto-download release from GitHub (Recommended)
+
+`install.sh` downloads the latest GitHub release, moves it to `/opt/opencode-editor/`,
+and creates the `opencode-editor` command plus a desktop menu shortcut:
 
 ```bash
-# 1. Build the single-file executable from modules in src/
-python3 build.py
+curl -fsSL https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh | sudo bash
+```
 
-# 2. Install (requires root privileges)
+Or download the script first, then run it:
+
+```bash
+curl -fsSL -o install.sh https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh
 sudo bash install.sh
 ```
 
-After installation, run the application using:
+After installation, launch the app with:
 
 ```bash
 opencode-editor
 ```
 
-Or find "OpenCode Config Editor" in your application menu (a `.desktop` entry is created automatically).
+or find "OpenCode Config Editor" in your application menu.
 
-### Option 2: Run Without Installation
+**Customization:**
+
+```bash
+# Install from a different repo
+REPO=<owner/repo> sudo bash install.sh
+
+# Install a specific version (default: latest)
+VERSION=4.0.0 sudo bash install.sh
+
+# Skip dependency installation
+NO_DEPS=1 sudo bash install.sh
+```
+
+### Option 2: Build from source manually
 
 ```bash
 pip install PySide6
@@ -59,6 +78,7 @@ python3 build.py
 python3 opencode-config-editor.py
 ```
 
+## Usage
 ## Usage
 
 1. Launch the app. Use the **Mode** selector in the toolbar:
@@ -91,19 +111,30 @@ python3 opencode-config-editor.py
 │   ├── 04_main_window.py     # Main window logic (menus, toolbar, save/load)
 │   └── 05_main.py            # Application entry point
 ├── build.py                  # Script to bundle src/ modules into one file
-├── install.sh                # System installation script
+├── install.sh                # Script to download release from GitHub and install
+├── .github/workflows/        # GitHub Actions: automated build + release
 ├── opencode-config-editor.py # Built executable (output of build.py)
 └── .archives/                # Legacy versions (v1 to v4)
 ```
 
-## Build Process
+## Build & Release (CI/CD)
+
+GitHub Actions automatically builds the file and creates a **GitHub Release** when you push a tag:
 
 ```bash
-python3 build.py
+git tag v4.0.0
+git push origin v4.0.0
 ```
 
-The `build.py` script combines files in `src/` following the order defined in `ORDER` 
-into a single `opencode-config-editor.py` file for easy distribution.
+- Workflow: `.github/workflows/build-release.yml`
+- Runs `python3 build.py`, packages the `opencode-config-editor-<version>.py` asset
+  along with `CHANGELOG.md` / `CHANGELOG_EN.md`.
+- Can also be triggered manually from the **Actions** tab → *Build & Release* → *Run workflow*
+  (in that case the asset is attached as an artifact, not a release).
+
+> **Note**: The workflow uses `github.repository` automatically, so no extra config is needed.
+> The default download source for `install.sh` is `yana-arch/opencode-config-editor`; if you fork,
+> set the `REPO` variable when running it to point to your repo.
 
 ## Schema Validation
 
