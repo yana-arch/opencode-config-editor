@@ -42,14 +42,24 @@ and creates the `opencode-editor` command plus a desktop menu shortcut:
 curl -fsSL https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh | sudo bash
 ```
 
-Or download the script first, then run it:
+Or download the script first, then run it in **remote** mode:
 
 ```bash
 curl -fsSL -o install.sh https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh
-sudo bash install.sh
+sudo bash install.sh --remote
 ```
 
-After installation, launch the app with:
+### Option 2: Install from a local file
+
+If you already have the `opencode-config-editor.py` file (e.g. built manually or downloaded
+separately), install it directly without re-downloading:
+
+```bash
+python3 build.py
+sudo bash install.sh --local opencode-config-editor.py
+```
+
+After installation (remote or local), launch the app with:
 
 ```bash
 opencode-editor
@@ -61,16 +71,18 @@ or find "OpenCode Config Editor" in your application menu.
 
 ```bash
 # Install from a different repo
-REPO=<owner/repo> sudo bash install.sh
+REPO=<owner/repo> sudo bash install.sh --remote
 
 # Install a specific version (default: latest)
-VERSION=4.0.0 sudo bash install.sh
+VERSION=4.0.1 sudo bash install.sh --remote
 
 # Skip dependency installation
-NO_DEPS=1 sudo bash install.sh
+NO_DEPS=1 sudo bash install.sh --remote
 ```
 
-### Option 2: Build from source manually
+**Full help:** `bash install.sh --help`
+
+### Option 3: Build from source manually
 
 ```bash
 pip install PySide6

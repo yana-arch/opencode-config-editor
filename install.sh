@@ -3,16 +3,20 @@ set -euo pipefail
 
 # ============================================================
 # opencode-config-editor installer
-# Tải release mới nhất từ GitHub, di chuyển vào /opt và cài đặt.
+# Cài đặt từ file local hoặc tải release từ GitHub.
 #
 # Cách dùng:
+#   # Remote (mặc định): tải release mới nhất từ GitHub
 #   curl -fsSL https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh | sudo bash
-#   hoặc: sudo bash install.sh
+#   sudo bash install.sh --remote
+#
+#   # Local: cài từ file python đã có sẵn trong thư mục
+#   sudo bash install.sh --local opencode-config-editor.py
 #
 # Tuỳ biến:
-#   REPO=<owner/repo> bash install.sh    # đổi nguồn tải (mặc định yana-arch/opencode-config-editor)
-#   VERSION=<x.y.z>    bash install.sh   # cài phiên bản cụ thể thay vì mới nhất
-#   NO_DEPS=1          bash install.sh   # bỏ qua cài python3/pyside6
+#   REPO=<owner/repo>  bash install.sh    # đổi nguồn tải remote (mặc định yana-arch/opencode-config-editor)
+#   VERSION=<x.y.z>    bash install.sh    # cài phiên bản cụ thể thay vì mới nhất
+#   NO_DEPS=1          bash install.sh    # bỏ qua cài python3/pyside6
 # ============================================================
 
 APP_NAME="opencode-editor"
@@ -20,10 +24,55 @@ BIN_NAME="opencode-editor"
 INSTALL_DIR="/opt/$APP_NAME"
 DESKTOP_NAME="$APP_NAME.desktop"
 
-# Nguồn tải mặc định
+# Mặc định
 REPO="${REPO:-yana-arch/opencode-config-editor}"
 VERSION="${VERSION:-latest}"
 NO_DEPS="${NO_DEPS:-0}"
+MODE="remote"
+LOCAL_FILE=""
+
+# ---------- Parser tham số ----------
+usage() {
+    cat <<EOF
+Cách dùng: bash install.sh [--remote | --local <file>]
+
+  --remote               Tải release từ GitHub (mặc định)
+  --local <file>         Cài từ file python có sẵn trong thư mục
+  -h, --help             Hiển thị trợ giúp này
+
+Biến môi trường:
+  REPO=<owner/repo>      Đổi nguồn tải remote (mặc định: yana-arch/opencode-config-editor)
+  VERSION=<x.y.z>        Cài phiên bản cụ thể (mặc định: latest)
+  NO_DEPS=1              Bỏ qua cài đặt phụ thuộc (python3, pyside6)
+EOF
+    exit "${1:-0}"
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remote)
+                MODE="remote"
+                shift
+                ;;
+            --local)
+                MODE="local"
+                shift
+                if [[ $# -eq 0 || "$1" == --* ]]; then
+                    die "Cần chỉ định file khi dùng --local (ví dụ: --local opencode-config-editor.py)."
+                fi
+                LOCAL_FILE="$1"
+                shift
+                ;;
+            -h|--help)
+                usage 0
+                ;;
+            *)
+                die "Tham số không hợp lệ: $1 (dùng --help để xem trợ giúp)."
+                ;;
+        esac
+    done
+}
 
 # ---------- Hàm ----------
 die() {
@@ -34,8 +83,13 @@ die() {
 banner() {
     echo "========================================================"
     echo " opencode-config-editor — Installer"
-    echo " Repo   : $REPO"
-    echo " Version: $VERSION"
+    echo " Mode   : $MODE"
+    if [[ "$MODE" == "remote" ]]; then
+        echo " Repo   : $REPO"
+        echo " Version: $VERSION"
+    else
+        echo " File   : $LOCAL_FILE"
+    fi
     echo "========================================================"
 }
 
@@ -95,6 +149,7 @@ download() {
 
 install_files() {
     local src="$1"
+    local keep="$2"   # "keep" giữ nguyên file nguồn (không xóa)
     mkdir -p "$INSTALL_DIR" /usr/local/bin
     cp "$src" "$INSTALL_DIR/main.py"
     chmod +x "$INSTALL_DIR/main.py"
@@ -120,23 +175,34 @@ Categories=Development;Settings;
 Keywords=opencode;config;json;
 EOF
 
-    rm -f "$src"
+    if [[ "$keep" != "keep" ]]; then
+        rm -f "$src"
+    fi
 }
 
 # ---------- Chạy ----------
+parse_args "$@"
 banner
 check_root
 
-have curl || die "Cần 'curl' để tải release (cài: apt/pacman/dnf install curl)."
 install_deps
 
-echo "Đang chuẩn bị tải..."
-TMP_FILE="$(mktemp /tmp/$APP_NAME.XXXXXX.py)"
-trap 'rm -f "$TMP_FILE"' EXIT
-download "$VERSION" "$TMP_FILE"
-
-echo "Đang cài đặt vào $INSTALL_DIR ..."
-install_files "$TMP_FILE"
+case "$MODE" in
+    remote)
+        have curl || die "Cần 'curl' để tải release (cài: apt/pacman/dnf install curl)."
+        echo "Đang chuẩn bị tải..."
+        TMP_FILE="$(mktemp /tmp/$APP_NAME.XXXXXX.py)"
+        trap 'rm -f "$TMP_FILE"' EXIT
+        download "$VERSION" "$TMP_FILE"
+        echo "Đang cài đặt vào $INSTALL_DIR ..."
+        install_files "$TMP_FILE"
+        ;;
+    local)
+        [[ -f "$LOCAL_FILE" ]] || die "Không tìm thấy file: $LOCAL_FILE"
+        echo "Đang cài đặt từ file $LOCAL_FILE vào $INSTALL_DIR ..."
+        install_files "$LOCAL_FILE" keep
+        ;;
+esac
 
 echo "--------------------------------------------------------"
 echo "Cài đặt hoàn tất!"

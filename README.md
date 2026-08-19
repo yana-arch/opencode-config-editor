@@ -41,14 +41,24 @@ tạo lệnh `opencode-editor` và shortcut trong menu ứng dụng:
 curl -fsSL https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh | sudo bash
 ```
 
-Hoặc tải script về rồi chạy:
+Hoặc tải script về rồi chạy ở chế độ **remote**:
 
 ```bash
 curl -fsSL -o install.sh https://raw.githubusercontent.com/yana-arch/opencode-config-editor/master/install.sh
-sudo bash install.sh
+sudo bash install.sh --remote
 ```
 
-Sau khi cài đặt, chạy bằng lệnh:
+### Cách 2: Cài từ file local
+
+Nếu đã có sẵn file `opencode-config-editor.py` (ví dụ build thủ công hoặc tải về riêng), cài
+trực tiếp mà không cần tải lại:
+
+```bash
+python3 build.py
+sudo bash install.sh --local opencode-config-editor.py
+```
+
+Sau khi cài đặt (dù remote hay local), chạy bằng lệnh:
 
 ```bash
 opencode-editor
@@ -60,16 +70,18 @@ hoặc tìm "OpenCode Config Editor" trong menu ứng dụng.
 
 ```bash
 # Cài từ repo khác
-REPO=<owner/repo> sudo bash install.sh
+REPO=<owner/repo> sudo bash install.sh --remote
 
 # Cài phiên bản cụ thể (mặc định: mới nhất)
-VERSION=4.0.0 sudo bash install.sh
+VERSION=4.0.1 sudo bash install.sh --remote
 
 # Bỏ qua cài đặt phụ thuộc
-NO_DEPS=1 sudo bash install.sh
+NO_DEPS=1 sudo bash install.sh --remote
 ```
 
-### Cách 2: Build thủ công từ mã nguồn
+**Xem trợ giúp đầy đủ:** `bash install.sh --help`
+
+### Cách 3: Build thủ công từ mã nguồn
 
 ```bash
 pip install PySide6
