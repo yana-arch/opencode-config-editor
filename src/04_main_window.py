@@ -156,6 +156,14 @@ class MainWindow(QMainWindow):
         self.act_catalog.triggered.connect(self.load_model_catalog)
         mtools.addAction(self.act_catalog)
 
+        self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
+        self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
+        mtools.addAction(self.act_browse_catalog)
+
+        self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
+        self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
+        mtools.addAction(self.act_apply_catalog)
+
         mtools.addSeparator()
 
         self.act_imp_provider = QAction("Import &Providers...", self)
@@ -761,6 +769,67 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, json.JSONDecodeError) as e:
             QMessageBox.warning(self, "Load Error", f"Failed to load catalog: {e}")
             return False
+
+    def _ensure_catalog(self) -> bool:
+        """Load the bundled models.dev catalog if present, else ask the user."""
+        bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
+        if bundled.exists():
+            try:
+                self.model_catalog.load(bundled)
+                self._update_catalog_status()
+                self.status_bar.showMessage(f"Loaded bundled catalog: {bundled.name}")
+                return True
+            except (OSError, ValueError) as e:
+                QMessageBox.warning(self, "Catalog Error", f"Failed to load bundled catalog: {e}")
+        return self.load_model_catalog()
+
+    def _browse_model_catalog(self):
+        """Open the full-catalog browse dialog."""
+        if not self.model_catalog.loaded():
+            if not self._ensure_catalog():
+                return
+        dlg = ModelCatalogDialog(self, self.model_catalog)
+        dlg.exec()
+
+    def _apply_model_catalog(self):
+        """Match configured models against the catalog and apply normalized format."""
+        if not self.model_catalog.loaded():
+            if not self._ensure_catalog():
+                return
+        if not self.cfg_oc:
+            QMessageBox.information(self, "Match & Format", "Open a config file first.")
+            return
+
+        providers = self.cfg_oc.data.get("provider", {})
+        if not providers:
+            QMessageBox.information(
+                self, "Match & Format", "No providers found in the current config."
+            )
+            return
+
+        self.snapshot_state("opencode")
+        dlg = ApplyCatalogDialog(self, self.model_catalog, providers)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        report = dlg.apply()
+        if report.any_changes():
+            self.mark_dirty("opencode")
+            self.refresh_tabs()
+            self.status_bar.showMessage(
+                f"Catalog apply: {len(report.filled)} filled, "
+                f"{len(report.added)} added, {len(report.unknown)} unknown"
+            )
+            QMessageBox.information(
+                self, "Apply Complete",
+                f"Filled/updated: {len(report.filled)}\n"
+                f"Added: {len(report.added)}\n"
+                f"Unchanged: {len(report.unchanged)}\n"
+                f"Unknown: {len(report.unknown)}\n"
+                f"Ambiguous: {len(report.ambiguous)}"
+            )
+        else:
+            QMessageBox.information(self, "Apply", "No changes were applied.")
 
     def _toggle_theme(self):
         """Toggle between light/dark/system theme"""

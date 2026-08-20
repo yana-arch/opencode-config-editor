@@ -33,5 +33,27 @@ def build() -> None:
     OUT.write_text(text, encoding="utf-8")
     print(f"Đã tạo {OUT} ({len(text.splitlines())} dòng)")
 
+    if _run_tests():
+        print("Tất cả test PASS")
+    else:
+        raise SystemExit("Test FAILED")
+
+
+def _run_tests() -> bool:
+    """Run the pytest suite if pytest is available."""
+    import importlib.util
+    import subprocess
+    import sys
+
+    if importlib.util.find_spec("pytest") is None:
+        print("(pytest không được cài — bỏ qua test. Cài bằng: pip install pytest)")
+        return True
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/", "-q"],
+        cwd=ROOT,
+    )
+    return res.returncode == 0
+
+
 if __name__ == "__main__":
     build()

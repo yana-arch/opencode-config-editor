@@ -25,7 +25,9 @@ import sys
 import tempfile
 import time
 import urllib.request
+import html
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -59,7 +61,7 @@ except ImportError:
 
 # Constants
 APP_NAME = "opencode-config-editor"
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 SCHEMA_URL = "https://opencode.ai/config.json"
 TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
 SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"

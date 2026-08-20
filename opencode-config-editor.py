@@ -25,7 +25,9 @@ import sys
 import tempfile
 import time
 import urllib.request
+import html
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -59,7 +61,7 @@ except ImportError:
 
 # Constants
 APP_NAME = "opencode-config-editor"
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 SCHEMA_URL = "https://opencode.ai/config.json"
 TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
 SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"
@@ -143,6 +145,34 @@ class SettingsManager:
             recent.remove(path)
         recent.insert(0, path)
         self.set("recent_files", recent[:10])
+
+    DEFAULT_CONTEXT_TIERS = [4000, 8000, 32000, 64000, 128000, 200000, 1000000]
+    DEFAULT_OUTPUT_TIERS = [1000, 4000, 8000, 32000, 128000]
+
+    def _parse_tiers(self, val, default) -> List[int]:
+        if isinstance(val, str) and val.strip():
+            try:
+                return sorted({int(x) for x in val.split(",") if x.strip()})
+            except ValueError:
+                return default
+        if isinstance(val, list):
+            try:
+                return sorted({int(x) for x in val})
+            except (ValueError, TypeError):
+                return default
+        return default
+
+    def get_context_tiers(self) -> List[int]:
+        return self._parse_tiers(self.get("catalog/context_tiers"), self.DEFAULT_CONTEXT_TIERS)
+
+    def set_context_tiers(self, tiers: List[int]):
+        self.set("catalog/context_tiers", ",".join(str(x) for x in sorted(set(tiers))))
+
+    def get_output_tiers(self) -> List[int]:
+        return self._parse_tiers(self.get("catalog/output_tiers"), self.DEFAULT_OUTPUT_TIERS)
+
+    def set_output_tiers(self, tiers: List[int]):
+        self.set("catalog/output_tiers", ",".join(str(x) for x in sorted(set(tiers))))
 
 class ThemeManager:
     """Handle application theme switching"""
@@ -612,6 +642,8 @@ class ModelCatalog:
         self.flat = {}         # model_id -> spec
         self.source = None
         self.last_updated = None
+        self._formats_cache = None
+        self._model_index = {}  # model_id -> [provider_id, ...]
 
     def loaded(self) -> bool:
         """Check if catalog is loaded"""
@@ -656,11 +688,18 @@ class ModelCatalog:
         # Flat map: {modelId: spec}
         elif all(isinstance(v, dict) for v in data.values()):
             flat.update(data)
+            # Provide a synthetic provider so the normalized formats still work.
+            by_provider["provider"] = data
 
         else:
             raise ValueError("Unrecognized model catalog format.")
 
         self.raw, self.by_provider, self.flat = data, by_provider, flat
+        self._formats_cache = None
+        self._model_index = {}
+        for pid, models in by_provider.items():
+            for mid in models:
+                self._model_index.setdefault(mid, []).append(pid)
 
     def models_for(self, provider_key: str, npm: str = None) -> dict:
         """Get models for provider"""
@@ -681,6 +720,31 @@ class ModelCatalog:
             if search in mid.lower() or
                (isinstance(spec.get("name"), str) and search in spec["name"].lower())
         }
+
+    def formats(self) -> Dict[str, Dict[str, ModelFormat]]:
+        """Lazily build normalized formats: provider -> model_id -> ModelFormat."""
+        if getattr(self, "_formats_cache", None) is not None:
+            return self._formats_cache
+        cache = {}
+        for pid, models in self.by_provider.items():
+            pmap = {}
+            for mid, spec in models.items():
+                pmap[mid] = ModelFormat.from_spec(pid, mid, spec)
+            cache[pid] = pmap
+        self._formats_cache = cache
+        return cache
+
+    def all_formats(self) -> List[ModelFormat]:
+        """Flatten all formats across providers."""
+        return [fmt for pmap in self.formats().values() for fmt in pmap.values()]
+
+    def find_model(self, model_id: str) -> List[ModelFormat]:
+        """Match a model id across the whole catalog (may match many providers)."""
+        providers = self._model_index.get(model_id)
+        if not providers:
+            return []
+        fmts = self.formats()
+        return [fmts[p][model_id] for p in providers if model_id in fmts.get(p, {})]
 
 def _load_json_file(path: Path) -> dict:
     """Load JSON file with error handling"""
@@ -764,9 +828,11 @@ def _extract_models_map(data) -> dict:
 
     raise ValueError("Unrecognized models JSON shape.")
 
-def _merge_model_spec(existing: dict, catalog_spec: dict, overwrite: bool) -> dict:
+def _merge_model_spec(existing, catalog_spec: dict, overwrite: bool) -> dict:
     """Merge model spec with catalog spec"""
-    existing = dict(existing or {})
+    if not isinstance(existing, dict):
+        existing = {}
+    existing = dict(existing)
     for k, v in catalog_spec.items():
         if k in ("cost", "limit") and isinstance(v, dict):
             sub = dict(existing.get(k, {})) if isinstance(existing.get(k), dict) else {}
@@ -779,7 +845,323 @@ def _merge_model_spec(existing: dict, catalog_spec: dict, overwrite: bool) -> di
                 existing[k] = v
     return existing
 
+
+# ---------------------------------------------------------------------------
+# Model Format normalization
+# ---------------------------------------------------------------------------
+
+# Flexible key aliases so new providers/schemas only need a map entry.
+SPEC_ALIASES = {
+    "context": ["limit.context", "context_window", "max_input_tokens", "context_length"],
+    "output": ["limit.output", "max_output_tokens", "output_tokens", "max_tokens"],
+    "modalities": ["modalities", "input_modalities", "supported_media"],
+    "cost_in": ["cost.input", "cost_in", "input_cost"],
+    "cost_out": ["cost.output", "cost_out", "output_cost"],
+    "cost_cache_read": ["cost.cache_read", "cache_read"],
+    "cost_cache_write": ["cost.cache_write", "cache_write"],
+}
+
+
+def _deep_get(spec: dict, dotted: str):
+    """Resolve a dotted path ('limit.context') in a dict."""
+    cur = spec
+    for part in dotted.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _first_value(spec: dict, aliases) -> Optional[object]:
+    for key in aliases:
+        v = _deep_get(spec, key)
+        if v is not None:
+            return v
+    return None
+
+
+def _as_bool(v) -> bool:
+    return bool(v) if v is not None else False
+
+
+@dataclass
+class Modalities:
+    """Normalized input/output modalities of a model."""
+    input_mods: List[str] = field(default_factory=lambda: ["text"])
+    output_mods: List[str] = field(default_factory=lambda: ["text"])
+    inferred: bool = False
+
+    @property
+    def has_image_input(self) -> bool:
+        return any(m in ("image", "vision") for m in self.input_mods)
+
+    @property
+    def has_pdf_input(self) -> bool:
+        return "pdf" in self.input_mods
+
+    @property
+    def supports_text_input(self) -> bool:
+        return "text" in self.input_mods or not self.input_mods
+
+    @property
+    def supports_text_output(self) -> bool:
+        return "text" in self.output_mods or not self.output_mods
+
+    def label(self) -> str:
+        in_str = "+".join(self.input_mods) if self.input_mods else "?"
+        out_str = "+".join(self.output_mods) if self.output_mods else "?"
+        mark = "~" if self.inferred else ""
+        return f"in:{in_str}{mark} / out:{out_str}"
+
+
+@dataclass
+class ModelFormat:
+    """Normalized description of a model across any provider."""
+    provider: str
+    model_id: str
+    name: str
+    context: Optional[int] = None
+    output: Optional[int] = None
+    modalities: Modalities = field(default_factory=Modalities)
+    attachment: bool = False
+    reasoning: bool = False
+    tools: bool = False
+    temperature: bool = False
+    cost_in: Optional[float] = None
+    cost_out: Optional[float] = None
+    cost_cache_read: Optional[float] = None
+    cost_cache_write: Optional[float] = None
+
+    def context_k(self) -> str:
+        return _fmt_tokens(self.context)
+
+    def output_k(self) -> str:
+        return _fmt_tokens(self.output)
+
+    def cost_in_label(self) -> str:
+        return _fmt_cost(self.cost_in)
+
+    def cost_out_label(self) -> str:
+        return _fmt_cost(self.cost_out)
+
+    @classmethod
+    def from_spec(cls, provider: str, model_id: str, spec: dict) -> "ModelFormat":
+        spec = spec or {}
+
+        context = _first_value(spec, SPEC_ALIASES["context"])
+        output = _first_value(spec, SPEC_ALIASES["output"])
+
+        mods = _parse_modalities(spec)
+
+        attachment = _as_bool(spec.get("attachment"))
+        reasoning = _as_bool(spec.get("reasoning"))
+        tools = _as_bool(spec.get("tool_call") or spec.get("tools"))
+        temperature = _as_bool(spec.get("temperature"))
+
+        cost_in = _first_value(spec, SPEC_ALIASES["cost_in"])
+        cost_out = _first_value(spec, SPEC_ALIASES["cost_out"])
+        cache_read = _first_value(spec, SPEC_ALIASES["cost_cache_read"])
+        cache_write = _first_value(spec, SPEC_ALIASES["cost_cache_write"])
+
+        return cls(
+            provider=provider,
+            model_id=model_id,
+            name=str(spec.get("name") or model_id),
+            context=_as_int(context),
+            output=_as_int(output),
+            modalities=mods,
+            attachment=attachment,
+            reasoning=reasoning,
+            tools=tools,
+            temperature=temperature,
+            cost_in=_as_float(cost_in),
+            cost_out=_as_float(cost_out),
+            cost_cache_read=_as_float(cache_read),
+            cost_cache_write=_as_float(cache_write),
+        )
+
+
+def _parse_modalities(spec: dict) -> Modalities:
+    """Parse modalities, inferring from attachment when missing."""
+    raw = _first_value(spec, SPEC_ALIASES["modalities"])
+
+    if isinstance(raw, dict):
+        in_mods = raw.get("input")
+        out_mods = raw.get("output")
+        inferred = False
+    elif isinstance(raw, list):
+        in_mods, out_mods = raw, ["text"]
+        inferred = True
+    else:
+        in_mods, out_mods = None, None
+        inferred = True
+
+    in_list = [str(m) for m in in_mods] if in_mods else None
+    out_list = [str(m) for m in out_mods] if out_mods else None
+
+    # Fallback: attachment implies image input
+    if not in_list and _as_bool(spec.get("attachment")):
+        in_list = ["text", "image"]
+    elif not in_list:
+        in_list = ["text"]
+
+    if not out_list:
+        out_list = ["text"]
+
+    return Modalities(input_mods=in_list, output_mods=out_list, inferred=inferred)
+
+
+def _as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_tokens(v) -> str:
+    if v is None:
+        return "?"
+    if v >= 1000000:
+        return f"{v / 1000000:.1f}M"
+    if v >= 1000:
+        return f"{v / 1000:.0f}k"
+    return str(v)
+
+
+def _fmt_cost(v) -> str:
+    if v is None:
+        return "?"
+    return f"${v:.4f}"
+
+
+def build_spec_from_format(fmt: ModelFormat) -> dict:
+    """Convert a normalized ModelFormat back into a config-shaped spec."""
+    spec = {}
+    if fmt.name and fmt.name != fmt.model_id:
+        spec["name"] = fmt.name
+
+    limit = {}
+    if fmt.context is not None:
+        limit["context"] = fmt.context
+    if fmt.output is not None:
+        limit["output"] = fmt.output
+    if limit:
+        spec["limit"] = limit
+
+    cost = {}
+    if fmt.cost_in is not None:
+        cost["input"] = fmt.cost_in
+    if fmt.cost_out is not None:
+        cost["output"] = fmt.cost_out
+    if fmt.cost_cache_read is not None:
+        cost["cache_read"] = fmt.cost_cache_read
+    if fmt.cost_cache_write is not None:
+        cost["cache_write"] = fmt.cost_cache_write
+    if cost:
+        spec["cost"] = cost
+
+    if not fmt.modalities.inferred:
+        spec["modalities"] = {
+            "input": list(fmt.modalities.input_mods),
+            "output": list(fmt.modalities.output_mods),
+        }
+
+    if fmt.attachment:
+        spec["attachment"] = True
+    if fmt.reasoning:
+        spec["reasoning"] = True
+    if fmt.tools:
+        spec["tool_call"] = True
+    if fmt.temperature:
+        spec["temperature"] = True
+    return spec
+
+
+@dataclass
+class ApplyReport:
+    """Result of applying catalog specs to a config's providers."""
+    matched: List[str] = field(default_factory=list)
+    filled: List[str] = field(default_factory=list)
+    added: List[str] = field(default_factory=list)
+    unchanged: List[str] = field(default_factory=list)
+    unknown: List[str] = field(default_factory=list)
+    ambiguous: List[tuple] = field(default_factory=list)
+
+    def any_changes(self) -> bool:
+        return bool(self.matched or self.filled or self.added)
+
+
+def apply_catalog_to_config(catalog, config_providers: dict, *,
+                            overwrite: bool = False,
+                            add_new: bool = False,
+                            resolve_fn=None) -> ApplyReport:
+    """Match each configured model id against the catalog and merge specs."""
+    report = ApplyReport()
+    formats = catalog.formats()
+
+    for prov_name, prov_cfg in list((config_providers or {}).items()):
+        if not isinstance(prov_cfg, dict):
+            continue
+        models = prov_cfg.get("models")
+        if models is None:
+            # Only create an empty models map if we'll actually add something.
+            has_new = add_new and bool(formats.get(prov_name))
+            models = prov_cfg.setdefault("models", {}) if has_new else {}
+        if not isinstance(models, dict):
+            continue
+
+        for mid, spec in list(models.items()):
+            matches = catalog.find_model(mid)
+            if not matches:
+                report.unknown.append(f"{prov_name}/{mid}")
+                continue
+
+            chosen = _resolve_match(matches, prov_name, mid, resolve_fn)
+            if chosen is None:
+                report.ambiguous.append((prov_name, mid, matches))
+                continue
+
+            merged = _merge_model_spec(spec, build_spec_from_format(chosen), overwrite)
+            changed = merged != (spec or {})
+            if changed:
+                models[mid] = merged
+                report.filled.append(f"{prov_name}/{mid}")
+            else:
+                report.unchanged.append(f"{prov_name}/{mid}")
+
+        if add_new:
+            known_ids = set(models.keys())
+            for fmt in formats.get(prov_name, {}).values():
+                if fmt.model_id not in known_ids:
+                    models[fmt.model_id] = build_spec_from_format(fmt)
+                    report.added.append(f"{prov_name}/{fmt.model_id}")
+                    known_ids.add(fmt.model_id)
+
+    return report
+
+
+def _resolve_match(matches, prov_name, mid=None, resolve_fn=None):
+    """Pick a match: prefer same provider name, else ask resolve_fn, else first."""
+    if len(matches) == 1:
+        return matches[0]
+    for m in matches:
+        if m.provider == prov_name:
+            return m
+    if resolve_fn is not None:
+        return resolve_fn(prov_name, mid, matches)
+    return None
+
 # GUI Components
+def _esc_html(s) -> str:
+    return html.escape(str(s), quote=True)
+
 class MaskedLineEdit(QWidget):
     """Line edit with optional masking for sensitive fields"""
 
@@ -1077,6 +1459,7 @@ class ModelsManagerDialog(QDialog):
             ("Import", self._import_models),
             ("Export", self._export_models),
             ("Apply Catalog", self._apply_catalog),
+            ("Match from Catalog", self._match_catalog),
             ("Bulk Edit", self._bulk_edit)
         ]:
             btn = QPushButton(text)
@@ -1154,6 +1537,11 @@ class ModelsManagerDialog(QDialog):
             remove_btn.clicked.connect(lambda _, m=model_id: self._remove_model(m))
             actions_layout.addWidget(remove_btn)
 
+            match_btn = QPushButton("Match")
+            match_btn.setFixedWidth(60)
+            match_btn.clicked.connect(lambda _, m=model_id: self._match_single(m))
+            actions_layout.addWidget(match_btn)
+
             self.table.setCellWidget(row, 6, actions_widget)
 
         self.status_label.setText(f"{len(self.models)} models")
@@ -1202,6 +1590,11 @@ class ModelsManagerDialog(QDialog):
             remove_btn.setFixedWidth(60)
             remove_btn.clicked.connect(lambda _, m=model_id: self._remove_model(m))
             actions_layout.addWidget(remove_btn)
+
+            match_btn = QPushButton("Match")
+            match_btn.setFixedWidth(60)
+            match_btn.clicked.connect(lambda _, m=model_id: self._match_single(m))
+            actions_layout.addWidget(match_btn)
 
             self.table.setCellWidget(row, 6, actions_widget)
 
@@ -1314,10 +1707,14 @@ class ModelsManagerDialog(QDialog):
     def _apply_catalog(self):
         """Apply model catalog to update existing models"""
         if not self.app.model_catalog.loaded():
-            if not _confirm(self, "No Catalog", "No model catalog loaded. Load one now?"):
-                return
-            if not self.app.load_model_catalog():
-                return
+            if hasattr(self.app, "_ensure_catalog"):
+                if not self.app._ensure_catalog():
+                    return
+            else:
+                if not _confirm(self, "No Catalog", "No model catalog loaded. Load one now?"):
+                    return
+                if not self.app.load_model_catalog():
+                    return
 
         catalog = self.app.model_catalog
         models = catalog.models_for(self.provider_key, self.provider_cfg.get("npm"))
@@ -1347,6 +1744,79 @@ class ModelsManagerDialog(QDialog):
             self, "Apply Catalog",
             f"Updated {updated} models from catalog"
         )
+
+    def _match_catalog(self):
+        """Match & format all models in this provider against the catalog."""
+        self._match_models(set(self.models.keys()))
+
+    def _match_single(self, model_id: str):
+        """Match & format a single model against the catalog."""
+        self._match_models({model_id})
+
+    def _match_models(self, model_ids):
+        """Preview and apply matched catalog format for the given models."""
+        if not self.app.model_catalog.loaded():
+            if hasattr(self.app, "_ensure_catalog"):
+                if not self.app._ensure_catalog():
+                    return
+            else:
+                if not _confirm(self, "No Catalog", "No model catalog loaded. Load one now?"):
+                    return
+                if not self.app.load_model_catalog():
+                    return
+
+        catalog = self.app.model_catalog
+        scope = set(model_ids)
+
+        entries = []  # (model_id, old_spec, new_spec, status)
+        ambiguous_data = {}
+        for mid in sorted(scope):
+            if mid not in self.models:
+                continue
+            matches = catalog.find_model(mid)
+            if not matches:
+                entries.append((mid, dict(self.models[mid]), None, "unknown"))
+                continue
+            chosen = _resolve_match(matches, self.provider_key, mid)
+            if chosen is None:
+                entries.append((mid, dict(self.models[mid]), None, "ambiguous"))
+                ambiguous_data[mid] = (self.provider_key, matches)
+                continue
+            merged = _merge_model_spec(
+                self.models[mid], build_spec_from_format(chosen), overwrite=False)
+            status = "matched" if merged != (self.models[mid] or {}) else "unchanged"
+            entries.append((mid, dict(self.models[mid]), merged, status))
+
+        if not any(e[2] is not None or e[3] == "ambiguous" for e in entries):
+            QMessageBox.information(
+                self, "Match from Catalog",
+                "No models matched. Check the model ids against the catalog."
+            )
+            return
+
+        dlg = MatchFormatPreviewDialog(self, entries, ambiguous_data)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        overwrite = dlg.overwrite_checkbox.isChecked()
+        applied = 0
+        for mid, old_spec, new_spec, status in dlg.selected_entries:
+            # Use the provider picked in the combo for ambiguous entries.
+            if status == "ambiguous":
+                new_spec = dlg.resolved_specs.get(mid, new_spec)
+            if new_spec is None:
+                continue
+            self.models[mid] = _merge_model_spec(
+                self.models[mid], new_spec, overwrite=overwrite)
+            applied += 1
+
+        self._update_table()
+        self.app.mark_dirty()
+        if applied:
+            QMessageBox.information(
+                self, "Match from Catalog", f"Updated {applied} model(s) from catalog")
+        else:
+            QMessageBox.information(self, "Match from Catalog", "No changes were applied.")
 
     def _bulk_edit(self):
         """Bulk edit selected models"""
@@ -1504,6 +1974,209 @@ class CatalogPreviewDialog(QDialog):
                 selected.append(self.table.item(row, 1).text())
         return selected
 
+class MatchFormatPreviewDialog(QDialog):
+    """Preview old vs new model config after matching against the catalog."""
+
+    def __init__(self, parent, entries, ambiguous_data=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preview Matched Models")
+        self.resize(900, 600)
+        # entries: list of (model_id, old_spec, new_spec|None, status)
+        self.entries = entries
+        self.resolved_specs = {}
+        self._ambiguous_data = ambiguous_data or {}
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Review each model below. 'Old' is your current config, 'New' is the "
+            "matched catalog format. Check the ones you want to apply."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.overwrite_checkbox = QCheckBox("Overwrite existing values (otherwise only fill missing fields)")
+        layout.addWidget(self.overwrite_checkbox)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Apply", "Model ID", "Status", "Old Config", "New Config", "Catalog Provider"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.itemSelectionChanged.connect(self._show_diff)
+
+        # Diff panel: side-by-side visual old -> new for the selected row.
+        self.diff_title = QLabel("Select a row to preview the change")
+        self.diff_title.setStyleSheet("font-weight: bold;")
+        self.diff_view = QTextEdit()
+        self.diff_view.setReadOnly(True)
+        self.diff_view.setMinimumHeight(180)
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self.table)
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(self.diff_title)
+        rl.addWidget(self.diff_view)
+        splitter.addWidget(right)
+        splitter.setSizes([360, 220])
+        layout.addWidget(splitter)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._populate()
+
+    def _flat(self, d, prefix=""):
+        """Flatten a nested dict into (path, value) leaves."""
+        out = []
+        if not isinstance(d, dict):
+            return [(prefix, d)]
+        for k, v in d.items():
+            p = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                out.extend(self._flat(v, p))
+            else:
+                out.append((p, v))
+        return out
+
+    def _show_diff(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            self.diff_title.setText("Select a row to preview the change")
+            self.diff_view.clear()
+            return
+        row = rows[0].row()
+        if not (0 <= row < len(self.entries)):
+            return
+        mid, old_spec, new_spec, status = self.entries[row]
+        if status == "ambiguous":
+            new_spec = self.resolved_specs.get(mid, new_spec)
+        self.diff_title.setText(
+            f"{mid} — {status}"
+            + (" (ambiguous: pick a catalog provider)" if status == "ambiguous" else ""))
+        self.diff_view.setHtml(self._diff_html(old_spec or {}, new_spec))
+
+    def _diff_html(self, old, new) -> str:
+        """Render an HTML table comparing old vs new field-by-field."""
+        if new is None:
+            return "<b>No catalog match for this model.</b>"
+        old_flat = dict(self._flat(old))
+        new_flat = dict(self._flat(new))
+        keys = sorted(set(old_flat) | set(new_flat))
+
+        def esc(v):
+            return _esc_html(json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v)
+
+        rows_html = []
+        for k in keys:
+            o = old_flat.get(k)
+            n = new_flat.get(k)
+            if o is None and n is None:
+                continue
+            if o == n:
+                rows_html.append(
+                    f"<tr><td class='k'>{_esc_html(k)}</td>"
+                    f"<td class='same'>{esc(n)}</td></tr>")
+            elif o is None:
+                rows_html.append(
+                    f"<tr><td class='k'>{_esc_html(k)}</td>"
+                    f"<td class='add' style='color:#1a7f37'>+ {esc(n)}</td></tr>")
+            elif n is None:
+                rows_html.append(
+                    f"<tr><td class='k'>{_esc_html(k)}</td>"
+                    f"<td class='del' style='color:#d1242f; text-decoration:line-through'>- {esc(o)}</td></tr>")
+            else:
+                rows_html.append(
+                    f"<tr><td class='k'>{_esc_html(k)}</td>"
+                    f"<td class='chg' style='color:#9a6700'>{esc(o)} → {esc(n)}</td></tr>")
+
+        return (
+            "<style>table{border-collapse:collapse;width:100%;font-family:monospace;font-size:12px}"
+            ".k{color:#57606a;padding:2px 10px 2px 0;vertical-align:top;white-space:nowrap}</style>"
+            "<table>" + "".join(rows_html) + "</table>"
+        ) if rows_html else "<i>No changes</i>"
+
+    def _populate(self):
+        self.table.setRowCount(len(self.entries))
+        for row, (mid, old_spec, new_spec, status) in enumerate(self.entries):
+            apply_check = QCheckBox()
+            apply_check.setChecked(new_spec is not None and status != "unchanged")
+            self.table.setCellWidget(row, 0, apply_check)
+
+            self.table.setItem(row, 1, QTableWidgetItem(mid))
+            self.table.setItem(row, 2, QTableWidgetItem(status))
+
+            old_text = json.dumps(old_spec, ensure_ascii=False) if old_spec else "(empty)"
+            if new_spec is not None:
+                new_text = json.dumps(new_spec, ensure_ascii=False)
+            elif status == "ambiguous":
+                new_text = "choose a provider"
+            else:
+                new_text = "no match"
+            self.table.setItem(row, 3, QTableWidgetItem(old_text))
+            self.table.setItem(row, 4, QTableWidgetItem(new_text))
+
+            # Resolve column: combo box listing catalog providers matching this id.
+            resolve_widget = QWidget()
+            resolve_layout = QHBoxLayout(resolve_widget)
+            resolve_layout.setContentsMargins(2, 0, 2, 0)
+            combo = QComboBox()
+            provider_key, matches = self._ambiguous_data.get(mid, (None, []))
+            if status == "ambiguous" and matches:
+                preferred = provider_key
+                for m in matches:
+                    combo.addItem(m.provider, m)
+                    if m.provider == preferred:
+                        combo.setCurrentIndex(combo.count() - 1)
+                if combo.currentIndex() < 0:
+                    combo.setCurrentIndex(0)
+                combo.currentIndexChanged.connect(
+                    lambda _, r=row, mm=mid: self._on_combo_change(r, mm))
+                # reflect the default selection now
+                self.resolved_specs[mid] = build_spec_from_format(combo.currentData())
+                self._refresh_new_cell(row, mid)
+            else:
+                combo.setEnabled(False)
+                combo.addItem("—")
+            resolve_layout.addWidget(combo, 1)
+            self.table.setCellWidget(row, 5, resolve_widget)
+
+        self.table.resizeColumnsToContents()
+
+    def _on_combo_change(self, row, mid):
+        combo = self.table.cellWidget(row, 5).findChild(QComboBox)
+        fmt = combo.currentData()
+        if fmt is not None:
+            self.resolved_specs[mid] = build_spec_from_format(fmt)
+            self._refresh_new_cell(row, mid)
+            check = self.table.cellWidget(row, 0)
+            if check is not None:
+                check.setChecked(True)
+            self._show_diff()
+
+    def _refresh_new_cell(self, row, mid):
+        spec = self.resolved_specs.get(mid)
+        self.table.setItem(row, 4, QTableWidgetItem(
+            json.dumps(spec, ensure_ascii=False) if spec else "choose a provider"))
+        self.table.setItem(row, 2, QTableWidgetItem("matched" if spec else "ambiguous"))
+        self.table.resizeColumnsToContents()
+
+    @property
+    def selected_entries(self):
+        out = []
+        for row in range(self.table.rowCount()):
+            check = self.table.cellWidget(row, 0)
+            if check is not None and check.isChecked():
+                out.append(self.entries[row])
+        return out
+
 class BulkEditDialog(QDialog):
     """Dialog for bulk editing model fields"""
 
@@ -1658,6 +2331,460 @@ class JsonImportDialog(QDialog):
             self.accept()
         except json.JSONDecodeError as e:
             QMessageBox.warning(self, "Invalid JSON", str(e))
+
+
+class ModelFormatCard(QFrame):
+    """Card showing normalized details of a single model format."""
+
+    def __init__(self, fmt: Optional[ModelFormat] = None, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setMinimumWidth(280)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(10, 10, 10, 10)
+
+        self.title_label = QLabel("Select a model")
+        title_font = QFont()
+        title_font.setBold(True)
+        title_font.setPointSize(11)
+        self.title_label.setFont(title_font)
+        self.title_label.setWordWrap(True)
+        self._layout.addWidget(self.title_label)
+
+        self.sub_label = QLabel("")
+        self.sub_label.setStyleSheet("color: gray;")
+        self.sub_label.setWordWrap(True)
+        self._layout.addWidget(self.sub_label)
+
+        self.info_label = QLabel("")
+        self.info_label.setWordWrap(True)
+        self._layout.addWidget(self.info_label)
+
+        self.set_format(fmt)
+
+    def set_format(self, fmt: Optional[ModelFormat]):
+        if fmt is None:
+            self.title_label.setText("No model selected")
+            self.sub_label.setText("")
+            self.info_label.setText("Click a row in the table to see its normalized format.")
+            return
+
+        self.title_label.setText(f"{fmt.provider} · {fmt.model_id}")
+        self.sub_label.setText(fmt.name)
+        lines = [
+            f"Context: {fmt.context_k()}",
+            f"Output: {fmt.output_k()}",
+            f"Modalities: {fmt.modalities.label()}",
+            f"Cost in/out: {fmt.cost_in_label()} / {fmt.cost_out_label()}",
+            f"Cache read/write: {_fmt_cost(fmt.cost_cache_read)} / {_fmt_cost(fmt.cost_cache_write)}",
+        ]
+        caps = []
+        if fmt.attachment:
+            caps.append("attachment")
+        if fmt.reasoning:
+            caps.append("reasoning")
+        if fmt.tools:
+            caps.append("tool_call")
+        if fmt.temperature:
+            caps.append("temperature")
+        if caps:
+            lines.append("Capabilities: " + ", ".join(caps))
+        if fmt.modalities.inferred:
+            lines.append("(modalities inferred)")
+        self.info_label.setText("\n".join(lines))
+
+
+class TierSettingsDialog(QDialog):
+    """Dialog to edit configurable context/output tiers."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Catalog Tier Settings")
+        self.resize(400, 320)
+        self.settings = SettingsManager()
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Enter tier thresholds in thousands of tokens (e.g. 4, 8, 32, 128, 200).\n"
+            "Separate by commas. Used to bucket models by context / output size."
+        ))
+
+        form = QFormLayout()
+        self.context_edit = QLineEdit()
+        self.output_edit = QLineEdit()
+        form.addRow("Context tiers (k):", self.context_edit)
+        form.addRow("Output tiers (k):", self.output_edit)
+        layout.addLayout(form)
+
+        self.context_edit.setText(",".join(str(x // 1000 if x >= 1000 else x)
+                                            for x in self.settings.get_context_tiers()))
+        self.output_edit.setText(",".join(str(x // 1000 if x >= 1000 else x)
+                                          for x in self.settings.get_output_tiers()))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _parse_k(self, text: str, fallback) -> List[int]:
+        vals = []
+        for tok in text.replace(",", " ").split():
+            try:
+                vals.append(int(float(tok) * 1000))
+            except ValueError:
+                continue
+        return vals or list(fallback)
+
+    def _accept(self):
+        self.settings.set_context_tiers(
+            self._parse_k(self.context_edit.text(), SettingsManager.DEFAULT_CONTEXT_TIERS))
+        self.settings.set_output_tiers(
+            self._parse_k(self.output_edit.text(), SettingsManager.DEFAULT_OUTPUT_TIERS))
+        self.accept()
+
+
+class ModelCatalogDialog(QDialog):
+    """Browse the whole model catalog with filters and format detail."""
+
+    COLUMNS = ["Provider", "Model ID", "Name", "Context", "Output", "Modalities", "Cost in/out"]
+
+    def __init__(self, parent, catalog):
+        super().__init__(parent)
+        self.setWindowTitle("Browse Model Catalog")
+        self.resize(960, 600)
+        self.catalog = catalog
+        self.settings = SettingsManager()
+
+        layout = QVBoxLayout(self)
+
+        # Filter bar
+        filters = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search model / name...")
+        self.search_edit.textChanged.connect(self._refresh)
+        filters.addWidget(self.search_edit)
+
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("All providers")
+        for pid in sorted(catalog.by_provider.keys()):
+            self.provider_combo.addItem(pid)
+        self.provider_combo.currentTextChanged.connect(self._refresh)
+        filters.addWidget(self.provider_combo)
+
+        self.context_combo = QComboBox()
+        self._fill_tier_combo(self.context_combo, "context")
+        self.context_combo.currentIndexChanged.connect(self._refresh)
+        filters.addWidget(QLabel("Context ≥"))
+        filters.addWidget(self.context_combo)
+
+        self.output_combo = QComboBox()
+        self._fill_tier_combo(self.output_combo, "output")
+        self.output_combo.currentIndexChanged.connect(self._refresh)
+        filters.addWidget(QLabel("Output ≥"))
+        filters.addWidget(self.output_combo)
+        filters.addStretch()
+        layout.addLayout(filters)
+
+        mod_filters = QHBoxLayout()
+        self.image_check = QCheckBox("Image input")
+        self.pdf_check = QCheckBox("PDF input")
+        self.tools_check = QCheckBox("Tools")
+        self.reasoning_check = QCheckBox("Reasoning")
+        for cb in (self.image_check, self.pdf_check, self.tools_check, self.reasoning_check):
+            cb.stateChanged.connect(self._refresh)
+            mod_filters.addWidget(cb)
+        mod_filters.addStretch()
+        layout.addLayout(mod_filters)
+
+        # Splitter: table + card
+        splitter = QSplitter()
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.itemSelectionChanged.connect(self._on_select)
+        splitter.addWidget(self.table)
+
+        self.card = ModelFormatCard()
+        splitter.addWidget(self.card)
+        splitter.setSizes([680, 280])
+        layout.addWidget(splitter)
+
+        # Status + buttons
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("")
+        bottom.addWidget(self.status_label)
+        bottom.addStretch()
+
+        tiers_btn = QPushButton("Tiers…")
+        tiers_btn.clicked.connect(self._edit_tiers)
+        bottom.addWidget(tiers_btn)
+
+        export_btn = QPushButton("Export…")
+        export_btn.clicked.connect(self._export)
+        bottom.addWidget(export_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+        self._refresh()
+
+    def _fill_tier_combo(self, combo: QComboBox, attr: str):
+        combo.addItem("any")
+        tiers = (self.settings.get_context_tiers() if attr == "context"
+                 else self.settings.get_output_tiers())
+        for t in tiers:
+            combo.addItem(f"{_fmt_tokens(t)}")
+
+    def _refresh(self):
+        search = self.search_edit.text().lower()
+        provider = self.provider_combo.currentText()
+        ctx_min = self._tier_value(self.context_combo)
+        out_min = self._tier_value(self.output_combo)
+
+        rows = []
+        for fmt in self.catalog.all_formats():
+            if provider != "All providers" and fmt.provider != provider:
+                continue
+            if search and search not in fmt.model_id.lower() and search not in fmt.name.lower():
+                continue
+            if ctx_min and (fmt.context is None or fmt.context < ctx_min):
+                continue
+            if out_min and (fmt.output is None or fmt.output < out_min):
+                continue
+            if self.image_check.isChecked() and not fmt.modalities.has_image_input:
+                continue
+            if self.pdf_check.isChecked() and not fmt.modalities.has_pdf_input:
+                continue
+            if self.tools_check.isChecked() and not fmt.tools:
+                continue
+            if self.reasoning_check.isChecked() and not fmt.reasoning:
+                continue
+            rows.append(fmt)
+
+        self.table.setRowCount(len(rows))
+        self._row_formats = []
+        for r, fmt in enumerate(rows):
+            self._row_formats.append(fmt)
+            vals = [
+                fmt.provider, fmt.model_id, fmt.name, fmt.context_k(), fmt.output_k(),
+                fmt.modalities.label(), f"{fmt.cost_in_label()}/{fmt.cost_out_label()}",
+            ]
+            for c, v in enumerate(vals):
+                self.table.setItem(r, c, QTableWidgetItem(v))
+        self.status_label.setText(f"{len(rows)} models")
+
+    def _tier_value(self, combo: QComboBox):
+        txt = combo.currentText()
+        if not txt or txt == "any":
+            return 0
+        if txt.endswith("M"):
+            return int(float(txt[:-1]) * 1000000)
+        if txt.endswith("k"):
+            return int(float(txt[:-1]) * 1000)
+        try:
+            return int(txt)
+        except ValueError:
+            return 0
+
+    def _on_select(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows or not getattr(self, "_row_formats", None):
+            self.card.set_format(None)
+            return
+        idx = rows[0].row()
+        if 0 <= idx < len(self._row_formats):
+            self.card.set_format(self._row_formats[idx])
+
+    def _edit_tiers(self):
+        dlg = TierSettingsDialog(self)
+        dlg.exec()
+        self.context_combo.clear()
+        self.output_combo.clear()
+        self._fill_tier_combo(self.context_combo, "context")
+        self._fill_tier_combo(self.output_combo, "output")
+        self._refresh()
+
+    def _export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Models", "models.csv",
+            "CSV files (*.csv);;JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        rows = [self._row_formats[r] for r in range(self.table.rowCount())
+                if 0 <= r < len(getattr(self, "_row_formats", []))]
+        try:
+            if path.endswith(".json"):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump([build_spec_from_format(f) | {"provider": f.provider,
+                                                            "model_id": f.model_id}
+                               for f in rows], f, indent=2, ensure_ascii=False)
+            else:
+                import csv
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["provider", "model_id", "name", "context",
+                                     "output", "cost_in", "cost_out"])
+                    for fm in rows:
+                        writer.writerow([fm.provider, fm.model_id, fm.name,
+                                         fm.context or "", fm.output or "",
+                                         fm.cost_in or "", fm.cost_out or ""])
+            QMessageBox.information(self, "Export Complete", f"Exported {len(rows)} models")
+        except OSError as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+
+class ApplyCatalogDialog(QDialog):
+    """Match configured models against the catalog and apply normalized format."""
+
+    def __init__(self, parent, catalog, config_providers):
+        super().__init__(parent)
+        self.setWindowTitle("Match & Format Models from Catalog")
+        self.resize(980, 620)
+        self.catalog = catalog
+        self.config_providers = config_providers
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            "Matches the models already configured in your config against the model catalog, "
+            "then fills in normalized format (context, output, modalities, cost).\n"
+            "Models with an id present in the catalog but missing from config can also be added."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Controls
+        ctrl = QHBoxLayout()
+        self.overwrite_check = QCheckBox("Overwrite existing values")
+        self.add_new_check = QCheckBox("Add new models from catalog")
+        self.add_new_check.setChecked(True)
+        ctrl.addWidget(self.overwrite_check)
+        ctrl.addWidget(self.add_new_check)
+        ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Model ID", "Provider (config)", "Catalog source", "Status",
+            "Context", "Modalities"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.itemDoubleClicked.connect(self._resolve_ambiguous)
+        layout.addWidget(self.table)
+
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Apply to Config")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.overwrite_check.stateChanged.connect(lambda _: self._scan())
+        self.add_new_check.stateChanged.connect(lambda _: self._scan())
+        self._picks = {}
+        self._scan()
+
+    def _scan(self):
+        self.rows = []
+        self.fmt_cache = self.catalog.formats()
+        overwrite = self.overwrite_check.isChecked()
+
+        for prov_name, prov_cfg in (self.config_providers or {}).items():
+            if not isinstance(prov_cfg, dict):
+                continue
+            models = prov_cfg.get("models")
+            if not isinstance(models, dict):
+                continue
+            for mid in models:
+                matches = self.catalog.find_model(mid)
+                if not matches:
+                    self.rows.append([mid, prov_name, "", "unknown", "", ""])
+                    continue
+                chosen = _resolve_match(matches, prov_name, mid,
+                                        self._pick_provider)
+                if chosen is None:
+                    self.rows.append([mid, prov_name,
+                                      ", ".join(m.provider for m in matches),
+                                      "ambiguous", "", ""])
+                    continue
+                spec = build_spec_from_format(chosen)
+                merged = _merge_model_spec(models[mid], spec, overwrite)
+                status = "matched" if merged != (models[mid] or {}) else "unchanged"
+                self.rows.append([mid, prov_name, chosen.provider, status,
+                                  chosen.context_k(), chosen.modalities.label()])
+
+        if self.add_new_check.isChecked():
+            for prov_name, prov_cfg in (self.config_providers or {}).items():
+                if not isinstance(prov_cfg, dict):
+                    continue
+                existing = set(prov_cfg.get("models", {})) if isinstance(prov_cfg.get("models"), dict) else set()
+                for fmt in self.fmt_cache.get(prov_name, {}).values():
+                    if fmt.model_id not in existing:
+                        self.rows.append([fmt.model_id, prov_name, prov_name, "added",
+                                          fmt.context_k(), fmt.modalities.label()])
+
+        self._populate()
+
+    def _populate(self):
+        self.table.setRowCount(len(self.rows))
+        for r, row in enumerate(self.rows):
+            for c, val in enumerate(row):
+                self.table.setItem(r, c, QTableWidgetItem(val))
+        counts = {"matched": 0, "filled": 0, "unchanged": 0, "unknown": 0,
+                  "ambiguous": 0, "added": 0}
+        for row in self.rows:
+            counts[row[3]] = counts.get(row[3], 0) + 1
+        parts = [f"{k}: {v}" for k, v in counts.items() if v]
+        self.status_label.setText("  ".join(parts))
+
+    def _pick_provider(self, prov_name, mid, matches):
+        """Return the user's chosen provider for an ambiguous match, else None."""
+        key = (prov_name, mid)
+        picked = self._picks.get(key)
+        if picked is not None:
+            return next((m for m in matches if m.provider == picked), matches[0])
+        return None
+
+    def _resolve_ambiguous(self, item):
+        row = item.row()
+        if self.rows[row][3] != "ambiguous":
+            return
+        mid, prov = self.rows[row][0], self.rows[row][1]
+        matches = self.catalog.find_model(mid)
+        providers = [m.provider for m in matches]
+        choice, ok = QInputDialog.getItem(
+            self, "Choose Catalog Source",
+            f"Model '{mid}' matches multiple providers. Choose one:",
+            providers, 0, False
+        )
+        if ok and choice:
+            self._picks[(prov, mid)] = choice
+            fmt = next((m for m in matches if m.provider == choice), matches[0])
+            self.rows[row][2] = choice
+            self.rows[row][3] = "matched"
+            self.rows[row][4] = fmt.context_k()
+            self.rows[row][5] = fmt.modalities.label()
+            self._populate()
+
+    def apply(self) -> ApplyReport:
+        """Apply the current choices to the live config providers."""
+        report = apply_catalog_to_config(
+            self.catalog,
+            self.config_providers,
+            overwrite=self.overwrite_check.isChecked(),
+            add_new=self.add_new_check.isChecked(),
+            resolve_fn=self._pick_provider,
+        )
+        return report
 
 class ProvidersTab(QWidget):
     """Enhanced providers tab with search and bulk operations"""
@@ -4624,6 +5751,14 @@ class MainWindow(QMainWindow):
         self.act_catalog.triggered.connect(self.load_model_catalog)
         mtools.addAction(self.act_catalog)
 
+        self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
+        self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
+        mtools.addAction(self.act_browse_catalog)
+
+        self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
+        self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
+        mtools.addAction(self.act_apply_catalog)
+
         mtools.addSeparator()
 
         self.act_imp_provider = QAction("Import &Providers...", self)
@@ -5229,6 +6364,67 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, json.JSONDecodeError) as e:
             QMessageBox.warning(self, "Load Error", f"Failed to load catalog: {e}")
             return False
+
+    def _ensure_catalog(self) -> bool:
+        """Load the bundled models.dev catalog if present, else ask the user."""
+        bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
+        if bundled.exists():
+            try:
+                self.model_catalog.load(bundled)
+                self._update_catalog_status()
+                self.status_bar.showMessage(f"Loaded bundled catalog: {bundled.name}")
+                return True
+            except (OSError, ValueError) as e:
+                QMessageBox.warning(self, "Catalog Error", f"Failed to load bundled catalog: {e}")
+        return self.load_model_catalog()
+
+    def _browse_model_catalog(self):
+        """Open the full-catalog browse dialog."""
+        if not self.model_catalog.loaded():
+            if not self._ensure_catalog():
+                return
+        dlg = ModelCatalogDialog(self, self.model_catalog)
+        dlg.exec()
+
+    def _apply_model_catalog(self):
+        """Match configured models against the catalog and apply normalized format."""
+        if not self.model_catalog.loaded():
+            if not self._ensure_catalog():
+                return
+        if not self.cfg_oc:
+            QMessageBox.information(self, "Match & Format", "Open a config file first.")
+            return
+
+        providers = self.cfg_oc.data.get("provider", {})
+        if not providers:
+            QMessageBox.information(
+                self, "Match & Format", "No providers found in the current config."
+            )
+            return
+
+        self.snapshot_state("opencode")
+        dlg = ApplyCatalogDialog(self, self.model_catalog, providers)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        report = dlg.apply()
+        if report.any_changes():
+            self.mark_dirty("opencode")
+            self.refresh_tabs()
+            self.status_bar.showMessage(
+                f"Catalog apply: {len(report.filled)} filled, "
+                f"{len(report.added)} added, {len(report.unknown)} unknown"
+            )
+            QMessageBox.information(
+                self, "Apply Complete",
+                f"Filled/updated: {len(report.filled)}\n"
+                f"Added: {len(report.added)}\n"
+                f"Unchanged: {len(report.unchanged)}\n"
+                f"Unknown: {len(report.unknown)}\n"
+                f"Ambiguous: {len(report.ambiguous)}"
+            )
+        else:
+            QMessageBox.information(self, "Apply", "No changes were applied.")
 
     def _toggle_theme(self):
         """Toggle between light/dark/system theme"""

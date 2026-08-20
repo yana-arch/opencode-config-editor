@@ -10,6 +10,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/en/2.0.0/).
 
+## [4.1.0] - 2026-08-20
+
+**Model Format Match & Apply** feature: normalize and match models against the models.dev catalog.
+
+### Added
+
+- **Browse Model Catalog**: browse the full catalog (190+ providers, 6800+ models) with
+  context/output tier, modality and capability filters; view normalized format details;
+  export CSV/JSON.
+- **Match & Format Models from Catalog**: match each configured model id against the catalog,
+  locate its provider, and fill in the normalized format (context, output, modalities, cost,
+  capability flags) either fill-missing or overwrite.
+- **Per-model / per-provider matching** right inside the Models Manager (per-row "Match"
+  button and "Match from Catalog").
+- **Visual old → new diff preview** before applying: field-by-field with add/change/delete
+  colors, provider dropdown for models that match multiple providers, overwrite checkbox.
+- **Catalog tier settings** to configure context/output thresholds for filtering.
+- Bundled models.dev catalog (`models/models.dev.catalog.json`) auto-loaded when opening dialogs.
+- **Test suite** (`tests/`, 32 tests) for the core matching/normalization logic plus a fast
+  model-lookup index; wired into `build.py` and CI.
+
 ## [4.0.0] - 2026-08-19
 
 Major rewrite, transitioning from a single-file script to a modular architecture with a build system.

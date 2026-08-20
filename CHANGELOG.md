@@ -10,6 +10,26 @@ Tất cả các thay đổi đáng chú ý của dự án được ghi lại tro
 Định dạng dựa trên [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/),
 và dự án tuân theo [Semantic Versioning](https://semver.org/lang/vi/).
 
+## [4.1.0] - 2026-08-20
+
+Tính năng **Model Format Match & Apply**: chuẩn hóa và match model từ catalog models.dev.
+
+### Added
+
+- **Browse Model Catalog**: duyệt toàn bộ catalog (190+ provider, 6800+ model) với bộ lọc
+  context/output tier, modality, capability; xem chi tiết format chuẩn hóa; export CSV/JSON.
+- **Match & Format Models from Catalog**: match từng model id trong config với catalog,
+  tìm provider chứa nó, tự điền format chuẩn hóa (context, output, modalities, cost,
+  capability flags) theo chế độ fill-thiếu hoặc ghi đè.
+- **Match theo từng model / cả provider** ngay trong Models Manager (nút "Match" mỗi dòng
+  và "Match from Catalog").
+- **Preview diff trực quan old → new** trước khi áp: từng field với màu thêm/sửa/xóa,
+  chọn provider cho model trùng nhiều provider bằng dropdown, checkbox overwrite.
+- **Catalog tier settings** cấu hình ngưỡng context/output để lọc.
+- Bundle catalog models.dev (`models/models.dev.catalog.json`) tự nạp khi mở dialog.
+- **Test suite** (`tests/`, 32 tests) cho core matching/normalization + index tìm model
+  nhanh; tích hợp vào `build.py` và CI.
+
 ## [4.0.0] - 2026-08-19
 
 Phiên bản viết lại lớn, chuyển từ file đơn sang kiến trúc module + build system.
