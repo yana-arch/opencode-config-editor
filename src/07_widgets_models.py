@@ -121,7 +121,7 @@ class ModelEditDialog(QDialog):
 
         # Cost
         cost = {}
-        for field, edit in [
+        for fname, edit in [
             ("input", self.cost_in_edit),
             ("output", self.cost_out_edit),
             ("cache_read", self.cost_cache_read_edit),
@@ -130,25 +130,25 @@ class ModelEditDialog(QDialog):
             value = edit.text().strip()
             if value:
                 try:
-                    cost[field] = float(value)
+                    cost[fname] = float(value)
                 except ValueError:
-                    QMessageBox.warning(self, "Error", f"Invalid cost value for {field}")
+                    QMessageBox.warning(self, "Error", f"Invalid cost value for {fname}")
                     return
         if cost:
             spec["cost"] = cost
 
         # Limits
         limit = {}
-        for field, edit in [
+        for fname, edit in [
             ("context", self.limit_ctx_edit),
             ("output", self.limit_out_edit)
         ]:
             value = edit.text().strip()
             if value:
                 try:
-                    limit[field] = int(value)
+                    limit[fname] = int(value)
                 except ValueError:
-                    QMessageBox.warning(self, "Error", f"Invalid limit value for {field}")
+                    QMessageBox.warning(self, "Error", f"Invalid limit value for {fname}")
                     return
         if limit:
             spec["limit"] = limit

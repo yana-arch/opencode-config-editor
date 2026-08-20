@@ -87,7 +87,7 @@ class ModelCatalog:
                (isinstance(spec.get("name"), str) and search in spec["name"].lower())
         }
 
-    def formats(self) -> Dict[str, Dict[str, ModelFormat]]:
+    def formats(self) -> Dict[str, Dict[str, "ModelFormat"]]:
         """Lazily build normalized formats: provider -> model_id -> ModelFormat."""
         if getattr(self, "_formats_cache", None) is not None:
             return self._formats_cache
@@ -100,11 +100,11 @@ class ModelCatalog:
         self._formats_cache = cache
         return cache
 
-    def all_formats(self) -> List[ModelFormat]:
+    def all_formats(self) -> List["ModelFormat"]:
         """Flatten all formats across providers."""
         return [fmt for pmap in self.formats().values() for fmt in pmap.values()]
 
-    def find_model(self, model_id: str) -> List[ModelFormat]:
+    def find_model(self, model_id: str) -> List["ModelFormat"]:
         """Match a model id across the whole catalog (may match many providers)."""
         providers = self._model_index.get(model_id)
         if not providers:

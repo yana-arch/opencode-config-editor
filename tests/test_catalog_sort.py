@@ -1,6 +1,4 @@
 """Tests for match ranking helpers (_format_completeness, _sort_matches)."""
-import pytest
-
 from conftest import app
 
 

@@ -83,7 +83,7 @@ class RawJsonTab(QWidget):
             self._set_status("No file loaded", "gray")
             return
         try:
-            data = json.loads(text)
+            json.loads(text)
         except json.JSONDecodeError as e:
             self._set_status(f"Invalid JSON: {e}", "red")
             return

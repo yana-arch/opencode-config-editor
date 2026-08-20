@@ -1,0 +1,12 @@
+# Lint config. The app ships as ONE concatenated file, so ruff checks the
+# built artifact (all imports/names visible in one module) plus build.py and
+# tests. src/ is excluded: per-file checks there would produce false F821s
+# across file boundaries (flat-namespace concatenation by design).
+line-length = 140
+target-version = "py310"
+extend-exclude = ["src"]
+
+[lint]
+# E9 = syntax errors, F = pyflakes (unused imports/vars, undefined names).
+# Style rules intentionally off: noisy for this codebase.
+select = ["E9", "F"]

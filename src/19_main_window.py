@@ -800,7 +800,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Match & Format", "Open a config file first.")
             return
 
-        providers = self.cfg_oc.data.get("provider", {})
+        providers = section(self.cfg_oc.data, "provider")
         if not providers:
             QMessageBox.information(
                 self, "Match & Format", "No providers found in the current config."

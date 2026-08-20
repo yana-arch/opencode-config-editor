@@ -4,8 +4,6 @@ Covers the functions introduced by the "Model Format Match & Apply" feature:
 _parse_modalities, build_spec_from_format, _merge_model_spec, _resolve_match
 and apply_catalog_to_config.
 """
-import pytest
-
 from conftest import app
 
 

@@ -53,7 +53,7 @@ class ProvidersTab(QWidget):
             return
 
         text = text.lower()
-        providers = self.app.cfg.data.get("provider", {}) if self.app.cfg else {}
+        providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
         filtered = {
             name: cfg for name, cfg in providers.items()
             if text in name.lower() or
@@ -66,7 +66,7 @@ class ProvidersTab(QWidget):
     def _update_table(self, providers: Optional[dict] = None):
         """Update table with providers"""
         if providers is None:
-            providers = self.app.cfg.data.get("provider", {}) if self.app.cfg else {}
+            providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
 
         self.table.setRowCount(len(providers))
         self.rows = []
@@ -170,7 +170,7 @@ class ProvidersTab(QWidget):
                 return
             name = selected[0].text()
 
-        providers = self.app.cfg.data.get("provider", {})
+        providers = section(self.app.cfg.data, "provider")
         if name not in providers:
             QMessageBox.warning(self, "Error", f"Provider '{name}' not found")
             return
@@ -210,14 +210,14 @@ class ProvidersTab(QWidget):
             if not _confirm(self, "Remove Providers", f"Remove {len(names)} selected providers?"):
                 return
 
-            providers = self.app.cfg.data.get("provider", {})
+            providers = section(self.app.cfg.data, "provider")
             for name in names:
                 providers.pop(name, None)
         else:
             if not _confirm(self, "Remove Provider", f"Remove provider '{name}'?"):
                 return
 
-            self.app.cfg.data.get("provider", {}).pop(name, None)
+            section(self.app.cfg.data, "provider").pop(name, None)
 
         self.app.mark_dirty()
         self.refresh()
@@ -390,7 +390,7 @@ class ProvidersTab(QWidget):
         if not path:
             return
 
-        providers = self.app.cfg.data.get("provider", {})
+        providers = section(self.app.cfg.data, "provider")
         if not providers:
             QMessageBox.information(self, "Export", "No providers to export")
             return
@@ -411,7 +411,7 @@ class ProvidersTab(QWidget):
     def _edit_models(self, name: str):
         """Edit models for provider"""
         self.app.snapshot_state()
-        providers = self.app.cfg.data.get("provider", {})
+        providers = section(self.app.cfg.data, "provider")
         if name not in providers:
             return
 
@@ -424,7 +424,7 @@ class ProvidersTab(QWidget):
     def _edit_options(self, name: str):
         """Edit options for provider"""
         self.app.snapshot_state()
-        providers = self.app.cfg.data.get("provider", {})
+        providers = section(self.app.cfg.data, "provider")
         if name not in providers:
             return
 

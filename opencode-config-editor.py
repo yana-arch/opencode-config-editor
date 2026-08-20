@@ -33,11 +33,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 try:
     from PySide6.QtCore import (
-        Qt, QTimer, QSize, QPoint, QSettings, QThread, Signal
+        Qt, QTimer, QSettings, QThread, Signal
     )
     from PySide6.QtGui import (
         QAction, QFont, QKeySequence, QColor, QPalette,
@@ -49,7 +49,7 @@ try:
         QPlainTextEdit, QTableWidget, QTableWidgetItem, QPushButton, QLabel,
         QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QSplitter,
         QComboBox, QMessageBox, QFileDialog, QDialogButtonBox, QGroupBox,
-        QHeaderView, QToolBar, QToolButton, QMenu, QDialog, QFrame, QInputDialog,
+        QHeaderView, QToolBar, QDialog, QFrame, QInputDialog,
         QScrollArea
     )
 except ImportError:
@@ -326,6 +326,11 @@ class JSONHighlighter(QSyntaxHighlighter):
             for match in expression.finditer(text):
                 start, end = match.span()
                 self.setFormat(start, end - start, fmt)
+
+def section(cfg_data, key: str) -> dict:
+    """Return cfg_data[key] when it is a dict, else an empty dict."""
+    v = cfg_data.get(key) if isinstance(cfg_data, dict) else None
+    return v if isinstance(v, dict) else {}
 
 class ConfigFile:
     """Enhanced config file handler with backup and validation"""
@@ -830,7 +835,7 @@ class ModelCatalog:
                (isinstance(spec.get("name"), str) and search in spec["name"].lower())
         }
 
-    def formats(self) -> Dict[str, Dict[str, ModelFormat]]:
+    def formats(self) -> Dict[str, Dict[str, "ModelFormat"]]:
         """Lazily build normalized formats: provider -> model_id -> ModelFormat."""
         if getattr(self, "_formats_cache", None) is not None:
             return self._formats_cache
@@ -843,11 +848,11 @@ class ModelCatalog:
         self._formats_cache = cache
         return cache
 
-    def all_formats(self) -> List[ModelFormat]:
+    def all_formats(self) -> List["ModelFormat"]:
         """Flatten all formats across providers."""
         return [fmt for pmap in self.formats().values() for fmt in pmap.values()]
 
-    def find_model(self, model_id: str) -> List[ModelFormat]:
+    def find_model(self, model_id: str) -> List["ModelFormat"]:
         """Match a model id across the whole catalog (may match many providers)."""
         providers = self._model_index.get(model_id)
         if not providers:
@@ -1837,7 +1842,7 @@ class ModelEditDialog(QDialog):
 
         # Cost
         cost = {}
-        for field, edit in [
+        for fname, edit in [
             ("input", self.cost_in_edit),
             ("output", self.cost_out_edit),
             ("cache_read", self.cost_cache_read_edit),
@@ -1846,25 +1851,25 @@ class ModelEditDialog(QDialog):
             value = edit.text().strip()
             if value:
                 try:
-                    cost[field] = float(value)
+                    cost[fname] = float(value)
                 except ValueError:
-                    QMessageBox.warning(self, "Error", f"Invalid cost value for {field}")
+                    QMessageBox.warning(self, "Error", f"Invalid cost value for {fname}")
                     return
         if cost:
             spec["cost"] = cost
 
         # Limits
         limit = {}
-        for field, edit in [
+        for fname, edit in [
             ("context", self.limit_ctx_edit),
             ("output", self.limit_out_edit)
         ]:
             value = edit.text().strip()
             if value:
                 try:
-                    limit[field] = int(value)
+                    limit[fname] = int(value)
                 except ValueError:
-                    QMessageBox.warning(self, "Error", f"Invalid limit value for {field}")
+                    QMessageBox.warning(self, "Error", f"Invalid limit value for {fname}")
                     return
         if limit:
             spec["limit"] = limit
@@ -3576,7 +3581,7 @@ class ProvidersTab(QWidget):
             return
 
         text = text.lower()
-        providers = self.app.cfg.data.get("provider", {}) if self.app.cfg else {}
+        providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
         filtered = {
             name: cfg for name, cfg in providers.items()
             if text in name.lower() or
@@ -3589,7 +3594,7 @@ class ProvidersTab(QWidget):
     def _update_table(self, providers: Optional[dict] = None):
         """Update table with providers"""
         if providers is None:
-            providers = self.app.cfg.data.get("provider", {}) if self.app.cfg else {}
+            providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
 
         self.table.setRowCount(len(providers))
         self.rows = []
@@ -3693,7 +3698,7 @@ class ProvidersTab(QWidget):
                 return
             name = selected[0].text()
 
-        providers = self.app.cfg.data.get("provider", {})
+        providers = section(self.app.cfg.data, "provider")
         if name not in providers:
             QMessageBox.warning(self, "Error", f"Provider '{name}' not found")
             return
@@ -3733,14 +3738,14 @@ class ProvidersTab(QWidget):
             if not _confirm(self, "Remove Providers", f"Remove {len(names)} selected providers?"):
                 return
 
-            providers = self.app.cfg.data.get("provider", {})
+            providers = section(self.app.cfg.data, "provider")
             for name in names:
                 providers.pop(name, None)
         else:
             if not _confirm(self, "Remove Provider", f"Remove provider '{name}'?"):
                 return
 
-            self.app.cfg.data.get("provider", {}).pop(name, None)
+            section(self.app.cfg.data, "provider").pop(name, None)
 
         self.app.mark_dirty()
         self.refresh()
@@ -3913,7 +3918,7 @@ class ProvidersTab(QWidget):
         if not path:
             return
 
-        providers = self.app.cfg.data.get("provider", {})
+        providers = section(self.app.cfg.data, "provider")
         if not providers:
             QMessageBox.information(self, "Export", "No providers to export")
             return
@@ -3934,7 +3939,7 @@ class ProvidersTab(QWidget):
     def _edit_models(self, name: str):
         """Edit models for provider"""
         self.app.snapshot_state()
-        providers = self.app.cfg.data.get("provider", {})
+        providers = section(self.app.cfg.data, "provider")
         if name not in providers:
             return
 
@@ -3947,7 +3952,7 @@ class ProvidersTab(QWidget):
     def _edit_options(self, name: str):
         """Edit options for provider"""
         self.app.snapshot_state()
-        providers = self.app.cfg.data.get("provider", {})
+        providers = section(self.app.cfg.data, "provider")
         if name not in providers:
             return
 
@@ -6403,7 +6408,7 @@ class RawJsonTab(QWidget):
             self._set_status("No file loaded", "gray")
             return
         try:
-            data = json.loads(text)
+            json.loads(text)
         except json.JSONDecodeError as e:
             self._set_status(f"Invalid JSON: {e}", "red")
             return
@@ -7258,7 +7263,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Match & Format", "Open a config file first.")
             return
 
-        providers = self.cfg_oc.data.get("provider", {})
+        providers = section(self.cfg_oc.data, "provider")
         if not providers:
             QMessageBox.information(
                 self, "Match & Format", "No providers found in the current config."

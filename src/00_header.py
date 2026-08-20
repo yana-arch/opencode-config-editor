@@ -33,11 +33,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 try:
     from PySide6.QtCore import (
-        Qt, QTimer, QSize, QPoint, QSettings, QThread, Signal
+        Qt, QTimer, QSettings, QThread, Signal
     )
     from PySide6.QtGui import (
         QAction, QFont, QKeySequence, QColor, QPalette,
@@ -49,7 +49,7 @@ try:
         QPlainTextEdit, QTableWidget, QTableWidgetItem, QPushButton, QLabel,
         QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QSplitter,
         QComboBox, QMessageBox, QFileDialog, QDialogButtonBox, QGroupBox,
-        QHeaderView, QToolBar, QToolButton, QMenu, QDialog, QFrame, QInputDialog,
+        QHeaderView, QToolBar, QDialog, QFrame, QInputDialog,
         QScrollArea
     )
 except ImportError:

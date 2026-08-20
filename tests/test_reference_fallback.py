@@ -1,9 +1,5 @@
 """Tests for reference-provider fallback: id normalization, fallback lookup,
 and persisted mappings."""
-import json
-
-import pytest
-
 from conftest import app
 
 

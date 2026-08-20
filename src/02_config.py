@@ -41,6 +41,11 @@ class JSONHighlighter(QSyntaxHighlighter):
                 start, end = match.span()
                 self.setFormat(start, end - start, fmt)
 
+def section(cfg_data, key: str) -> dict:
+    """Return cfg_data[key] when it is a dict, else an empty dict."""
+    v = cfg_data.get(key) if isinstance(cfg_data, dict) else None
+    return v if isinstance(v, dict) else {}
+
 class ConfigFile:
     """Enhanced config file handler with backup and validation"""
 
