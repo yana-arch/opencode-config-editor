@@ -64,7 +64,7 @@ except ImportError:
 
 # Constants
 APP_NAME = "opencode-config-editor"
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.3.1"
 SCHEMA_URL = "https://opencode.ai/config.json"
 TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
 SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"
@@ -97,6 +97,7 @@ MODEL_FIELDS = [
     "limit.context", "limit.output"
 ]
 
+# Application settings, theme and undo/redo management
 class SettingsManager:
     """Handle application settings with QSettings"""
 
@@ -283,6 +284,7 @@ class UndoManager:
         self.undo_stack.append(copy.deepcopy(current))
         return self.redo_stack.pop()
 
+# Config file model, validation and state stores
 class JSONHighlighter(QSyntaxHighlighter):
     """Syntax highlighter for JSON editor"""
 
@@ -655,6 +657,91 @@ class TuiPluginStateStore:
             self._data.pop(key, None)
         self._save()
 
+# JSON parsing / import helpers for providers, MCP servers and models
+def _load_json_file(path: Path) -> dict:
+    """Load JSON with error handling"""
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _slugify(s: str) -> str:
+    """Convert string to slug"""
+    s = re.sub(r"[^a-zA-Z0-9_.\-]+", "-", str(s)).strip("-")
+    return s or "item"
+
+def _looks_like_provider_cfg(v) -> bool:
+    """Check if object looks like a provider config"""
+    return isinstance(v, dict) and any(k in v for k in ("npm", "models", "options", "name", "id"))
+
+def parse_provider_import(obj: dict) -> dict:
+    """Parse provider import from various JSON formats"""
+    if isinstance(obj, dict) and isinstance(obj.get("provider"), dict) and obj["provider"]:
+        obj = obj["provider"]
+
+    if isinstance(obj, dict) and obj and all(_looks_like_provider_cfg(v) for v in obj.values()):
+        return obj
+
+    if _looks_like_provider_cfg(obj):
+        key = _slugify(obj.get("id") or obj.get("name") or "provider")
+        cfg = {k: v for k, v in obj.items() if k != "id"}
+        return {key: cfg}
+
+    raise ValueError(
+        "Unrecognized provider JSON. Expected a provider object, a "
+        "{name: provider} map, or a full config containing 'provider'."
+    )
+
+def _looks_like_mcp_cfg(v) -> bool:
+    """Check if object looks like an MCP config"""
+    return isinstance(v, dict) and any(k in v for k in ("type", "command", "url", "enabled"))
+
+def parse_mcp_import(obj: dict) -> dict:
+    """Parse MCP import from various JSON formats"""
+    if isinstance(obj, dict) and isinstance(obj.get("mcp"), dict) and obj["mcp"]:
+        obj = obj["mcp"]
+
+    if isinstance(obj, dict) and obj and all(_looks_like_mcp_cfg(v) for v in obj.values()):
+        return obj
+
+    if _looks_like_mcp_cfg(obj):
+        key = _slugify(obj.get("name") or obj.get("id") or "server")
+        cfg = {k: v for k, v in obj.items() if k not in ("name", "id")}
+        return {key: cfg}
+
+    raise ValueError(
+        "Unrecognized MCP JSON. Expected a server object or a {name: server} map."
+    )
+
+def merge_dict(base: dict, incoming: dict) -> dict:
+    """Merge two configs with special handling for models/options"""
+    out = dict(base)
+    for k, v in incoming.items():
+        if k in ("models", "options") and isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = {**out[k], **v}
+        else:
+            out[k] = v
+    return out
+
+def _extract_models_map(data) -> dict:
+    """Extract models map from various formats"""
+    if isinstance(data, dict):
+        if isinstance(data.get("models"), dict):
+            return data["models"]
+        if data and all(isinstance(v, dict) for v in data.values()):
+            return data
+
+    if isinstance(data, list):
+        out = {}
+        for item in data:
+            if isinstance(item, dict) and "id" in item:
+                out[item["id"]] = {k: v for k, v in item.items() if k != "id"}
+        if not out:
+            raise ValueError("Array items must be objects with an 'id' field.")
+        return out
+
+    raise ValueError("Unrecognized models JSON shape.")
+
+# Model catalog, normalized model formats, matching and fallback logic
 class ModelCatalog:
     """Enhanced model catalog with filtering and preview"""
 
@@ -768,12 +855,6 @@ class ModelCatalog:
         fmts = self.formats()
         return [fmts[p][model_id] for p in providers if model_id in fmts.get(p, {})]
 
-def _load_json_file(path: Path) -> dict:
-    """Load JSON with error handling"""
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def try_load_bundled_catalog(catalog) -> bool:
     """Silently load the bundled models.dev catalog into `catalog` if present.
 
@@ -788,83 +869,6 @@ def try_load_bundled_catalog(catalog) -> bool:
     except (OSError, ValueError):
         pass
     return False
-
-def _slugify(s: str) -> str:
-    """Convert string to slug"""
-    s = re.sub(r"[^a-zA-Z0-9_.\-]+", "-", str(s)).strip("-")
-    return s or "item"
-
-def _looks_like_provider_cfg(v) -> bool:
-    """Check if object looks like a provider config"""
-    return isinstance(v, dict) and any(k in v for k in ("npm", "models", "options", "name", "id"))
-
-def parse_provider_import(obj: dict) -> dict:
-    """Parse provider import from various JSON formats"""
-    if isinstance(obj, dict) and isinstance(obj.get("provider"), dict) and obj["provider"]:
-        obj = obj["provider"]
-
-    if isinstance(obj, dict) and obj and all(_looks_like_provider_cfg(v) for v in obj.values()):
-        return obj
-
-    if _looks_like_provider_cfg(obj):
-        key = _slugify(obj.get("id") or obj.get("name") or "provider")
-        cfg = {k: v for k, v in obj.items() if k != "id"}
-        return {key: cfg}
-
-    raise ValueError(
-        "Unrecognized provider JSON. Expected a provider object, a "
-        "{name: provider} map, or a full config containing 'provider'."
-    )
-
-def _looks_like_mcp_cfg(v) -> bool:
-    """Check if object looks like an MCP config"""
-    return isinstance(v, dict) and any(k in v for k in ("type", "command", "url", "enabled"))
-
-def parse_mcp_import(obj: dict) -> dict:
-    """Parse MCP import from various JSON formats"""
-    if isinstance(obj, dict) and isinstance(obj.get("mcp"), dict) and obj["mcp"]:
-        obj = obj["mcp"]
-
-    if isinstance(obj, dict) and obj and all(_looks_like_mcp_cfg(v) for v in obj.values()):
-        return obj
-
-    if _looks_like_mcp_cfg(obj):
-        key = _slugify(obj.get("name") or obj.get("id") or "server")
-        cfg = {k: v for k, v in obj.items() if k not in ("name", "id")}
-        return {key: cfg}
-
-    raise ValueError(
-        "Unrecognized MCP JSON. Expected a server object or a {name: server} map."
-    )
-
-def merge_dict(base: dict, incoming: dict) -> dict:
-    """Merge two configs with special handling for models/options"""
-    out = dict(base)
-    for k, v in incoming.items():
-        if k in ("models", "options") and isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = {**out[k], **v}
-        else:
-            out[k] = v
-    return out
-
-def _extract_models_map(data) -> dict:
-    """Extract models map from various formats"""
-    if isinstance(data, dict):
-        if isinstance(data.get("models"), dict):
-            return data["models"]
-        if data and all(isinstance(v, dict) for v in data.values()):
-            return data
-
-    if isinstance(data, list):
-        out = {}
-        for item in data:
-            if isinstance(item, dict) and "id" in item:
-                out[item["id"]] = {k: v for k, v in item.items() if k != "id"}
-        if not out:
-            raise ValueError("Array items must be objects with an 'id' field.")
-        return out
-
-    raise ValueError("Unrecognized models JSON shape.")
 
 def _merge_model_spec(existing, catalog_spec: dict, overwrite: bool) -> dict:
     """Merge model spec with catalog spec"""
@@ -1292,6 +1296,7 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     return None
 
 
+# Provider model-list fetching (adapters, SSRF guard, response parsing)
 # ---------------------------------------------------------------------------
 # Provider model fetching (import a new provider by fetching its model list)
 # ---------------------------------------------------------------------------
@@ -1528,6 +1533,7 @@ def fetch_provider_models(spec: ProviderFetchSpec, *, opener=None) -> dict:
     return parse_fetched_models(data, spec)
 
 
+# Shared GUI components and generic import dialogs
 # GUI Components
 def _esc_html(s) -> str:
     return html.escape(str(s), quote=True)
@@ -1641,6 +1647,74 @@ class SearchableTableWidget(QTableWidget):
             value = item.get(header, "")
             self.setItem(row, col, QTableWidgetItem(str(value)))
 
+class JsonImportDialog(QDialog):
+    """Enhanced JSON import dialog with syntax highlighting"""
+
+    def __init__(self, parent, title: str, hint: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(700, 500)
+        self.result_data = None
+
+        layout = QVBoxLayout(self)
+
+        if hint:
+            hint_label = QLabel(hint)
+            hint_label.setWordWrap(True)
+            layout.addWidget(hint_label)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        load_btn = QPushButton("Load from file...")
+        load_btn.clicked.connect(self._load_file)
+        paste_btn = QPushButton("Paste from clipboard")
+        paste_btn.clicked.connect(self._paste)
+        button_layout.addWidget(load_btn)
+        button_layout.addWidget(paste_btn)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+        # Editor
+        self.editor = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = JSONHighlighter(self.editor.document())
+        layout.addWidget(self.editor)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _load_file(self):
+        """Load JSON from file"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load JSON", str(Path.home()),
+            "JSON files (*.json);;All files (*)"
+        )
+        if path:
+            try:
+                self.editor.setPlainText(Path(path).read_text(encoding="utf-8"))
+            except OSError as e:
+                QMessageBox.warning(self, "Load Error", str(e))
+
+    def _paste(self):
+        """Paste from clipboard"""
+        cb = QApplication.clipboard()
+        self.editor.setPlainText(cb.text())
+
+    def _accept(self):
+        """Validate and accept"""
+        try:
+            self.result_data = json.loads(self.editor.toPlainText())
+            self.accept()
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "Invalid JSON", str(e))
+
+
+# Model editing and management dialogs (Models Manager and friends)
 class ModelEditDialog(QDialog):
     """Enhanced model edit dialog with validation"""
 
@@ -2214,6 +2288,96 @@ class ModelsManagerDialog(QDialog):
         """Get result models"""
         return self.models
 
+class BulkEditDialog(QDialog):
+    """Dialog for bulk editing model fields"""
+
+    def __init__(self, parent, models: dict, model_ids: set):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Edit Models")
+        self.resize(500, 400)
+
+        self.models = models
+        self.model_ids = model_ids
+
+        layout = QVBoxLayout(self)
+
+        # Info
+        info_label = QLabel(f"Editing {len(model_ids)} models")
+        layout.addWidget(info_label)
+
+        # Fields to edit
+        self.field_combo = QComboBox()
+        self.field_combo.addItems(MODEL_FIELDS)
+        layout.addWidget(self.field_combo)
+
+        # Value
+        self.value_edit = QLineEdit()
+        self.value_edit.setPlaceholderText("Leave empty to remove field")
+        layout.addWidget(self.value_edit)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def apply_to_model(self, model: dict) -> dict:
+        """Apply bulk edit to a model"""
+        field = self.field_combo.currentText()
+        value = self.value_edit.text().strip()
+
+        if not field:
+            return model
+
+        model = dict(model)
+
+        # Handle nested fields
+        if "." in field:
+            parts = field.split(".")
+            current = model
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+                if not isinstance(current, dict):
+                    current = {}
+            last_part = parts[-1]
+
+            if value:
+                try:
+                    if last_part in ("input", "output", "cache_read", "cache_write"):
+                        current[last_part] = float(value)
+                    else:
+                        current[last_part] = int(value)
+                except ValueError:
+                    pass
+            else:
+                current.pop(last_part, None)
+                # Clean up empty parent objects
+                for part in reversed(parts[:-1]):
+                    parent = model
+                    for p in parts[:parts.index(part)]:
+                        parent = parent[p]
+                    if not parent.get(part):
+                        parent.pop(part, None)
+        else:
+            if value:
+                if field in ("attachment", "reasoning", "temperature", "tool_call"):
+                    model[field] = value.lower() in ("true", "1", "yes")
+                else:
+                    try:
+                        model[field] = int(value)
+                    except ValueError:
+                        try:
+                            model[field] = float(value)
+                        except ValueError:
+                            model[field] = value
+            else:
+                model.pop(field, None)
+
+        return model
+
+# Catalog dialogs: preview/match, browse, apply, fetch and format card
 class CatalogPreviewDialog(QDialog):
     """Dialog to preview catalog application"""
 
@@ -2699,162 +2863,6 @@ class MatchFormatPreviewDialog(QDialog):
             if check is not None and check.isChecked():
                 out.append(self.entries[row])
         return out
-
-class BulkEditDialog(QDialog):
-    """Dialog for bulk editing model fields"""
-
-    def __init__(self, parent, models: dict, model_ids: set):
-        super().__init__(parent)
-        self.setWindowTitle("Bulk Edit Models")
-        self.resize(500, 400)
-
-        self.models = models
-        self.model_ids = model_ids
-
-        layout = QVBoxLayout(self)
-
-        # Info
-        info_label = QLabel(f"Editing {len(model_ids)} models")
-        layout.addWidget(info_label)
-
-        # Fields to edit
-        self.field_combo = QComboBox()
-        self.field_combo.addItems(MODEL_FIELDS)
-        layout.addWidget(self.field_combo)
-
-        # Value
-        self.value_edit = QLineEdit()
-        self.value_edit.setPlaceholderText("Leave empty to remove field")
-        layout.addWidget(self.value_edit)
-
-        # Buttons
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-
-    def apply_to_model(self, model: dict) -> dict:
-        """Apply bulk edit to a model"""
-        field = self.field_combo.currentText()
-        value = self.value_edit.text().strip()
-
-        if not field:
-            return model
-
-        model = dict(model)
-
-        # Handle nested fields
-        if "." in field:
-            parts = field.split(".")
-            current = model
-            for part in parts[:-1]:
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
-                if not isinstance(current, dict):
-                    current = {}
-            last_part = parts[-1]
-
-            if value:
-                try:
-                    if last_part in ("input", "output", "cache_read", "cache_write"):
-                        current[last_part] = float(value)
-                    else:
-                        current[last_part] = int(value)
-                except ValueError:
-                    pass
-            else:
-                current.pop(last_part, None)
-                # Clean up empty parent objects
-                for part in reversed(parts[:-1]):
-                    parent = model
-                    for p in parts[:parts.index(part)]:
-                        parent = parent[p]
-                    if not parent.get(part):
-                        parent.pop(part, None)
-        else:
-            if value:
-                if field in ("attachment", "reasoning", "temperature", "tool_call"):
-                    model[field] = value.lower() in ("true", "1", "yes")
-                else:
-                    try:
-                        model[field] = int(value)
-                    except ValueError:
-                        try:
-                            model[field] = float(value)
-                        except ValueError:
-                            model[field] = value
-            else:
-                model.pop(field, None)
-
-        return model
-
-class JsonImportDialog(QDialog):
-    """Enhanced JSON import dialog with syntax highlighting"""
-
-    def __init__(self, parent, title: str, hint: str = ""):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(700, 500)
-        self.result_data = None
-
-        layout = QVBoxLayout(self)
-
-        if hint:
-            hint_label = QLabel(hint)
-            hint_label.setWordWrap(True)
-            layout.addWidget(hint_label)
-
-        # Buttons
-        button_layout = QHBoxLayout()
-        load_btn = QPushButton("Load from file...")
-        load_btn.clicked.connect(self._load_file)
-        paste_btn = QPushButton("Paste from clipboard")
-        paste_btn.clicked.connect(self._paste)
-        button_layout.addWidget(load_btn)
-        button_layout.addWidget(paste_btn)
-        button_layout.addStretch()
-        layout.addLayout(button_layout)
-
-        # Editor
-        self.editor = QPlainTextEdit()
-        font = QFont("Monospace")
-        font.setStyleHint(QFont.Monospace)
-        self.editor.setFont(font)
-        self.highlighter = JSONHighlighter(self.editor.document())
-        layout.addWidget(self.editor)
-
-        # Buttons
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(self._accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-
-    def _load_file(self):
-        """Load JSON from file"""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load JSON", str(Path.home()),
-            "JSON files (*.json);;All files (*)"
-        )
-        if path:
-            try:
-                self.editor.setPlainText(Path(path).read_text(encoding="utf-8"))
-            except OSError as e:
-                QMessageBox.warning(self, "Load Error", str(e))
-
-    def _paste(self):
-        """Paste from clipboard"""
-        cb = QApplication.clipboard()
-        self.editor.setPlainText(cb.text())
-
-    def _accept(self):
-        """Validate and accept"""
-        try:
-            self.result_data = json.loads(self.editor.toPlainText())
-            self.accept()
-        except json.JSONDecodeError as e:
-            QMessageBox.warning(self, "Invalid JSON", str(e))
-
 
 class _ModelFetchWorker(QThread):
     """Runs fetch_provider_models off the UI thread."""
@@ -3513,6 +3521,7 @@ class ApplyCatalogDialog(QDialog):
         )
         return report
 
+# Providers tab
 class ProvidersTab(QWidget):
     """Enhanced providers tab with search and bulk operations"""
 
@@ -3988,6 +3997,7 @@ class ProvidersTab(QWidget):
 
             providers[new_name] = old_cfg
 
+# MCP servers tab
 class MCPHeadersDialog(QDialog):
     """Edit the `headers` map (name -> value) of a remote MCP server.
 
@@ -4386,6 +4396,7 @@ class McpTab(QWidget):
         # Enabled states are already applied live
         pass
 
+# Plugins tab
 class PluginsTab(QWidget):
     """Enhanced plugins tab with search and bulk operations"""
 
@@ -4637,6 +4648,7 @@ class PluginsTab(QWidget):
         if self.app.cfg:
             self.state_store.set_disabled(self.app.cfg.path, set(disabled))
 
+# Permissions tab
 class PermissionTab(QWidget):
     """Enhanced permission tab with search"""
 
@@ -4789,6 +4801,7 @@ class PermissionTab(QWidget):
         # Permissions are edited directly in the config
         pass
 
+# Runtime tab and its small editor widgets
 class StringListEdit(QWidget):
     """Editable list of strings backed by a nested key path in the config."""
 
@@ -5309,6 +5322,7 @@ class RuntimeTab(QWidget):
         self._touched.clear()
 
 
+# Agents tab
 class AgentEditDialog(QDialog):
     """Add/edit a custom agent."""
 
@@ -5511,6 +5525,7 @@ class AgentsTab(QWidget):
         pass  # mutations applied live to cfg.data
 
 
+# Commands tab
 class CommandEditDialog(QDialog):
     """Add/edit a custom command."""
 
@@ -5669,6 +5684,7 @@ class CommandsTab(QWidget):
         pass  # mutations applied live to cfg.data
 
 
+# TUI tab
 class TuiPluginEditor(QWidget):
     """Manage the tui.json `plugin` list + `plugin_enabled` state map.
 
@@ -6115,6 +6131,7 @@ class TuiTab(QWidget):
         self._touched.clear()
 
 
+# General tab
 class GeneralTab(QWidget):
     """Enhanced general tab with validation"""
 
@@ -6301,6 +6318,7 @@ class GeneralTab(QWidget):
         self.disabled_providers.collect(data)
         self.enabled_providers.collect(data)
 
+# Raw JSON tab and shared confirm helper
 class RawJsonTab(QWidget):
     """Enhanced raw JSON editor with validation and formatting"""
 

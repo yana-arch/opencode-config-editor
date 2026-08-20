@@ -13,11 +13,26 @@ OUT = ROOT / "opencode-config-editor.py"
 
 ORDER = [
     "00_header.py",
-    "01_core.py",
-    "02_widgets.py",
-    "03_tabs.py",
-    "04_main_window.py",
-    "05_main.py",
+    "01_settings.py",
+    "02_config.py",
+    "03_parsing.py",
+    "04_catalog.py",
+    "05_provider_fetch.py",
+    "06_widgets_common.py",
+    "07_widgets_models.py",
+    "08_widgets_catalog.py",
+    "09_tab_providers.py",
+    "10_tab_mcp.py",
+    "11_tab_plugins.py",
+    "12_tab_permission.py",
+    "13_tab_runtime.py",
+    "14_tab_agents.py",
+    "15_tab_commands.py",
+    "16_tab_tui.py",
+    "17_tab_general.py",
+    "18_tab_raw.py",
+    "19_main_window.py",
+    "20_main.py",
 ]
 
 def build() -> None:

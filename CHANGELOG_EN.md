@@ -10,6 +10,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/en/2.0.0/).
 
+## [4.3.1] - 2026-08-20
+
+### Changed
+
+- Split the large modules into 21 small domain-focused files (settings, config,
+  parsing, catalog, provider fetch, common/models/catalog widgets, 10 individual
+  tabs, main window, main). No behavior change — code moved verbatim, build
+  concatenates as before, 75 tests pass.
+
 ## [4.3.0] - 2026-08-20
 
 Streamlined bulk match review + **Reference provider fallback** for unmatched models.

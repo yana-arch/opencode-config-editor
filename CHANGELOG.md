@@ -10,6 +10,14 @@ Tất cả các thay đổi đáng chú ý của dự án được ghi lại tro
 Định dạng dựa trên [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/),
 và dự án tuân theo [Semantic Versioning](https://semver.org/lang/vi/).
 
+## [4.3.1] - 2026-08-20
+
+### Changed
+
+- Tách module lớn thành 21 file nhỏ theo miền (settings, config, parsing, catalog,
+  provider fetch, widgets common/models/catalog, 10 tab riêng, main window, main).
+  Không đổi hành vi — code được chuyển nguyên vẹn, build ghép như cũ, 75 tests PASS.
+
 ## [4.3.0] - 2026-08-20
 
 Tối ưu duyệt match hàng loạt + **Reference provider fallback** cho model không match.
