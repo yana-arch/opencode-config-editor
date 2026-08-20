@@ -1173,6 +1173,189 @@ class JsonImportDialog(QDialog):
             QMessageBox.warning(self, "Invalid JSON", str(e))
 
 
+class _ModelFetchWorker(QThread):
+    """Runs fetch_provider_models off the UI thread."""
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, spec):
+        super().__init__()
+        self.spec = spec
+
+    def run(self):
+        try:
+            models = fetch_provider_models(self.spec)
+            self.finished_ok.emit(models)
+        except Exception as e:  # FetchError and anything unexpected
+            self.failed.emit(str(e))
+
+
+class FetchProviderModelsDialog(QDialog):
+    """Fetch a provider's model list from its API and preview the results."""
+
+    def __init__(self, parent, provider_key: str = "new-provider"):
+        super().__init__(parent)
+        self.setWindowTitle("Fetch Provider Models from API")
+        self.resize(720, 560)
+        self.fetched_models = {}   # {model_id: spec}
+        self.provider_key = provider_key
+        self._worker = None
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.key_edit = QLineEdit(provider_key)
+        form.addRow("Provider key:", self.key_edit)
+
+        self.format_combo = QComboBox()
+        for adapter, preset in FETCH_ADAPTERS.items():
+            self.format_combo.addItem(preset["label"], adapter)
+        self.format_combo.currentIndexChanged.connect(self._on_format_change)
+        form.addRow("API format:", self.format_combo)
+
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://api.openai.com/v1")
+        form.addRow("Base URL:", self.url_edit)
+
+        self.apikey_edit = QLineEdit()
+        self.apikey_edit.setEchoMode(QLineEdit.Password)
+        self.apikey_edit.setPlaceholderText("(sent as a header, never saved to config)")
+        form.addRow("API key:", self.apikey_edit)
+
+        layout.addLayout(form)
+
+        # Generic-only advanced fields
+        self.generic_box = QGroupBox("Generic JSON options")
+        gform = QFormLayout(self.generic_box)
+        self.items_path_edit = QLineEdit()
+        self.items_path_edit.setPlaceholderText("data  (dotted path to the array)")
+        self.id_field_edit = QLineEdit()
+        self.id_field_edit.setPlaceholderText("id")
+        self.name_field_edit = QLineEdit()
+        self.name_field_edit.setPlaceholderText("name")
+        gform.addRow("Items path:", self.items_path_edit)
+        gform.addRow("ID field:", self.id_field_edit)
+        gform.addRow("Name field:", self.name_field_edit)
+        layout.addWidget(self.generic_box)
+
+        self.allow_local_check = QCheckBox("Allow local URL (Ollama / LM Studio / localhost)")
+        layout.addWidget(self.allow_local_check)
+
+        # Fetch controls
+        fetch_row = QHBoxLayout()
+        self.fetch_btn = QPushButton("Fetch models")
+        self.fetch_btn.clicked.connect(self._fetch)
+        fetch_row.addWidget(self.fetch_btn)
+        self.status_label = QLabel("")
+        fetch_row.addWidget(self.status_label, 1)
+        layout.addLayout(fetch_row)
+
+        # Results table
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Add", "Model ID", "Name"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.table)
+
+        select_row = QHBoxLayout()
+        all_btn = QPushButton("Select all")
+        all_btn.clicked.connect(lambda: self._set_all(True))
+        none_btn = QPushButton("Select none")
+        none_btn.clicked.connect(lambda: self._set_all(False))
+        select_row.addWidget(all_btn)
+        select_row.addWidget(none_btn)
+        select_row.addStretch()
+        layout.addLayout(select_row)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Add Selected")
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self._on_format_change()
+
+    def _current_adapter(self) -> str:
+        return self.format_combo.currentData()
+
+    def _on_format_change(self):
+        adapter = self._current_adapter()
+        self.generic_box.setVisible(adapter == "generic")
+        # Sensible default base URLs per adapter.
+        defaults = {
+            "openai": "https://api.openai.com/v1",
+            "anthropic": "https://api.anthropic.com",
+            "gemini": "https://generativelanguage.googleapis.com",
+            "models_dev": "https://models.dev/api.json",
+            "generic": "",
+        }
+        if not self.url_edit.text().strip() or self.url_edit.text() in defaults.values():
+            self.url_edit.setText(defaults.get(adapter, ""))
+        self.apikey_edit.setEnabled(adapter != "models_dev")
+
+    def _build_spec(self) -> ProviderFetchSpec:
+        return ProviderFetchSpec(
+            base_url=self.url_edit.text().strip(),
+            adapter=self._current_adapter(),
+            api_key=self.apikey_edit.text(),
+            items_path=self.items_path_edit.text().strip(),
+            id_field=self.id_field_edit.text().strip(),
+            name_field=self.name_field_edit.text().strip(),
+            allow_local=self.allow_local_check.isChecked(),
+        )
+
+    def _fetch(self):
+        if not self.url_edit.text().strip():
+            QMessageBox.warning(self, "Fetch", "Please enter a base URL.")
+            return
+        self.fetch_btn.setEnabled(False)
+        self.status_label.setText("Fetching…")
+        self._worker = _ModelFetchWorker(self._build_spec())
+        self._worker.finished_ok.connect(self._on_fetched)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_fetched(self, models: dict):
+        self.fetched_models = models
+        self.fetch_btn.setEnabled(True)
+        self.status_label.setText(f"Fetched {len(models)} models")
+        self._populate(models)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(models))
+
+    def _on_failed(self, msg: str):
+        self.fetch_btn.setEnabled(True)
+        self.status_label.setText("Fetch failed")
+        QMessageBox.warning(self, "Fetch Error", msg)
+
+    def _populate(self, models: dict):
+        self.table.setRowCount(len(models))
+        for row, (mid, spec) in enumerate(sorted(models.items())):
+            check = QCheckBox()
+            check.setChecked(True)
+            self.table.setCellWidget(row, 0, check)
+            self.table.setItem(row, 1, QTableWidgetItem(mid))
+            self.table.setItem(row, 2, QTableWidgetItem(spec.get("name", "")))
+
+    def _set_all(self, checked: bool):
+        for row in range(self.table.rowCount()):
+            w = self.table.cellWidget(row, 0)
+            if w is not None:
+                w.setChecked(checked)
+
+    @property
+    def selected_models(self) -> dict:
+        """Return {model_id: spec} for checked rows."""
+        out = {}
+        for row in range(self.table.rowCount()):
+            w = self.table.cellWidget(row, 0)
+            if w is not None and w.isChecked():
+                mid = self.table.item(row, 1).text()
+                out[mid] = self.fetched_models.get(mid, {})
+        return out
+
+
+
 class ModelFormatCard(QFrame):
     """Card showing normalized details of a single model format."""
 

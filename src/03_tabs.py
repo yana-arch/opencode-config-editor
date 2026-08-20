@@ -19,6 +19,7 @@ class ProvidersTab(QWidget):
         for text, slot in [
             ("+ Add", self._add_provider),
             ("Import", self._import_providers),
+            ("Fetch from API", self._fetch_provider_models),
             ("Export", self._export_providers),
             ("Enable All", lambda: self._set_all_enabled(True)),
             ("Disable All", lambda: self._set_all_enabled(False))
@@ -261,6 +262,68 @@ class ProvidersTab(QWidget):
             self, "Import Complete",
             f"Added {added} new providers, updated {updated} existing providers"
         )
+
+    def _fetch_provider_models(self):
+        """Fetch a provider's model list from its API, then auto-match the catalog."""
+        self.app.snapshot_state()
+        dlg = FetchProviderModelsDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        key = dlg.key_edit.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Fetch", "Provider key cannot be empty.")
+            return
+
+        selected = dlg.selected_models
+        if not selected:
+            QMessageBox.information(self, "Fetch", "No models selected.")
+            return
+
+        providers = self.app.cfg.data.setdefault("provider", {})
+        prov = providers.setdefault(key, {"npm": "@ai-sdk/openai", "name": key, "models": {}})
+        if not isinstance(prov.get("models"), dict):
+            prov["models"] = {}
+        for mid, spec in selected.items():
+            prov["models"].setdefault(mid, dict(spec))
+
+        self.app.mark_dirty()
+        self._update_table()
+
+        # Auto-match against the catalog to fill normalized format.
+        if not self.app.model_catalog.loaded():
+            if not self.app._ensure_catalog():
+                QMessageBox.information(
+                    self, "Fetch Complete",
+                    f"Added {len(selected)} models to '{key}'. "
+                    "Catalog not loaded, skipped auto-match.")
+                return
+
+        report = apply_catalog_to_config(
+            self.app.model_catalog, {key: prov}, overwrite=False, add_new=False,
+            resolve_fn=lambda p, m, matches: self._pick_catalog_provider(m, matches))
+        self.app.mark_dirty()
+        self._update_table()
+        QMessageBox.information(
+            self, "Fetch & Match Complete",
+            f"Added {len(selected)} models to '{key}'.\n"
+            f"Matched/filled: {len(report.filled)}\n"
+            f"Unchanged: {len(report.unchanged)}\n"
+            f"Unknown (no catalog match): {len(report.unknown)}\n"
+            f"Ambiguous: {len(report.ambiguous)}"
+        )
+
+    def _pick_catalog_provider(self, mid, matches):
+        """Prompt to disambiguate a model that matches multiple catalog providers."""
+        providers = [m.provider for m in matches]
+        choice, ok = QInputDialog.getItem(
+            self, "Choose Catalog Source",
+            f"Model '{mid}' matches multiple providers. Choose one (Cancel to skip):",
+            providers, 0, False
+        )
+        if ok and choice:
+            return next((m for m in matches if m.provider == choice), matches[0])
+        return None
 
     def _export_providers(self):
         """Export providers to JSON file"""

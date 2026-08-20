@@ -10,6 +10,23 @@ Tất cả các thay đổi đáng chú ý của dự án được ghi lại tro
 Định dạng dựa trên [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/),
 và dự án tuân theo [Semantic Versioning](https://semver.org/lang/vi/).
 
+## [4.2.0] - 2026-08-20
+
+Tính năng **Fetch Models từ API provider**: nhập provider mới bằng cách fetch danh sách model trực tiếp từ API.
+
+### Added
+
+- Nút **"Fetch from API"** trong tab Providers: nhập provider key + Base URL + API key,
+  chọn định dạng API rồi fetch danh sách model.
+- Hỗ trợ 5 định dạng API: **OpenAI-compatible** (`/models`), **Anthropic/Claude**
+  (`/v1/models`), **Google Gemini** (`/v1beta/models`), **models.dev** (api.json),
+  và **Generic JSON** (tự khai báo đường dẫn mảng model + field id/name).
+- Fetch chạy trong **QThread** không block UI; danh sách model hiện kèm checkbox chọn.
+- **Auto-match sau fetch**: model fetch về (chỉ có id/name) được tự động match với catalog
+  models.dev để điền context/output/cost/modalities; model trùng nhiều provider sẽ hỏi chọn.
+- Bảo mật: chặn SSRF tới localhost/IP nội bộ (trừ khi bật "Allow local URL"),
+  API key chỉ gửi qua header và không lưu vào config, timeout request.
+
 ## [4.1.0] - 2026-08-20
 
 Tính năng **Model Format Match & Apply**: chuẩn hóa và match model từ catalog models.dev.

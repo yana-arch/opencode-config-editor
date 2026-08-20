@@ -25,6 +25,9 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.parse
+import ipaddress
+import socket
 import html
 from collections import deque
 from dataclasses import dataclass, field
@@ -34,7 +37,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 try:
     from PySide6.QtCore import (
-        Qt, QTimer, QSize, QPoint, QSettings
+        Qt, QTimer, QSize, QPoint, QSettings, QThread, Signal
     )
     from PySide6.QtGui import (
         QAction, QFont, QKeySequence, QColor, QPalette,
@@ -61,7 +64,7 @@ except ImportError:
 
 # Constants
 APP_NAME = "opencode-config-editor"
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.2.0"
 SCHEMA_URL = "https://opencode.ai/config.json"
 TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
 SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"
@@ -1157,6 +1160,243 @@ def _resolve_match(matches, prov_name, mid=None, resolve_fn=None):
     if resolve_fn is not None:
         return resolve_fn(prov_name, mid, matches)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Provider model fetching (import a new provider by fetching its model list)
+# ---------------------------------------------------------------------------
+
+class FetchError(Exception):
+    """Raised when fetching or parsing a provider's model list fails."""
+
+
+@dataclass
+class ProviderFetchSpec:
+    """Describes how to fetch a model list from a provider API."""
+    base_url: str
+    adapter: str = "openai"           # openai | anthropic | gemini | models_dev | generic
+    api_key: str = ""
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    # Generic adapter only:
+    items_path: str = ""              # dotted path to the array, e.g. "data" or "result.models"
+    id_field: str = ""                # field within each item holding the model id
+    name_field: str = ""              # field within each item holding the display name
+    allow_local: bool = False         # permit localhost / private IPs (Ollama, LM Studio)
+    timeout: int = 15
+
+
+# Well-known adapter presets: (endpoint suffix, auth mode, items_path, id_field).
+FETCH_ADAPTERS = {
+    "openai": {
+        "label": "OpenAI-compatible (/models)",
+        "suffix": "/models",
+        "auth": "bearer",
+        "items_path": "data",
+        "id_field": "id",
+        "name_field": "id",
+    },
+    "anthropic": {
+        "label": "Anthropic / Claude (/v1/models)",
+        "suffix": "/v1/models",
+        "auth": "x-api-key",
+        "items_path": "data",
+        "id_field": "id",
+        "name_field": "display_name",
+    },
+    "gemini": {
+        "label": "Google Gemini (/v1beta/models)",
+        "suffix": "/v1beta/models",
+        "auth": "query-key",
+        "items_path": "models",
+        "id_field": "name",
+        "name_field": "displayName",
+    },
+    "models_dev": {
+        "label": "models.dev catalog (api.json)",
+        "suffix": "",
+        "auth": "none",
+        "items_path": "",   # handled specially (catalog dump)
+        "id_field": "id",
+        "name_field": "name",
+    },
+    "generic": {
+        "label": "Generic JSON (custom path)",
+        "suffix": "",
+        "auth": "bearer",
+        "items_path": "data",
+        "id_field": "id",
+        "name_field": "name",
+    },
+}
+
+
+def _is_local_host(host: str) -> bool:
+    """True if host is localhost or resolves to a private/loopback address."""
+    if not host:
+        return True
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    # Resolve hostname; if any resolved address is private, treat as local.
+    try:
+        infos = socket.getaddrinfo(host, None)
+        for info in infos:
+            addr = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    return True
+            except ValueError:
+                continue
+    except (socket.gaierror, OSError):
+        # Cannot resolve; let the request itself fail rather than blocking.
+        return False
+    return False
+
+
+def _validate_fetch_url(url: str, allow_local: bool):
+    """Basic SSRF guard: require http(s) and block private hosts unless allowed."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise FetchError("URL must use http:// or https://")
+    if not parsed.hostname:
+        raise FetchError("URL has no host")
+    if not allow_local and _is_local_host(parsed.hostname):
+        raise FetchError(
+            f"Refusing to fetch from local/private host '{parsed.hostname}'. "
+            "Enable 'Allow local URL' for Ollama/LM Studio.")
+    return parsed
+
+
+def _build_fetch_url(spec: ProviderFetchSpec) -> str:
+    """Combine base_url + adapter suffix (+ query key for Gemini)."""
+    preset = FETCH_ADAPTERS.get(spec.adapter, FETCH_ADAPTERS["generic"])
+    base = spec.base_url.rstrip("/")
+    suffix = preset["suffix"]
+    # Only append the suffix when the base doesn't already include it.
+    if suffix and not base.endswith(suffix.rstrip("/")):
+        url = base + suffix
+    else:
+        url = base
+    if preset["auth"] == "query-key" and spec.api_key:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}key={urllib.parse.quote(spec.api_key)}"
+    return url
+
+
+def _build_fetch_headers(spec: ProviderFetchSpec) -> Dict[str, str]:
+    preset = FETCH_ADAPTERS.get(spec.adapter, FETCH_ADAPTERS["generic"])
+    headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}", "Accept": "application/json"}
+    auth = preset["auth"]
+    if spec.api_key and auth == "bearer":
+        headers["Authorization"] = f"Bearer {spec.api_key}"
+    elif spec.api_key and auth == "x-api-key":
+        headers["x-api-key"] = spec.api_key
+        headers["anthropic-version"] = "2023-06-01"
+    headers.update(spec.extra_headers or {})
+    return headers
+
+
+def _extract_by_path(data, dotted: str):
+    """Follow a dotted path; empty path returns data unchanged."""
+    if not dotted:
+        return data
+    cur = data
+    for part in dotted.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+    return cur
+
+
+def _gemini_model_id(raw_id: str) -> str:
+    """Gemini ids come as 'models/gemini-1.5-pro'; strip the prefix."""
+    if isinstance(raw_id, str) and raw_id.startswith("models/"):
+        return raw_id[len("models/"):]
+    return raw_id
+
+
+def parse_fetched_models(data, spec: ProviderFetchSpec) -> dict:
+    """Normalize a fetched API response into a {model_id: spec} map."""
+    preset = FETCH_ADAPTERS.get(spec.adapter, FETCH_ADAPTERS["generic"])
+
+    # models.dev returns a full catalog dump; flatten across providers.
+    if spec.adapter == "models_dev":
+        flat = {}
+        if isinstance(data, dict):
+            for _pid, pdata in data.items():
+                if isinstance(pdata, dict) and isinstance(pdata.get("models"), dict):
+                    for mid, mspec in pdata["models"].items():
+                        flat.setdefault(mid, mspec)
+        if not flat:
+            raise FetchError("models.dev response contained no models.")
+        return flat
+
+    items_path = spec.items_path or preset["items_path"]
+    id_field = spec.id_field or preset["id_field"]
+    name_field = spec.name_field or preset["name_field"]
+
+    items = _extract_by_path(data, items_path)
+    # Some APIs return the array at the top level.
+    if items is None and isinstance(data, list):
+        items = data
+    if not isinstance(items, list):
+        raise FetchError(
+            f"Could not find a model array at path '{items_path or '(root)'}'. "
+            "Check the format / path.")
+
+    out = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get(id_field)
+        if not raw_id:
+            continue
+        mid = _gemini_model_id(raw_id) if spec.adapter == "gemini" else str(raw_id)
+        model_spec = {}
+        display = item.get(name_field)
+        if display and str(display) != mid:
+            model_spec["name"] = str(display)
+        out[mid] = model_spec
+    if not out:
+        raise FetchError("No models with a valid id were found in the response.")
+    return out
+
+
+def fetch_provider_models(spec: ProviderFetchSpec, *, opener=None) -> dict:
+    """Fetch and normalize a provider's model list. Returns {model_id: spec}.
+
+    `opener` is an optional callable(url, headers, timeout) -> bytes, injected
+    for testing so no real network call is made.
+    """
+    url = _build_fetch_url(spec)
+    _validate_fetch_url(url, spec.allow_local)
+    headers = _build_fetch_headers(spec)
+
+    if opener is not None:
+        raw = opener(url, headers, spec.timeout)
+    else:
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=spec.timeout) as r:
+                raw = r.read()
+        except Exception as e:  # urllib raises many subclasses; surface uniformly
+            raise FetchError(f"Request failed: {e}") from e
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise FetchError(f"Response was not valid JSON: {e}") from e
+
+    return parse_fetched_models(data, spec)
+
 
 # GUI Components
 def _esc_html(s) -> str:
@@ -2333,6 +2573,189 @@ class JsonImportDialog(QDialog):
             QMessageBox.warning(self, "Invalid JSON", str(e))
 
 
+class _ModelFetchWorker(QThread):
+    """Runs fetch_provider_models off the UI thread."""
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, spec):
+        super().__init__()
+        self.spec = spec
+
+    def run(self):
+        try:
+            models = fetch_provider_models(self.spec)
+            self.finished_ok.emit(models)
+        except Exception as e:  # FetchError and anything unexpected
+            self.failed.emit(str(e))
+
+
+class FetchProviderModelsDialog(QDialog):
+    """Fetch a provider's model list from its API and preview the results."""
+
+    def __init__(self, parent, provider_key: str = "new-provider"):
+        super().__init__(parent)
+        self.setWindowTitle("Fetch Provider Models from API")
+        self.resize(720, 560)
+        self.fetched_models = {}   # {model_id: spec}
+        self.provider_key = provider_key
+        self._worker = None
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.key_edit = QLineEdit(provider_key)
+        form.addRow("Provider key:", self.key_edit)
+
+        self.format_combo = QComboBox()
+        for adapter, preset in FETCH_ADAPTERS.items():
+            self.format_combo.addItem(preset["label"], adapter)
+        self.format_combo.currentIndexChanged.connect(self._on_format_change)
+        form.addRow("API format:", self.format_combo)
+
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://api.openai.com/v1")
+        form.addRow("Base URL:", self.url_edit)
+
+        self.apikey_edit = QLineEdit()
+        self.apikey_edit.setEchoMode(QLineEdit.Password)
+        self.apikey_edit.setPlaceholderText("(sent as a header, never saved to config)")
+        form.addRow("API key:", self.apikey_edit)
+
+        layout.addLayout(form)
+
+        # Generic-only advanced fields
+        self.generic_box = QGroupBox("Generic JSON options")
+        gform = QFormLayout(self.generic_box)
+        self.items_path_edit = QLineEdit()
+        self.items_path_edit.setPlaceholderText("data  (dotted path to the array)")
+        self.id_field_edit = QLineEdit()
+        self.id_field_edit.setPlaceholderText("id")
+        self.name_field_edit = QLineEdit()
+        self.name_field_edit.setPlaceholderText("name")
+        gform.addRow("Items path:", self.items_path_edit)
+        gform.addRow("ID field:", self.id_field_edit)
+        gform.addRow("Name field:", self.name_field_edit)
+        layout.addWidget(self.generic_box)
+
+        self.allow_local_check = QCheckBox("Allow local URL (Ollama / LM Studio / localhost)")
+        layout.addWidget(self.allow_local_check)
+
+        # Fetch controls
+        fetch_row = QHBoxLayout()
+        self.fetch_btn = QPushButton("Fetch models")
+        self.fetch_btn.clicked.connect(self._fetch)
+        fetch_row.addWidget(self.fetch_btn)
+        self.status_label = QLabel("")
+        fetch_row.addWidget(self.status_label, 1)
+        layout.addLayout(fetch_row)
+
+        # Results table
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Add", "Model ID", "Name"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.table)
+
+        select_row = QHBoxLayout()
+        all_btn = QPushButton("Select all")
+        all_btn.clicked.connect(lambda: self._set_all(True))
+        none_btn = QPushButton("Select none")
+        none_btn.clicked.connect(lambda: self._set_all(False))
+        select_row.addWidget(all_btn)
+        select_row.addWidget(none_btn)
+        select_row.addStretch()
+        layout.addLayout(select_row)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Add Selected")
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self._on_format_change()
+
+    def _current_adapter(self) -> str:
+        return self.format_combo.currentData()
+
+    def _on_format_change(self):
+        adapter = self._current_adapter()
+        self.generic_box.setVisible(adapter == "generic")
+        # Sensible default base URLs per adapter.
+        defaults = {
+            "openai": "https://api.openai.com/v1",
+            "anthropic": "https://api.anthropic.com",
+            "gemini": "https://generativelanguage.googleapis.com",
+            "models_dev": "https://models.dev/api.json",
+            "generic": "",
+        }
+        if not self.url_edit.text().strip() or self.url_edit.text() in defaults.values():
+            self.url_edit.setText(defaults.get(adapter, ""))
+        self.apikey_edit.setEnabled(adapter != "models_dev")
+
+    def _build_spec(self) -> ProviderFetchSpec:
+        return ProviderFetchSpec(
+            base_url=self.url_edit.text().strip(),
+            adapter=self._current_adapter(),
+            api_key=self.apikey_edit.text(),
+            items_path=self.items_path_edit.text().strip(),
+            id_field=self.id_field_edit.text().strip(),
+            name_field=self.name_field_edit.text().strip(),
+            allow_local=self.allow_local_check.isChecked(),
+        )
+
+    def _fetch(self):
+        if not self.url_edit.text().strip():
+            QMessageBox.warning(self, "Fetch", "Please enter a base URL.")
+            return
+        self.fetch_btn.setEnabled(False)
+        self.status_label.setText("Fetching…")
+        self._worker = _ModelFetchWorker(self._build_spec())
+        self._worker.finished_ok.connect(self._on_fetched)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_fetched(self, models: dict):
+        self.fetched_models = models
+        self.fetch_btn.setEnabled(True)
+        self.status_label.setText(f"Fetched {len(models)} models")
+        self._populate(models)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(models))
+
+    def _on_failed(self, msg: str):
+        self.fetch_btn.setEnabled(True)
+        self.status_label.setText("Fetch failed")
+        QMessageBox.warning(self, "Fetch Error", msg)
+
+    def _populate(self, models: dict):
+        self.table.setRowCount(len(models))
+        for row, (mid, spec) in enumerate(sorted(models.items())):
+            check = QCheckBox()
+            check.setChecked(True)
+            self.table.setCellWidget(row, 0, check)
+            self.table.setItem(row, 1, QTableWidgetItem(mid))
+            self.table.setItem(row, 2, QTableWidgetItem(spec.get("name", "")))
+
+    def _set_all(self, checked: bool):
+        for row in range(self.table.rowCount()):
+            w = self.table.cellWidget(row, 0)
+            if w is not None:
+                w.setChecked(checked)
+
+    @property
+    def selected_models(self) -> dict:
+        """Return {model_id: spec} for checked rows."""
+        out = {}
+        for row in range(self.table.rowCount()):
+            w = self.table.cellWidget(row, 0)
+            if w is not None and w.isChecked():
+                mid = self.table.item(row, 1).text()
+                out[mid] = self.fetched_models.get(mid, {})
+        return out
+
+
+
 class ModelFormatCard(QFrame):
     """Card showing normalized details of a single model format."""
 
@@ -2807,6 +3230,7 @@ class ProvidersTab(QWidget):
         for text, slot in [
             ("+ Add", self._add_provider),
             ("Import", self._import_providers),
+            ("Fetch from API", self._fetch_provider_models),
             ("Export", self._export_providers),
             ("Enable All", lambda: self._set_all_enabled(True)),
             ("Disable All", lambda: self._set_all_enabled(False))
@@ -3049,6 +3473,68 @@ class ProvidersTab(QWidget):
             self, "Import Complete",
             f"Added {added} new providers, updated {updated} existing providers"
         )
+
+    def _fetch_provider_models(self):
+        """Fetch a provider's model list from its API, then auto-match the catalog."""
+        self.app.snapshot_state()
+        dlg = FetchProviderModelsDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        key = dlg.key_edit.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Fetch", "Provider key cannot be empty.")
+            return
+
+        selected = dlg.selected_models
+        if not selected:
+            QMessageBox.information(self, "Fetch", "No models selected.")
+            return
+
+        providers = self.app.cfg.data.setdefault("provider", {})
+        prov = providers.setdefault(key, {"npm": "@ai-sdk/openai", "name": key, "models": {}})
+        if not isinstance(prov.get("models"), dict):
+            prov["models"] = {}
+        for mid, spec in selected.items():
+            prov["models"].setdefault(mid, dict(spec))
+
+        self.app.mark_dirty()
+        self._update_table()
+
+        # Auto-match against the catalog to fill normalized format.
+        if not self.app.model_catalog.loaded():
+            if not self.app._ensure_catalog():
+                QMessageBox.information(
+                    self, "Fetch Complete",
+                    f"Added {len(selected)} models to '{key}'. "
+                    "Catalog not loaded, skipped auto-match.")
+                return
+
+        report = apply_catalog_to_config(
+            self.app.model_catalog, {key: prov}, overwrite=False, add_new=False,
+            resolve_fn=lambda p, m, matches: self._pick_catalog_provider(m, matches))
+        self.app.mark_dirty()
+        self._update_table()
+        QMessageBox.information(
+            self, "Fetch & Match Complete",
+            f"Added {len(selected)} models to '{key}'.\n"
+            f"Matched/filled: {len(report.filled)}\n"
+            f"Unchanged: {len(report.unchanged)}\n"
+            f"Unknown (no catalog match): {len(report.unknown)}\n"
+            f"Ambiguous: {len(report.ambiguous)}"
+        )
+
+    def _pick_catalog_provider(self, mid, matches):
+        """Prompt to disambiguate a model that matches multiple catalog providers."""
+        providers = [m.provider for m in matches]
+        choice, ok = QInputDialog.getItem(
+            self, "Choose Catalog Source",
+            f"Model '{mid}' matches multiple providers. Choose one (Cancel to skip):",
+            providers, 0, False
+        )
+        if ok and choice:
+            return next((m for m in matches if m.provider == choice), matches[0])
+        return None
 
     def _export_providers(self):
         """Export providers to JSON file"""

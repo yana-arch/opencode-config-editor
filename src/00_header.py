@@ -25,6 +25,9 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.parse
+import ipaddress
+import socket
 import html
 from collections import deque
 from dataclasses import dataclass, field
@@ -34,7 +37,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 try:
     from PySide6.QtCore import (
-        Qt, QTimer, QSize, QPoint, QSettings
+        Qt, QTimer, QSize, QPoint, QSettings, QThread, Signal
     )
     from PySide6.QtGui import (
         QAction, QFont, QKeySequence, QColor, QPalette,
@@ -61,7 +64,7 @@ except ImportError:
 
 # Constants
 APP_NAME = "opencode-config-editor"
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.2.0"
 SCHEMA_URL = "https://opencode.ai/config.json"
 TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
 SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"

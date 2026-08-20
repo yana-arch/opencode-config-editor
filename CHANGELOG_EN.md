@@ -10,6 +10,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/en/2.0.0/).
 
+## [4.2.0] - 2026-08-20
+
+**Fetch Models from provider API** feature: add a new provider by fetching its model list directly from the API.
+
+### Added
+
+- **"Fetch from API"** button in the Providers tab: enter provider key + Base URL + API key,
+  pick an API format and fetch the model list.
+- Five API formats supported: **OpenAI-compatible** (`/models`), **Anthropic/Claude**
+  (`/v1/models`), **Google Gemini** (`/v1beta/models`), **models.dev** (api.json),
+  and **Generic JSON** (custom array path + id/name fields).
+- Fetching runs in a **QThread** so the UI never blocks; results listed with checkboxes.
+- **Auto-match after fetch**: fetched models (id/name only) are automatically matched
+  against the models.dev catalog to fill context/output/cost/modalities; ambiguous ids
+  prompt for provider selection.
+- Security: SSRF guard against localhost/private IPs (unless "Allow local URL" is set),
+  API key sent as a header only and never stored in the config, request timeout.
+
 ## [4.1.0] - 2026-08-20
 
 **Model Format Match & Apply** feature: normalize and match models against the models.dev catalog.
