@@ -23,10 +23,14 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build (runs pytest suite)
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python3 build.py
 
       - name: Ruff (built artifact + build script + tests)
         run: ruff check
 
       - name: Coverage report
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python3 -m pytest tests/ -q --cov=. --cov-report=term
