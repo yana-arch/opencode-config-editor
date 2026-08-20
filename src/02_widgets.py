@@ -634,7 +634,8 @@ class ModelsManagerDialog(QDialog):
             )
             return
 
-        dlg = MatchFormatPreviewDialog(self, entries, ambiguous_data)
+        dlg = MatchFormatPreviewDialog(
+            self, entries, ambiguous_data, catalog=self.app.model_catalog)
         if dlg.exec() != QDialog.Accepted:
             return
 
@@ -644,6 +645,8 @@ class ModelsManagerDialog(QDialog):
             # Use the provider picked in the combo for ambiguous entries.
             if status == "ambiguous":
                 new_spec = dlg.resolved_specs.get(mid, new_spec)
+            elif status == "mapped":
+                new_spec = dlg.mapped_specs.get(mid, new_spec)
             if new_spec is None:
                 continue
             self.models[mid] = _merge_model_spec(
@@ -814,10 +817,61 @@ class CatalogPreviewDialog(QDialog):
                 selected.append(self.table.item(row, 1).text())
         return selected
 
+class CatalogModelPickerDialog(QDialog):
+    """Searchable picker over catalog formats (used to map unknown models)."""
+
+    def __init__(self, parent, catalog, initial_filter: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Map to Catalog Model")
+        self.resize(520, 520)
+        self._formats = list(catalog.all_formats()) if catalog is not None else []
+        self.selected_format = None
+
+        layout = QVBoxLayout(self)
+        self.search = QLineEdit(initial_filter)
+        self.search.setPlaceholderText("Filter by provider, model id or name...")
+        self.search.textChanged.connect(self._filter)
+        layout.addWidget(self.search)
+
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _item: self._accept())
+        layout.addWidget(self.list)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._filter()
+
+    def _filter(self):
+        text = self.search.text().lower()
+        self.list.clear()
+        shown = 0
+        for fmt in self._formats:
+            label = f"{fmt.provider} · {fmt.model_id}"
+            if text and text not in label.lower() and text not in (fmt.name or "").lower():
+                continue
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, fmt)
+            self.list.addItem(item)
+            shown += 1
+            if shown >= 400:  # keep the list snappy on huge catalogs
+                break
+
+    def _accept(self):
+        item = self.list.currentItem()
+        if item is not None:
+            self.selected_format = item.data(Qt.UserRole)
+        if self.selected_format is not None:
+            self.accept()
+
+
 class MatchFormatPreviewDialog(QDialog):
     """Preview old vs new model config after matching against the catalog."""
 
-    def __init__(self, parent, entries, ambiguous_data=None):
+    def __init__(self, parent, entries, ambiguous_data=None,
+                 fallback_data=None, catalog=None):
         super().__init__(parent)
         self.setWindowTitle("Preview Matched Models")
         self.resize(900, 600)
@@ -825,6 +879,10 @@ class MatchFormatPreviewDialog(QDialog):
         self.entries = entries
         self.resolved_specs = {}
         self._ambiguous_data = ambiguous_data or {}
+        self.fallback_data = fallback_data or {}   # {model_id: ModelFormat}
+        self.mapped_specs = {}                     # {model_id: spec}
+        self.mapped_ids = {}                       # {model_id: catalog model_id}
+        self.catalog = catalog
 
         layout = QVBoxLayout(self)
 
@@ -837,6 +895,24 @@ class MatchFormatPreviewDialog(QDialog):
 
         self.overwrite_checkbox = QCheckBox("Overwrite existing values (otherwise only fill missing fields)")
         layout.addWidget(self.overwrite_checkbox)
+
+        # Bulk resolve bar: set every ambiguous row to one provider at once.
+        self.bulk_bar = QWidget()
+        bulk_layout = QHBoxLayout(self.bulk_bar)
+        bulk_layout.setContentsMargins(0, 0, 0, 0)
+        bulk_layout.addWidget(QLabel("Set all ambiguous to:"))
+        self.bulk_combo = QComboBox()
+        self.bulk_combo.setMinimumWidth(220)
+        bulk_layout.addWidget(self.bulk_combo)
+        bulk_btn = QPushButton("Apply to all")
+        bulk_btn.clicked.connect(self._bulk_resolve)
+        bulk_layout.addWidget(bulk_btn)
+        self.apply_fallback_check = QCheckBox("Apply fallback")
+        self.apply_fallback_check.setChecked(True)
+        self.apply_fallback_check.toggled.connect(self._on_fallback_toggle)
+        bulk_layout.addWidget(self.apply_fallback_check)
+        bulk_layout.addStretch()
+        layout.addWidget(self.bulk_bar)
 
         self.table = QTableWidget()
         self.table.setColumnCount(6)
@@ -947,11 +1023,19 @@ class MatchFormatPreviewDialog(QDialog):
         self.table.setRowCount(len(self.entries))
         for row, (mid, old_spec, new_spec, status) in enumerate(self.entries):
             apply_check = QCheckBox()
-            apply_check.setChecked(new_spec is not None and status != "unchanged")
+            # Ambiguous rows are pre-checked too: their combo already defaults
+            # to the best provider (same-name first, then most complete).
+            apply_check.setChecked(
+                (new_spec is not None and status != "unchanged") or status == "ambiguous")
             self.table.setCellWidget(row, 0, apply_check)
 
             self.table.setItem(row, 1, QTableWidgetItem(mid))
-            self.table.setItem(row, 2, QTableWidgetItem(status))
+            status_item = QTableWidgetItem(status)
+            if status.startswith("fallback:"):
+                status_item.setForeground(QColor("#0969da"))
+            elif status == "mapped":
+                status_item.setForeground(QColor("#8250df"))
+            self.table.setItem(row, 2, status_item)
 
             old_text = json.dumps(old_spec, ensure_ascii=False) if old_spec else "(empty)"
             if new_spec is not None:
@@ -970,13 +1054,11 @@ class MatchFormatPreviewDialog(QDialog):
             combo = QComboBox()
             provider_key, matches = self._ambiguous_data.get(mid, (None, []))
             if status == "ambiguous" and matches:
-                preferred = provider_key
-                for m in matches:
+                # Same-name provider first, then the most complete formats,
+                # so the pre-selection is a sensible default.
+                for m in _sort_matches(matches, provider_key):
                     combo.addItem(m.provider, m)
-                    if m.provider == preferred:
-                        combo.setCurrentIndex(combo.count() - 1)
-                if combo.currentIndex() < 0:
-                    combo.setCurrentIndex(0)
+                combo.setCurrentIndex(0)
                 combo.currentIndexChanged.connect(
                     lambda _, r=row, mm=mid: self._on_combo_change(r, mm))
                 # reflect the default selection now
@@ -985,10 +1067,81 @@ class MatchFormatPreviewDialog(QDialog):
             else:
                 combo.setEnabled(False)
                 combo.addItem("—")
+                # Unknown rows can be mapped to a catalog model manually.
+                if status == "unknown" and self.catalog is not None:
+                    map_btn = QPushButton("Map…")
+                    map_btn.clicked.connect(
+                        lambda _, r=row, mm=mid: self._map_unknown(r, mm))
+                    resolve_layout.addWidget(map_btn)
             resolve_layout.addWidget(combo, 1)
             self.table.setCellWidget(row, 5, resolve_widget)
 
+        self._fill_bulk_combo()
         self.table.resizeColumnsToContents()
+
+    def _fill_bulk_combo(self):
+        """List providers across ambiguous rows, most frequent first."""
+        counts = {}
+        for mid, (_pk, matches) in self._ambiguous_data.items():
+            entry = next((e for e in self.entries if e[0] == mid), None)
+            if entry is None or entry[3] != "ambiguous":
+                continue
+            for m in matches:
+                counts[m.provider] = counts.get(m.provider, 0) + 1
+        self.bulk_combo.clear()
+        for prov, _n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            self.bulk_combo.addItem(prov)
+        n_ambiguous = sum(1 for e in self.entries if e[3] == "ambiguous")
+        has_fallback = any(e[3].startswith("fallback:") for e in self.entries)
+        self.bulk_bar.setVisible(
+            (self.bulk_combo.count() > 0 and n_ambiguous > 1) or has_fallback)
+
+    def _on_fallback_toggle(self, checked: bool):
+        """Check/uncheck every fallback row according to the Apply fallback box."""
+        for row, (mid, _old, _new, status) in enumerate(self.entries):
+            if not status.startswith("fallback:"):
+                continue
+            check = self.table.cellWidget(row, 0)
+            if check is not None:
+                check.setChecked(checked)
+
+    def _map_unknown(self, row, mid):
+        """Manually map an unknown model to a catalog format."""
+        if self.catalog is None:
+            return
+        old_spec = self.entries[row][1] or {}
+        dlg = CatalogModelPickerDialog(self, self.catalog, initial_filter=mid)
+        if dlg.exec() != QDialog.Accepted or dlg.selected_format is None:
+            return
+        fmt = dlg.selected_format
+        spec = build_spec_from_format(fmt)
+        self.mapped_specs[mid] = spec
+        self.mapped_ids[mid] = fmt.model_id
+        # Update the entry in place so selected_entries carries the new spec.
+        self.entries[row] = (mid, old_spec, spec, "mapped")
+        status_item = QTableWidgetItem("mapped")
+        status_item.setForeground(QColor("#8250df"))
+        self.table.setItem(row, 2, status_item)
+        self.table.setItem(row, 4, QTableWidgetItem(json.dumps(spec, ensure_ascii=False)))
+        check = self.table.cellWidget(row, 0)
+        if check is not None:
+            check.setChecked(True)
+        self._show_diff()
+
+    def _bulk_resolve(self):
+        """Point every ambiguous row's combo at the chosen provider where possible."""
+        provider = self.bulk_combo.currentText()
+        if not provider:
+            return
+        for row, (mid, _old, _new, status) in enumerate(self.entries):
+            if status != "ambiguous":
+                continue
+            combo = self.table.cellWidget(row, 5).findChild(QComboBox)
+            if combo is None:
+                continue
+            idx = combo.findText(provider)
+            if idx >= 0 and combo.currentIndex() != idx:
+                combo.setCurrentIndex(idx)  # triggers _on_combo_change
 
     def _on_combo_change(self, row, mid):
         combo = self.table.cellWidget(row, 5).findChild(QComboBox)
@@ -1193,13 +1346,17 @@ class _ModelFetchWorker(QThread):
 class FetchProviderModelsDialog(QDialog):
     """Fetch a provider's model list from its API and preview the results."""
 
-    def __init__(self, parent, provider_key: str = "new-provider"):
+    def __init__(self, parent, provider_key: str = "new-provider", catalog=None):
         super().__init__(parent)
         self.setWindowTitle("Fetch Provider Models from API")
         self.resize(720, 560)
         self.fetched_models = {}   # {model_id: spec}
         self.provider_key = provider_key
         self._worker = None
+
+        # Silently load the bundled catalog so the Reference combo can be filled.
+        self.catalog = catalog
+        try_load_bundled_catalog(self.catalog)
 
         layout = QVBoxLayout(self)
 
@@ -1212,6 +1369,17 @@ class FetchProviderModelsDialog(QDialog):
             self.format_combo.addItem(preset["label"], adapter)
         self.format_combo.currentIndexChanged.connect(self._on_format_change)
         form.addRow("API format:", self.format_combo)
+
+        # Optional provider used as a fallback source for models not in the catalog.
+        self.reference_combo = QComboBox()
+        self.reference_combo.addItem("Auto (exact match only)", "")
+        if self.catalog is not None and self.catalog.loaded():
+            for pid in sorted(self.catalog.by_provider.keys()):
+                self.reference_combo.addItem(pid, pid)
+        self.reference_combo.setToolTip(
+            "Models not found in the catalog will borrow their format from this "
+            "provider (fill-missing only). Manual 'Map…' overrides still win.")
+        form.addRow("Reference provider:", self.reference_combo)
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://api.openai.com/v1")
@@ -1278,6 +1446,12 @@ class FetchProviderModelsDialog(QDialog):
 
     def _current_adapter(self) -> str:
         return self.format_combo.currentData()
+
+    @property
+    def reference_provider(self):
+        """Selected fallback provider name, or None for Auto."""
+        data = self.reference_combo.currentData()
+        return data or None
 
     def _on_format_change(self):
         adapter = self._current_adapter()

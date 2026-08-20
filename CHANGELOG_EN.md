@@ -10,6 +10,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/en/2.0.0/).
 
+## [4.3.0] - 2026-08-20
+
+Streamlined bulk match review + **Reference provider fallback** for unmatched models.
+
+### Added
+
+- **Reference provider** in Fetch from API: pick a provider whose formats are used
+  as a fallback for models not found in the catalog.
+- **4-level fallback**: exact id within the reference provider → normalized id
+  (strips version/date suffixes like `-2024-08-13`, `-v2`, `-latest`) within the
+  reference provider → normalized across the catalog → longest shared prefix
+  within the reference provider.
+- Fallback rows show status `fallback:<provider>` (blue), fill-missing only.
+- **Manual Map…**: `unknown` rows get a button opening a searchable Catalog Model
+  Picker to map to any catalog model, status `mapped` (purple).
+- **Mappings persist** (`unknown → catalog id`) in QSettings; future fetches remember.
+- **"Apply fallback"** checkbox toggles all fallback rows at once.
+
+### Changed
+
+- Post-fetch matching and the Models Manager now funnel into **one review dialog**
+  (previously each ambiguous model required its own confirmation).
+- Provider combos default to the best-ranked match (same provider name first,
+  then the most complete data via `_sort_matches`); ambiguous rows are pre-checked.
+
 ## [4.2.0] - 2026-08-20
 
 **Fetch Models from provider API** feature: add a new provider by fetching its model list directly from the API.

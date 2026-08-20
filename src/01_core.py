@@ -78,6 +78,25 @@ class SettingsManager:
     def set_output_tiers(self, tiers: List[int]):
         self.set("catalog/output_tiers", ",".join(str(x) for x in sorted(set(tiers))))
 
+    # Persisted unknown->catalog model mappings: {"provider_key/model_id": "catalog_id"}
+    def get_reference_mappings(self) -> Dict[str, str]:
+        raw = self.get("catalog/reference_mappings", "{}")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items() if v}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return {}
+
+    def set_reference_mappings(self, mappings: Dict[str, str]):
+        self.set("catalog/reference_mappings", json.dumps(mappings, ensure_ascii=False))
+
+    def add_reference_mapping(self, provider_key: str, model_id: str, catalog_id: str):
+        mappings = self.get_reference_mappings()
+        mappings[f"{provider_key}/{model_id}"] = catalog_id
+        self.set_reference_mappings(mappings)
+
 class ThemeManager:
     """Handle application theme switching"""
 
@@ -651,9 +670,25 @@ class ModelCatalog:
         return [fmts[p][model_id] for p in providers if model_id in fmts.get(p, {})]
 
 def _load_json_file(path: Path) -> dict:
-    """Load JSON file with error handling"""
+    """Load JSON with error handling"""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def try_load_bundled_catalog(catalog) -> bool:
+    """Silently load the bundled models.dev catalog into `catalog` if present.
+
+    Never prompts or raises; returns True when the catalog was loaded."""
+    if catalog is None or catalog.loaded():
+        return catalog is not None and catalog.loaded()
+    try:
+        bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
+        if bundled.exists():
+            catalog.load(bundled)
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
 
 def _slugify(s: str) -> str:
     """Convert string to slug"""
@@ -1060,6 +1095,101 @@ def _resolve_match(matches, prov_name, mid=None, resolve_fn=None):
             return m
     if resolve_fn is not None:
         return resolve_fn(prov_name, mid, matches)
+    return None
+
+
+def _format_completeness(fmt: ModelFormat) -> int:
+    """Count how much metadata a format carries (used to rank matches)."""
+    score = 0
+    for v in (fmt.context, fmt.output, fmt.cost_in, fmt.cost_out,
+              fmt.cost_cache_read, fmt.cost_cache_write):
+        if v is not None:
+            score += 1
+    if not fmt.modalities.inferred:
+        score += 1
+    if fmt.name and fmt.name != fmt.model_id:
+        score += 1
+    return score
+
+
+def _sort_matches(matches, prov_name):
+    """Order matches: same provider name first, then by completeness (desc)."""
+    return sorted(
+        matches,
+        key=lambda m: (m.provider != prov_name, -_format_completeness(m)),
+    )
+
+
+_VERSION_SUFFIX = re.compile(
+    r'[-_](\d{4}[-_]\d{2}[-_]\d{2}'
+    r'|\d{4}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'
+    r'|v\d+(\.\d+)*|latest|preview|stable)$',
+    re.IGNORECASE)
+
+
+def _normalize_model_id(mid: str) -> str:
+    """Normalize a model id for fuzzy fallback: lowercase, underscores to
+    hyphens, and trailing version/date suffixes stripped."""
+    s = str(mid).strip().lower().replace("_", "-")
+    prev = None
+    while prev != s:
+        prev = s
+        s = _VERSION_SUFFIX.sub("", s)
+    return s.strip("-") or str(mid).strip().lower()
+
+
+def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
+    """Try to find a catalog format for an unmatched model id.
+
+    Order: (a) exact id within the reference provider, (b) normalized-id
+    match anywhere, (c) normalized-id match within the reference provider,
+    (d) longest shared prefix within the reference provider.
+    Returns a ModelFormat or None. Never raises on a missing catalog.
+    """
+    if catalog is None or not getattr(catalog, "loaded", lambda: False)():
+        return None
+    formats = catalog.formats()
+
+    # (a) exact id within reference provider
+    if reference_provider:
+        fmt = formats.get(reference_provider, {}).get(mid)
+        if fmt is not None:
+            return fmt
+
+    normalized = _normalize_model_id(mid)
+    if not normalized:
+        return None
+
+    # (b) normalized match within the reference provider first
+    if reference_provider:
+        pmap = formats.get(reference_provider, {})
+        if normalized in pmap:
+            return pmap[normalized]
+
+    # (c) normalized match anywhere in the catalog
+    for pid, pmap in formats.items():
+        if normalized in pmap:
+            return pmap[normalized]
+
+    # (d) longest shared prefix within the reference provider
+    if reference_provider:
+        pmap = formats.get(reference_provider, {})
+        best, best_len = None, 0
+        for cand_id in pmap:
+            cand_norm = _normalize_model_id(cand_id)
+            if not cand_norm:
+                continue
+            common = 0
+            for a, b in zip(normalized, cand_norm):
+                if a != b:
+                    break
+                common += 1
+            # Require a meaningful prefix and a remaining "family" shape.
+            if common > best_len and common >= min(len(normalized), len(cand_norm)) - 4 \
+                    and common >= 4:
+                best, best_len = pmap[cand_id], common
+        return best
+
     return None
 
 

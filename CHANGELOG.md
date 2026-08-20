@@ -10,6 +10,30 @@ Tất cả các thay đổi đáng chú ý của dự án được ghi lại tro
 Định dạng dựa trên [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/),
 và dự án tuân theo [Semantic Versioning](https://semver.org/lang/vi/).
 
+## [4.3.0] - 2026-08-20
+
+Tối ưu duyệt match hàng loạt + **Reference provider fallback** cho model không match.
+
+### Added
+
+- **Reference provider** trong Fetch from API: chọn provider tham chiếu làm nguồn
+  fallback cho các model không tìm thấy trong catalog.
+- **Fallback 4 cấp**: exact trong provider tham chiếu → normalized id (strip
+  suffix version/ngày kiểu `-2024-08-13`, `-v2`, `-latest`) trong provider tham chiếu →
+  normalized toàn catalog → prefix chung dài nhất trong provider tham chiếu.
+- Dòng fallback hiển thị status `fallback:<provider>` (màu xanh), chỉ fill-missing.
+- **Map… thủ công**: dòng `unknown` có nút mở Catalog Model Picker (tìm kiếm được)
+  để map sang model catalog bất kỳ, status `mapped` (màu tím).
+- **Persist mapping** `unknown → catalog id` vào QSettings; lần fetch sau tự nhớ.
+- Checkbox **"Apply fallback"** bật/tắt hàng loạt dòng fallback.
+
+### Changed
+
+- Match sau fetch và trong Models Manager giờ gộp về **một dialog duyệt duy nhất**
+  (trước đây model ambiguous phải confirm từng cái).
+- Combo provider mặc định chọn theo xếp hạng: provider trùng tên trước, rồi
+  provider có dữ liệu đầy đủ nhất (`_sort_matches`); dòng ambiguous được pre-check.
+
 ## [4.2.0] - 2026-08-20
 
 Tính năng **Fetch Models từ API provider**: nhập provider mới bằng cách fetch danh sách model trực tiếp từ API.

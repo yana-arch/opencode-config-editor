@@ -266,7 +266,10 @@ class ProvidersTab(QWidget):
     def _fetch_provider_models(self):
         """Fetch a provider's model list from its API, then auto-match the catalog."""
         self.app.snapshot_state()
-        dlg = FetchProviderModelsDialog(self)
+
+        # Fill the dialog's Reference provider combo (silently loads bundled catalog).
+        try_load_bundled_catalog(self.app.model_catalog)
+        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog)
         if dlg.exec() != QDialog.Accepted:
             return
 
@@ -280,6 +283,8 @@ class ProvidersTab(QWidget):
             QMessageBox.information(self, "Fetch", "No models selected.")
             return
 
+        reference = dlg.reference_provider
+
         providers = self.app.cfg.data.setdefault("provider", {})
         prov = providers.setdefault(key, {"npm": "@ai-sdk/openai", "name": key, "models": {}})
         if not isinstance(prov.get("models"), dict):
@@ -290,7 +295,7 @@ class ProvidersTab(QWidget):
         self.app.mark_dirty()
         self._update_table()
 
-        # Auto-match against the catalog to fill normalized format.
+        # Auto-match against the catalog in ONE review dialog (no per-model prompts).
         if not self.app.model_catalog.loaded():
             if not self.app._ensure_catalog():
                 QMessageBox.information(
@@ -299,31 +304,81 @@ class ProvidersTab(QWidget):
                     "Catalog not loaded, skipped auto-match.")
                 return
 
-        report = apply_catalog_to_config(
-            self.app.model_catalog, {key: prov}, overwrite=False, add_new=False,
-            resolve_fn=lambda p, m, matches: self._pick_catalog_provider(m, matches))
+        catalog = self.app.model_catalog
+        settings = SettingsManager()
+        mappings = settings.get_reference_mappings()
+        entries = []       # (model_id, old_spec, new_spec|None, status)
+        ambiguous_data = {}
+        fallback_data = {}  # {model_id: ModelFormat}
+
+        for mid in sorted(prov["models"]):
+            matches = catalog.find_model(mid)
+            if not matches:
+                fmt = None
+                # 1. Previously persisted manual/auto mapping wins.
+                saved = mappings.get(f"{key}/{mid}")
+                if saved:
+                    saved_matches = catalog.find_model(saved)
+                    if saved_matches:
+                        fmt = _sort_matches(saved_matches, reference or key)[0]
+                # 2. Reference provider / normalized-id / prefix fallback.
+                if fmt is None:
+                    fmt = _find_fallback(mid, reference, catalog)
+                if fmt is not None:
+                    merged = _merge_model_spec(
+                        prov["models"][mid], build_spec_from_format(fmt), overwrite=False)
+                    entries.append((mid, dict(prov["models"][mid]), merged,
+                                    f"fallback:{fmt.provider}"))
+                    fallback_data[mid] = fmt
+                else:
+                    entries.append((mid, dict(prov["models"][mid]), None, "unknown"))
+                continue
+            chosen = _resolve_match(matches, key, mid)
+            if chosen is None:
+                entries.append((mid, dict(prov["models"][mid]), None, "ambiguous"))
+                ambiguous_data[mid] = (key, matches)
+                continue
+            merged = _merge_model_spec(
+                prov["models"][mid], build_spec_from_format(chosen), overwrite=False)
+            status = "matched" if merged != (prov["models"][mid] or {}) else "unchanged"
+            entries.append((mid, dict(prov["models"][mid]), merged, status))
+
+        if not any(e[2] is not None or e[3] == "ambiguous" for e in entries):
+            QMessageBox.information(
+                self, "Fetch & Match",
+                f"Added {len(selected)} models to '{key}'. "
+                "None matched the catalog.")
+            return
+
+        preview = MatchFormatPreviewDialog(
+            self, entries, ambiguous_data, fallback_data=fallback_data, catalog=catalog)
+        if preview.exec() != QDialog.Accepted:
+            return
+
+        applied = 0
+        for mid, old_spec, new_spec, status in preview.selected_entries:
+            if status == "ambiguous":
+                new_spec = preview.resolved_specs.get(mid, new_spec)
+            elif status == "mapped":
+                new_spec = preview.mapped_specs.get(mid, new_spec)
+                if mid in preview.mapped_ids:
+                    settings.add_reference_mapping(key, mid, preview.mapped_ids[mid])
+            elif status.startswith("fallback:"):
+                fmt = fallback_data.get(mid)
+                if fmt is not None:
+                    settings.add_reference_mapping(key, mid, fmt.model_id)
+            if new_spec is None:
+                continue
+            prov["models"][mid] = _merge_model_spec(
+                prov["models"][mid], new_spec, overwrite=False)
+            applied += 1
+
         self.app.mark_dirty()
         self._update_table()
         QMessageBox.information(
             self, "Fetch & Match Complete",
-            f"Added {len(selected)} models to '{key}'.\n"
-            f"Matched/filled: {len(report.filled)}\n"
-            f"Unchanged: {len(report.unchanged)}\n"
-            f"Unknown (no catalog match): {len(report.unknown)}\n"
-            f"Ambiguous: {len(report.ambiguous)}"
+            f"Added {len(selected)} models to '{key}', normalized {applied} from catalog."
         )
-
-    def _pick_catalog_provider(self, mid, matches):
-        """Prompt to disambiguate a model that matches multiple catalog providers."""
-        providers = [m.provider for m in matches]
-        choice, ok = QInputDialog.getItem(
-            self, "Choose Catalog Source",
-            f"Model '{mid}' matches multiple providers. Choose one (Cancel to skip):",
-            providers, 0, False
-        )
-        if ok and choice:
-            return next((m for m in matches if m.provider == choice), matches[0])
-        return None
 
     def _export_providers(self):
         """Export providers to JSON file"""
