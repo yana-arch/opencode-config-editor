@@ -28,11 +28,14 @@ def _load():
 
 
 app = _load()
+HAS_QT = bool(getattr(app, "HAS_QT", False))
 
 
 @pytest.fixture(scope="session")
 def qapp():
     """One shared QApplication for all UI-touching tests (offscreen)."""
+    if not HAS_QT:
+        pytest.skip("PySide6 not available - skipping Qt tests")
     instance = app.QApplication.instance()
     if instance is None:
         instance = app.QApplication([])

@@ -52,9 +52,32 @@ try:
         QHeaderView, QToolBar, QDialog, QFrame, QInputDialog,
         QScrollArea
     )
-except ImportError:
-    sys.stderr.write("PySide6 is required. Install it with: pip install PySide6\n")
-    sys.exit(1)
+    HAS_QT = True
+except ImportError as _e:
+    HAS_QT = False
+    sys.stderr.write(f"PySide6 not available ({_e}) - GUI disabled, core tests still run\n")
+
+    class _DummyMeta(type):
+        def __getattr__(cls, name): return 0
+        def __call__(cls, *a, **kw): return super().__call__(*a, **kw)
+
+    class _DummyQt(metaclass=_DummyMeta):
+        def __init__(self, *a, **kw): pass
+        def __getattr__(self, name): return lambda *a, **kw: None
+
+    # Signal is used as class attribute descriptor (Signal(str) etc.)
+    def _dummy_signal(*a, **kw):
+        return _DummyQt()
+
+    Qt = QTimer = QSettings = QThread = _DummyQt
+    Signal = _dummy_signal
+    QAction = QFont = QKeySequence = QColor = QPalette = QTextCharFormat = QSyntaxHighlighter = _DummyQt
+    QApplication = QMainWindow = QWidget = QTabWidget = QVBoxLayout = QHBoxLayout = _DummyQt
+    QFormLayout = QLineEdit = QCheckBox = QSpinBox = QDoubleSpinBox = QTextEdit = _DummyQt
+    QPlainTextEdit = QTableWidget = QTableWidgetItem = QPushButton = QLabel = _DummyQt
+    QListWidget = QListWidgetItem = QTreeWidget = QTreeWidgetItem = QSplitter = _DummyQt
+    QComboBox = QMessageBox = QFileDialog = QDialogButtonBox = QGroupBox = _DummyQt
+    QHeaderView = QToolBar = QDialog = QFrame = QInputDialog = QScrollArea = _DummyQt
 
 try:
     import jsonschema

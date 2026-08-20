@@ -5,7 +5,9 @@ Covers MainWindow, every tab and every catalog/model dialog.
 """
 import pytest
 
-from tests.conftest import ROOT, app
+from tests.conftest import HAS_QT, ROOT, app
+
+pytestmark = pytest.mark.skipif(not HAS_QT, reason="PySide6 not available - skipping GUI smoke tests")
 
 
 @pytest.fixture

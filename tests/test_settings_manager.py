@@ -1,7 +1,9 @@
 """Tests for SettingsManager (QSettings-backed, pointed at a temp file)."""
 import pytest
 
-from tests.conftest import app
+from tests.conftest import HAS_QT, app
+
+pytestmark = pytest.mark.skipif(not HAS_QT, reason="PySide6 not available - skipping QSettings tests")
 
 
 @pytest.fixture
