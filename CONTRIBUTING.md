@@ -11,16 +11,44 @@ Cảm ơn bạn đã quan tâm đóng góp cho **opencode-config-editor**!
 
 Mã nguồn được chia thành các module trong thư mục `src/`, sau đó ghép lại thành một
 file duy nhất bằng `build.py`. **Quan trọng**: chỉ sửa code trong `src/` — file
-`opencode-config-editor.py` là đầu ra của build và sẽ bị ghi đè.
+`opencode-config-editor.py` là đầu ra của build và sẽ bị ghi đè. Thứ tự ghép là
+danh sách `ORDER` trong `build.py`.
 
 ```
-src/00_header.py    # Import, hằng số, danh sách key
-src/01_core.py      # SettingsManager, ThemeManager, UndoManager, Validator, ModelCatalog…
-src/02_widgets.py   # Widget/dialog dùng chung
-src/03_tabs.py      # Các tab chỉnh sửa
-src/04_main_window.py  # Cửa sổ chính
-src/05_main.py      # Entrypoint
+src/core/                  # dùng chung, không phụ thuộc agent
+  header.py                # Import, hằng số, danh sách key
+  settings.py              # SettingsManager, ThemeManager, UndoManager
+  config.py                # ConfigFile, Validator, section(), helper layered-config
+  parsing.py               # helper import/parse/merge
+  catalog.py               # ModelCatalog, ModelFormat, match/fallback
+  provider_fetch.py        # fetch danh sách model từ provider
+  adapter.py               # AdapterSpec + registry (điểm nối đa-agent)
+  widgets_common.py        # widget/dialog dùng chung
+  base_tab.py              # BaseTab: touched-tracking + helper set giá trị
+  widgets_models.py        # dialog chỉnh sửa model
+  widgets_catalog.py       # dialog catalog
+src/adapters/opencode/     # phần riêng của opencode + tui
+  tab_*.py                 # 10 tab
+  adapter.py               # đăng ký AdapterSpec của opencode
+src/app/                   # cửa sổ + entrypoint
+  main_window.py           # MainWindow (điều khiển qua adapter)
+  main.py                  # entrypoint
 ```
+
+## Thêm một agent CLI mới (adapter)
+
+Editor hỗ trợ đa-agent qua `core/adapter.py`. Để hỗ trợ CLI khác:
+
+1. Tạo `src/adapters/<agent>/` với các class tab kế thừa `BaseTab`
+   (triển khai `refresh()`/load và `collect(self, data)`).
+2. Thêm `src/adapters/<agent>/adapter.py` gọi `register_adapter(AdapterSpec(...))`
+   khai báo `kinds`, `known_keys`, `raw_files`, `targets_fn`, `make_tabs_fn`,
+   `capabilities` của agent đó.
+3. Thêm các file mới vào `ORDER` trong `build.py` (sau `core/*`, trước `app/*`).
+4. Chọn adapter trong `app/main.py` (`--adapter`/env).
+
+Không cần sửa `core/`. Contract test parametrize trong `tests/test_adapter.py`
+tự động phủ mọi adapter đã đăng ký.
 
 ## Quy trình đóng góp
 
@@ -48,10 +76,12 @@ src/05_main.py      # Entrypoint
 
 ## Các bước thông thường khi thêm tab mới
 
-1. Tạo class tab (kế thừa `QWidget`) trong `src/03_tabs.py`.
-2. Triển khai phương thức `_refresh`/load và `collect(self, data)`.
-3. Đăng ký tab trong `MainWindow._build_tabs()` (`src/04_main_window.py`).
-4. Nếu là tab opencode, thêm vào `self._oc_tabs`.
+1. Tạo class tab (kế thừa `BaseTab`) trong adapter tương ứng,
+   ví dụ `src/adapters/opencode/tab_tinhnang.py`.
+2. Triển khai `refresh()`/load và `collect(self, data)`.
+3. Thêm vào `make_tabs_fn` của adapter trong `adapters/<agent>/adapter.py`
+   (thêm `(tab, "Tiêu đề", kind)`); tab opencode.json thì thêm vào `win._oc_tabs`.
+4. Thêm file mới vào `ORDER` trong `build.py`.
 
 ## Báo cáo bug
 
