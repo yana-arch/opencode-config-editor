@@ -68,9 +68,11 @@ class OpenclaudeSettingsTab(BaseTab):
         _set(self.model_edit, "model")
         _set(self.agent_edit, "agent")
         _set(self.advisor_edit, "advisorModel")
+        # effortLevel: select this layer's OWN value only (do not bake in the
+        # inherited effective value on save); show effective as a hint via the
+        # "(default)" entry when unset.
         self.effort_combo.blockSignals(True)
-        eff_val = own.get("effortLevel", eff.get("effortLevel", ""))
-        eidx = self.effort_combo.findData(eff_val)
+        eidx = self.effort_combo.findData(own.get("effortLevel", ""))
         self.effort_combo.setCurrentIndex(eidx if eidx >= 0 else 0)
         self.effort_combo.blockSignals(False)
 
@@ -149,6 +151,10 @@ class OpenclaudeAgentModelsTab(BaseTab):
 
     def __init__(self, app):
         super().__init__(app)
+        self._dirty = False
+        self._extra_profiles = []   # non-dict providerProfiles entries, kept verbatim
+        self._had_profiles = False  # global file already had a providerProfiles key
+        self._had_agent_models = False
         layout = QVBoxLayout(self)
 
         layout.addWidget(QLabel("Providers — providerProfiles in ~/.openclaude.json "
@@ -190,6 +196,9 @@ class OpenclaudeAgentModelsTab(BaseTab):
         layout.addLayout(rbtn)
 
     def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self._dirty = True
         self.app.status_bar.showMessage("Unsaved changes\u2026")
 
     # --- provider rows (providerProfiles) ---
@@ -233,38 +242,53 @@ class OpenclaudeAgentModelsTab(BaseTab):
         # Providers/routing live in the global ~/.openclaude.json file.
         data = layered.global_data if layered else {}
 
-        self.models_table.setRowCount(0)
-        profiles = data.get("providerProfiles")
-        if isinstance(profiles, list):
-            for prof in profiles:
-                if isinstance(prof, dict):
-                    self._add_model_row(prof)
-        # Back-compat: also surface legacy agentModels {key: {...}} as rows.
-        agent_models = data.get("agentModels") if isinstance(data.get("agentModels"), dict) else {}
-        for key, spec in agent_models.items():
-            spec = spec if isinstance(spec, dict) else {}
-            self._add_model_row({"name": key, "provider": spec.get("provider", ""),
-                                 "baseUrl": spec.get("base_url", ""), "model": spec.get("model", ""),
-                                 "apiKey": spec.get("api_key", ""), "_legacy_agentModels": True})
+        self._loading = True
+        try:
+            self.models_table.setRowCount(0)
+            profiles = data.get("providerProfiles")
+            self._had_profiles = isinstance(profiles, list)
+            self._extra_profiles = []
+            if isinstance(profiles, list):
+                for prof in profiles:
+                    if isinstance(prof, dict):
+                        self._add_model_row(prof)
+                    else:
+                        # Preserve malformed/non-dict entries verbatim on save.
+                        self._extra_profiles.append(prof)
+            # Back-compat: also surface legacy agentModels {key: {...}} as rows.
+            agent_models = data.get("agentModels") if isinstance(data.get("agentModels"), dict) else {}
+            self._had_agent_models = "agentModels" in data
+            for key, spec in agent_models.items():
+                spec = spec if isinstance(spec, dict) else {}
+                row = dict(spec)   # keep any extra legacy keys
+                row.update({"name": key, "provider": spec.get("provider", ""),
+                            "baseUrl": spec.get("base_url", ""), "model": spec.get("model", ""),
+                            "apiKey": spec.get("api_key", ""), "_legacy_agentModels": True})
+                self._add_model_row(row)
 
-        chain = data.get("providerFallbackChain")
-        self.fallback_edit.blockSignals(True)
-        self.fallback_edit.setText(", ".join(chain) if isinstance(chain, list) else "")
-        self.fallback_edit.blockSignals(False)
+            chain = data.get("providerFallbackChain")
+            self.fallback_edit.blockSignals(True)
+            self.fallback_edit.setText(", ".join(chain) if isinstance(chain, list) else "")
+            self.fallback_edit.blockSignals(False)
 
-        self.routing_table.setRowCount(0)
-        routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
-        for agent, key in routing.items():
-            self._add_route_row(str(agent), str(key))
+            self.routing_table.setRowCount(0)
+            routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
+            for agent, key in routing.items():
+                self._add_route_row(str(agent), str(key))
+        finally:
+            self._loading = False
+            self._dirty = False
 
     def collect(self, data):
-        profiles = []
+        profiles = list(self._extra_profiles)  # re-emit preserved non-dict entries
         legacy_models = {}
+        seen_names = set()
         for r in range(self.models_table.rowCount()):
             name_item = self.models_table.item(r, 0)
             name = name_item.text().strip() if name_item else ""
-            if not name:
+            if not name or name in seen_names:
                 continue
+            seen_names.add(name)
             orig = name_item.data(Qt.UserRole) if name_item else None
             orig = dict(orig) if isinstance(orig, dict) else {}
             provider = self._cell(r, 1)
@@ -274,15 +298,12 @@ class OpenclaudeAgentModelsTab(BaseTab):
             api_key = widget.value().strip() if widget else ""
 
             if orig.pop("_legacy_agentModels", False):
-                spec = {}
-                if provider:
-                    spec["provider"] = provider
-                if base_url:
-                    spec["base_url"] = base_url
-                if model:
-                    spec["model"] = model
-                if api_key:
-                    spec["api_key"] = api_key
+                spec = dict(orig)  # preserve extra legacy keys
+                spec.pop("name", None)
+                self._set_or_pop(spec, "provider", provider)
+                self._set_or_pop(spec, "base_url", base_url)
+                self._set_or_pop(spec, "model", model)
+                self._set_or_pop(spec, "api_key", api_key)
                 legacy_models[name] = spec
                 continue
 
@@ -296,8 +317,11 @@ class OpenclaudeAgentModelsTab(BaseTab):
             self._set_or_pop(prof, "apiKey", api_key)
             profiles.append(prof)
 
-        self._put(data, "providerProfiles", profiles, [])
-        if legacy_models or "agentModels" in data:
+        # Only write providerProfiles when the file already had it or we have rows,
+        # so an untouched global file isn't polluted with an empty list.
+        if self._had_profiles or profiles:
+            data["providerProfiles"] = profiles
+        if legacy_models or self._had_agent_models:
             self._put(data, "agentModels", legacy_models, {})
 
         chain = [c.strip() for c in self.fallback_edit.text().split(",") if c.strip()]

@@ -36,8 +36,11 @@ def _openclaude_refresh(win):
 def _openclaude_save(win):
     layered = win.oc_layered
     raw = win._agent_raw_tab
-    # If the raw editor was edited, it is the source of truth for its layer.
-    if raw._modified:
+    # The Raw editor is the source of truth ONLY when it is the active tab AND
+    # has unsaved edits — otherwise honoring it would silently discard form
+    # edits made on the Settings/Agent Models tabs.
+    raw_is_active = win.tabs.currentWidget() is raw
+    if raw._modified and raw_is_active:
         layer, parsed = raw.parsed()
         if parsed is None:
             win.status_bar.showMessage("Raw JSON invalid — not saved")
@@ -52,19 +55,25 @@ def _openclaude_save(win):
 
     # Form-based save:
     #  - Settings tab writes scalar keys into the selected settings layer
-    #  - Agent Models tab writes agentModels/agentRouting/fallback into the
+    #  - Agent Models tab writes providerProfiles/agentRouting/fallback into the
     #    global ~/.openclaude.json (where providers live per openclaude docs)
     layer = win.oc_layer
     base = dict(layered.layer(layer))
     win._agent_settings_tab.collect(base)
     ok1, msg1 = layered.save_layer(layer, base)
 
-    gbase = dict(layered.global_data)
-    win._agent_models_tab.collect(gbase)
-    ok2, msg2 = layered.save_global(gbase)
+    # Only rewrite the global file when the Agent Models tab was actually
+    # touched, so an untouched global (with app-state keys) is left alone.
+    if getattr(win._agent_models_tab, "_dirty", False):
+        gbase = dict(layered.global_data)
+        win._agent_models_tab.collect(gbase)
+        ok2, msg2 = layered.save_global(gbase)
+        tail = " + global providers"
+    else:
+        ok2, msg2, tail = True, "", ""
 
     if ok1 and ok2:
-        win.status_bar.showMessage(f"Saved layer '{layer}' + global providers")
+        win.status_bar.showMessage(f"Saved layer '{layer}'{tail}")
     else:
         win.status_bar.showMessage(f"Save error: {msg1 if not ok1 else msg2}")
     win.refresh_tabs()

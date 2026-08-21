@@ -141,3 +141,72 @@ def test_opencode_still_default(qapp, tmp_path, monkeypatch):
     assert w.adapter.name == "opencode"
     assert w.tabs.count() == 10
     w.close()
+
+
+# --- regressions from the user-review pass ---
+
+def _seed_global(tmp_path, data):
+    (tmp_path / "cfghome").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "cfghome.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_untouched_global_not_rewritten_on_settings_save(oc_win, tmp_path):
+    """Saving only the Settings tab must not touch the global file (app-state
+    keys like numStartups/tipsHistory must be left byte-for-byte alone)."""
+    gpath = tmp_path / "cfghome.json"
+    gpath.write_text(json.dumps({"numStartups": 112, "tipsHistory": {"x": 1}}), encoding="utf-8")
+    before = gpath.read_text(encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+    oc_win._agent_settings_tab.model_edit.setText("sonnet")
+    oc_win._save()
+    assert gpath.read_text(encoding="utf-8") == before   # global untouched
+
+
+def test_provider_profiles_non_dict_entries_preserved(oc_win, tmp_path):
+    gpath = tmp_path / "cfghome.json"
+    gpath.write_text(json.dumps({"providerProfiles": [
+        {"id": "provider_ok", "name": "Good", "model": "m"},
+        "weird-string-entry",
+        123,
+    ]}), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+    oc_win._agent_models_tab._dirty = True   # force a global write
+    oc_win._save()
+    saved = json.loads(gpath.read_text())
+    assert "weird-string-entry" in saved["providerProfiles"]
+    assert 123 in saved["providerProfiles"]
+    assert any(isinstance(p, dict) and p["name"] == "Good" for p in saved["providerProfiles"])
+
+
+def test_settings_layer_preserves_unmanaged_keys(oc_win, tmp_path):
+    """env/permissions/hooks in a settings layer survive a Settings-tab save
+    even though no form field edits them."""
+    proj = tmp_path / "proj" / ".openclaude"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "settings.json").write_text(json.dumps({
+        "env": {"A": "1"}, "permissions": {"edit": "allow"}, "model": "old",
+    }), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+    oc_win._agent_settings_tab.model_edit.setText("new-model")
+    oc_win._save()
+    saved = json.loads((proj / "settings.json").read_text())
+    assert saved["model"] == "new-model"
+    assert saved["env"] == {"A": "1"}
+    assert saved["permissions"] == {"edit": "allow"}
+
+
+def test_effort_level_not_baked_from_inherited(oc_win, tmp_path):
+    """A layer without effortLevel must not gain it from the effective merge."""
+    cfg = tmp_path / "cfghome"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "project"
+    oc_win.refresh_tabs()
+    oc_win._agent_settings_tab.model_edit.setText("x")  # edit something else
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert "effortLevel" not in proj      # inherited 'high' NOT written to project
