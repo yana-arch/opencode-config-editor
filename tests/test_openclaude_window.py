@@ -232,3 +232,51 @@ def test_active_provider_profile_roundtrip(oc_win, tmp_path):
     saved = json.loads(gpath.read_text())
     assert saved["activeProviderProfileId"] == "p1"
     assert len(saved["providerProfiles"]) == 2
+
+
+def test_settings_statusline_roundtrip(oc_win, tmp_path):
+    st = oc_win._agent_settings_tab
+    st.statusline_chk.setChecked(True)
+    st.statusline_cmd.setText("echo hi")
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert proj["statusLine"] == {"type": "command", "command": "echo hi"}
+    # boolean form (no command)
+    st.statusline_cmd.setText("")
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert proj["statusLine"] is True
+    # disabling removes the key that was previously present
+    st.statusline_chk.setChecked(False)
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert "statusLine" not in proj
+
+
+def test_settings_skip_permission_roundtrip(oc_win, tmp_path):
+    st = oc_win._agent_settings_tab
+    st.skip_dangerous_chk.setChecked(True)
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert proj["skipDangerousModePermissionPrompt"] is True
+    # unchecking a pre-existing key writes false (not leaving it true)
+    st.skip_dangerous_chk.setChecked(False)
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert proj["skipDangerousModePermissionPrompt"] is False
+
+
+def test_mcp_servers_roundtrip_preserves_keys(oc_win, tmp_path):
+    tab = oc_win._agent_models_tab
+    tab._add_mcp_row(
+        {"name": "fs", "type": "command",
+         "command": "npx -y @modelcontextprotocol/server-filesystem /tmp",
+         "env": {"X": "1"}},
+        name="fs",
+    )
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    srv = saved["mcpServers"]["fs"]
+    assert srv["command"] == "npx -y @modelcontextprotocol/server-filesystem /tmp"
+    assert srv["type"] == "command"
+    assert srv["env"] == {"X": "1"}     # unknown sub-key preserved

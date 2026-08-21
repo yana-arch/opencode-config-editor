@@ -32,6 +32,24 @@ class OpenclaudeSettingsTab(BaseTab):
         form.addRow("agent:", self.agent_edit)
         form.addRow("advisorModel:", self.advisor_edit)
 
+        # statusLine: boolean or {"type": "command", "command": "..."}
+        self.statusline_chk = QCheckBox("enabled")
+        self.statusline_cmd = QLineEdit()
+        self.statusline_chk.stateChanged.connect(self._edited)
+        self.statusline_cmd.textChanged.connect(self._edited)
+        sl_box = QHBoxLayout()
+        sl_box.addWidget(self.statusline_chk)
+        sl_box.addWidget(self.statusline_cmd)
+        form.addRow("statusLine:", sl_box)
+
+        # skip-permission prompt toggles (settings.json booleans)
+        self.skip_dangerous_chk = QCheckBox("skip dangerous-mode prompt")
+        self.skip_fullaccess_chk = QCheckBox("skip full-access-mode prompt")
+        self.skip_dangerous_chk.stateChanged.connect(self._edited)
+        self.skip_fullaccess_chk.stateChanged.connect(self._edited)
+        form.addRow("Permission prompts:", self.skip_dangerous_chk)
+        form.addRow("", self.skip_fullaccess_chk)
+
         info = QLabel("Editable text = this layer's own value; greyed placeholder = "
                       "value inherited from the effective merge (user → project → local). "
                       "Saving writes only the fields you set into the selected layer.")
@@ -54,6 +72,24 @@ class OpenclaudeSettingsTab(BaseTab):
         self.layer_combo.blockSignals(True)
         self.layer_combo.setCurrentIndex(max(0, idx))
         self.layer_combo.blockSignals(False)
+
+        # statusLine (bool or {type,command}) + skip-permission booleans
+        sl = own.get("statusLine")
+        self._orig_statusline = sl
+        self.statusline_chk.blockSignals(True)
+        self.statusline_cmd.blockSignals(True)
+        self.statusline_chk.setChecked(bool(sl))
+        self.statusline_cmd.setText(sl.get("command", "") if isinstance(sl, dict) else "")
+        self.statusline_chk.blockSignals(False)
+        self.statusline_cmd.blockSignals(False)
+        self.skip_dangerous_chk.blockSignals(True)
+        self.skip_fullaccess_chk.blockSignals(True)
+        self.skip_dangerous_chk.setChecked(bool(own.get("skipDangerousModePermissionPrompt")))
+        self.skip_fullaccess_chk.setChecked(bool(own.get("skipFullAccessModePermissionPrompt")))
+        self._had_dangerous = "skipDangerousModePermissionPrompt" in own
+        self._had_fullaccess = "skipFullAccessModePermissionPrompt" in own
+        self.skip_dangerous_chk.blockSignals(False)
+        self.skip_fullaccess_chk.blockSignals(False)
 
         def _set(edit, key):
             # Show the selected layer's own value as editable text; show the
@@ -81,6 +117,23 @@ class OpenclaudeSettingsTab(BaseTab):
         self._put(data, "effortLevel", self.effort_combo.currentData() or "", "")
         self._put(data, "agent", self.agent_edit.text().strip(), "")
         self._put(data, "advisorModel", self.advisor_edit.text().strip(), "")
+
+        # statusLine: write when enabled; explicitly drop when disabled so an
+        # existing key is removed rather than left behind.
+        if self.statusline_chk.isChecked():
+            cmd = self.statusline_cmd.text().strip()
+            value = {"type": "command", "command": cmd} if cmd else True
+            self._put(data, "statusLine", value, None)
+        else:
+            data.pop("statusLine", None)
+        # skip-permission toggles: write when pre-existing in this layer (so
+        # unchecking writes an explicit false) or when explicitly opted in.
+        if "skipDangerousModePermissionPrompt" in data or self.skip_dangerous_chk.isChecked():
+            self._put(data, "skipDangerousModePermissionPrompt",
+                      self.skip_dangerous_chk.isChecked(), None)
+        if "skipFullAccessModePermissionPrompt" in data or self.skip_fullaccess_chk.isChecked():
+            self._put(data, "skipFullAccessModePermissionPrompt",
+                      self.skip_fullaccess_chk.isChecked(), None)
 
 
 class OpenclaudeRawTab(BaseTab):
@@ -205,6 +258,24 @@ class OpenclaudeAgentModelsTab(BaseTab):
         rbtn.addStretch()
         layout.addLayout(rbtn)
 
+        # mcpServers — global ~/.openclaude.json (name + type + command/url;
+        # other sub-keys on each server are preserved on save).
+        layout.addWidget(QLabel("MCP servers — mcpServers in ~/.openclaude.json "
+                                "(unknown sub-keys like env/headers preserved):"))
+        self.mcp_table = QTableWidget(0, 3)
+        self.mcp_table.setHorizontalHeaderLabels(["name", "type", "command / url"])
+        self.mcp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.mcp_table)
+        mcbtn = QHBoxLayout()
+        add_mc = QPushButton("Add server")
+        add_mc.clicked.connect(lambda: self._add_mcp_row())
+        del_mc = QPushButton("Remove selected")
+        del_mc.clicked.connect(self._remove_mcp_row)
+        mcbtn.addWidget(add_mc)
+        mcbtn.addWidget(del_mc)
+        mcbtn.addStretch()
+        layout.addLayout(mcbtn)
+
     def _edited(self, *_):
         if getattr(self, "_loading", False):
             return
@@ -245,6 +316,25 @@ class OpenclaudeAgentModelsTab(BaseTab):
         r = self.routing_table.currentRow()
         if r >= 0:
             self.routing_table.removeRow(r)
+            self._edited()
+
+    # --- mcpServers rows ---
+    def _add_mcp_row(self, server=None, name=""):
+        server = server if isinstance(server, dict) else {}
+        r = self.mcp_table.rowCount()
+        self.mcp_table.insertRow(r)
+        name_item = QTableWidgetItem(name or str(server.get("name", "")))
+        # Preserve the original full server config (env, headers, args, ...).
+        name_item.setData(Qt.UserRole, dict(server))
+        self.mcp_table.setItem(r, 0, name_item)
+        self.mcp_table.setItem(r, 1, QTableWidgetItem(str(server.get("type", ""))))
+        self.mcp_table.setItem(r, 2, QTableWidgetItem(str(server.get("command") or server.get("url", ""))))
+        self._edited()
+
+    def _remove_mcp_row(self):
+        r = self.mcp_table.currentRow()
+        if r >= 0:
+            self.mcp_table.removeRow(r)
             self._edited()
 
     def refresh(self):
@@ -300,6 +390,14 @@ class OpenclaudeAgentModelsTab(BaseTab):
             routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
             for agent, key in routing.items():
                 self._add_route_row(str(agent), str(key))
+
+            # mcpServers
+            self.mcp_table.setRowCount(0)
+            mcp = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
+            self._had_mcp = "mcpServers" in data
+            for name, server in mcp.items():
+                if isinstance(server, dict):
+                    self._add_mcp_row(server, name)
         finally:
             self._loading = False
             self._dirty = False
@@ -344,14 +442,40 @@ class OpenclaudeAgentModelsTab(BaseTab):
 
         # Only write providerProfiles when the file already had it or we have rows,
         # so an untouched global file isn't polluted with an empty list.
-        if self._had_profiles or profiles:
+        if "providerProfiles" in data or profiles:
             data["providerProfiles"] = profiles
-        if legacy_models or self._had_agent_models:
+        if legacy_models or "agentModels" in data:
             self._put(data, "agentModels", legacy_models, {})
 
         active = self.active_combo.currentData() or ""
-        if self._had_active or active:
+        if "activeProviderProfileId" in data or active:
             self._put(data, "activeProviderProfileId", active, "")
+
+        # mcpServers: rebuild each server from its preserved original full dict,
+        # overlaying the edited type + command/url so unknown sub-keys survive.
+        mcp = {}
+        for r in range(self.mcp_table.rowCount()):
+            nitem = self.mcp_table.item(r, 0)
+            name = nitem.text().strip() if nitem else ""
+            if not name:
+                continue
+            orig = nitem.data(Qt.UserRole) or {}
+            orig = dict(orig) if isinstance(orig, dict) else {}
+            typ = self._mcp_cell(r, 1)
+            target = self._mcp_cell(r, 2)
+            srv = dict(orig)
+            if typ:
+                srv["type"] = typ
+            if typ == "remote":
+                srv["url"] = target
+                srv.pop("command", None)
+            else:
+                if target:
+                    srv["command"] = target
+                srv.pop("url", None)
+            mcp[name] = srv
+        if "mcpServers" in data or mcp:
+            data["mcpServers"] = mcp
 
         chain = [c.strip() for c in self.fallback_edit.text().split(",") if c.strip()]
         self._put(data, "providerFallbackChain", chain, [])
@@ -368,6 +492,10 @@ class OpenclaudeAgentModelsTab(BaseTab):
 
     def _cell(self, r, c):
         item = self.models_table.item(r, c)
+        return item.text().strip() if item else ""
+
+    def _mcp_cell(self, r, c):
+        item = self.mcp_table.item(r, c)
         return item.text().strip() if item else ""
 
     @staticmethod
