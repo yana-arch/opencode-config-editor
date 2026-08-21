@@ -25,7 +25,8 @@ class MainWindow(QMainWindow):
 
         self._restore_window_state()
 
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        _title = self.adapter.app_title if self.adapter else APP_NAME
+        self.setWindowTitle(f"{_title} v{APP_VERSION}")
         self.resize(1200, 800)
 
         self._setup_theme()

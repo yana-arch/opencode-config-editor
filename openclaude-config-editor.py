@@ -1,0 +1,8110 @@
+#!/usr/bin/env python3
+"""
+opencode-config-editor — Enhanced GUI for opencode/tui config files
+
+Key improvements:
+- Dark/light theme support with system preference detection
+- Advanced model management with bulk operations
+- Provider/MCP/plugin import with conflict resolution
+- Schema-aware validation with detailed error reporting
+- Undo/redo support for all operations
+- Search/filter across all tabs
+- Bulk enable/disable for plugins and MCP servers
+- Model catalog with preview and filtering
+- Export/backup functionality
+- Keyboard shortcuts for common operations
+- Responsive UI with better error handling
+"""
+
+import json
+import os
+import re
+import copy
+import shutil
+import sys
+import tempfile
+import time
+import urllib.request
+import urllib.parse
+import ipaddress
+import socket
+import html
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+try:
+    from PySide6.QtCore import (
+        Qt, QTimer, QSettings, QThread, Signal
+    )
+    from PySide6.QtGui import (
+        QAction, QFont, QKeySequence, QColor, QPalette,
+        QTextCharFormat, QSyntaxHighlighter
+    )
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
+        QFormLayout, QLineEdit, QCheckBox, QSpinBox, QDoubleSpinBox, QTextEdit,
+        QPlainTextEdit, QTableWidget, QTableWidgetItem, QPushButton, QLabel,
+        QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QSplitter,
+        QComboBox, QMessageBox, QFileDialog, QDialogButtonBox, QGroupBox,
+        QHeaderView, QToolBar, QDialog, QFrame, QInputDialog,
+        QScrollArea
+    )
+    HAS_QT = True
+except ImportError as _e:
+    HAS_QT = False
+    sys.stderr.write(f"PySide6 not available ({_e}) - GUI disabled, core tests still run\n")
+
+    class _DummyMeta(type):
+        def __getattr__(cls, name): return 0
+        def __call__(cls, *a, **kw): return super().__call__(*a, **kw)
+
+    class _DummyQt(metaclass=_DummyMeta):
+        def __init__(self, *a, **kw): pass
+        def __getattr__(self, name): return lambda *a, **kw: None
+
+    # Signal is used as class attribute descriptor (Signal(str) etc.)
+    def _dummy_signal(*a, **kw):
+        return _DummyQt()
+
+    Qt = QTimer = QSettings = QThread = _DummyQt
+    Signal = _dummy_signal
+    QAction = QFont = QKeySequence = QColor = QPalette = QTextCharFormat = QSyntaxHighlighter = _DummyQt
+    QApplication = QMainWindow = QWidget = QTabWidget = QVBoxLayout = QHBoxLayout = _DummyQt
+    QFormLayout = QLineEdit = QCheckBox = QSpinBox = QDoubleSpinBox = QTextEdit = _DummyQt
+    QPlainTextEdit = QTableWidget = QTableWidgetItem = QPushButton = QLabel = _DummyQt
+    QListWidget = QListWidgetItem = QTreeWidget = QTreeWidgetItem = QSplitter = _DummyQt
+    QComboBox = QMessageBox = QFileDialog = QDialogButtonBox = QGroupBox = _DummyQt
+    QHeaderView = QToolBar = QDialog = QFrame = QInputDialog = QScrollArea = _DummyQt
+
+try:
+    import jsonschema
+    HAVE_JSONSCHEMA = True
+except ImportError:
+    HAVE_JSONSCHEMA = False
+
+# Constants
+APP_NAME = "opencode-config-editor"
+APP_VERSION = "4.3.1"
+SCHEMA_URL = "https://opencode.ai/config.json"
+TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
+SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"
+TUI_SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "tui-schema.json"
+PLUGIN_STATE_CACHE = Path.home() / ".cache" / APP_NAME / "plugin-state.json"
+SETTINGS_FILE = Path.home() / ".config" / APP_NAME / "settings.ini"
+UNDO_LIMIT = 100
+
+# Configuration keys (derived from https://opencode.ai/config.json and /tui.json)
+OPENCODE_KEYS = {
+    "$schema", "shell", "logLevel", "server", "command", "skills",
+    "references", "reference", "watcher", "snapshot", "plugin", "share",
+    "autoshare", "autoupdate", "disabled_providers", "enabled_providers",
+    "model", "small_model", "default_agent", "subagent_depth", "username",
+    "mode", "agent", "provider", "mcp", "formatter", "lsp", "instructions",
+    "layout", "permission", "tools", "attachment", "enterprise",
+    "tool_output", "compaction", "experimental",
+}
+
+TUI_KEYS = {
+    "$schema", "theme", "keybinds", "plugin", "plugin_enabled",
+    "leader_timeout", "attention", "prompt", "scroll_speed",
+    "scroll_acceleration", "diff_style", "cursor", "mouse",
+}
+
+# Model fields that can be bulk-edited
+MODEL_FIELDS = [
+    "name", "attachment", "reasoning", "temperature", "tool_call",
+    "cost.input", "cost.output", "cost.cache_read", "cost.cache_write",
+    "limit.context", "limit.output"
+]
+
+# Application settings, theme and undo/redo management
+class SettingsManager:
+    """Handle application settings with QSettings"""
+
+    def __init__(self):
+        self.settings = QSettings(str(SETTINGS_FILE), QSettings.IniFormat)
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    def get(self, key: str, default=None):
+        return self.settings.value(key, default)
+
+    def set(self, key: str, value):
+        self.settings.setValue(key, value)
+
+    def get_window_geometry(self):
+        return self.get("window/geometry")
+
+    def set_window_geometry(self, geometry):
+        self.set("window/geometry", geometry)
+
+    def get_window_state(self):
+        return self.get("window/state")
+
+    def set_window_state(self, state):
+        self.set("window/state", state)
+
+    def get_theme(self):
+        return self.get("appearance/theme", "system")
+
+    def set_theme(self, theme: str):
+        self.set("appearance/theme", theme)
+
+    def get_font_size(self):
+        return int(self.get("appearance/font_size", 10))
+
+    def set_font_size(self, size: int):
+        self.set("appearance/font_size", size)
+
+    def get_recent_files(self) -> List[str]:
+        val = self.get("recent_files", [])
+        if isinstance(val, str):
+            return [val] if val else []
+        if isinstance(val, list):
+            return [str(x) for x in val]
+        return []
+
+    def add_recent_file(self, path: str):
+        recent = self.get_recent_files()
+        if path in recent:
+            recent.remove(path)
+        recent.insert(0, path)
+        self.set("recent_files", recent[:10])
+
+    DEFAULT_CONTEXT_TIERS = [4000, 8000, 32000, 64000, 128000, 200000, 1000000]
+    DEFAULT_OUTPUT_TIERS = [1000, 4000, 8000, 32000, 128000]
+
+    def _parse_tiers(self, val, default) -> List[int]:
+        if isinstance(val, str) and val.strip():
+            try:
+                return sorted({int(x) for x in val.split(",") if x.strip()})
+            except ValueError:
+                return default
+        if isinstance(val, list):
+            try:
+                return sorted({int(x) for x in val})
+            except (ValueError, TypeError):
+                return default
+        return default
+
+    def get_context_tiers(self) -> List[int]:
+        return self._parse_tiers(self.get("catalog/context_tiers"), self.DEFAULT_CONTEXT_TIERS)
+
+    def set_context_tiers(self, tiers: List[int]):
+        self.set("catalog/context_tiers", ",".join(str(x) for x in sorted(set(tiers))))
+
+    def get_output_tiers(self) -> List[int]:
+        return self._parse_tiers(self.get("catalog/output_tiers"), self.DEFAULT_OUTPUT_TIERS)
+
+    def set_output_tiers(self, tiers: List[int]):
+        self.set("catalog/output_tiers", ",".join(str(x) for x in sorted(set(tiers))))
+
+    # Persisted unknown->catalog model mappings: {"provider_key/model_id": "catalog_id"}
+    def get_reference_mappings(self) -> Dict[str, str]:
+        raw = self.get("catalog/reference_mappings", "{}")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items() if v}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return {}
+
+    def set_reference_mappings(self, mappings: Dict[str, str]):
+        self.set("catalog/reference_mappings", json.dumps(mappings, ensure_ascii=False))
+
+    def add_reference_mapping(self, provider_key: str, model_id: str, catalog_id: str):
+        mappings = self.get_reference_mappings()
+        mappings[f"{provider_key}/{model_id}"] = catalog_id
+        self.set_reference_mappings(mappings)
+
+class ThemeManager:
+    """Handle application theme switching"""
+
+    def __init__(self, app: QApplication):
+        self.app = app
+        self.settings = SettingsManager()
+        self._setup_theme()
+
+    def _setup_theme(self):
+        theme = self.settings.get_theme()
+
+        if theme == "system":
+            # Use system theme
+            if self.app.styleHints().colorScheme() == Qt.Dark:
+                self._apply_dark_theme()
+            else:
+                self._apply_light_theme()
+        elif theme == "dark":
+            self._apply_dark_theme()
+        else:
+            self._apply_light_theme()
+
+    def _apply_dark_theme(self):
+        dark_palette = QPalette()
+        dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.WindowText, Qt.white)
+        dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
+        dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
+        dark_palette.setColor(QPalette.ToolTipText, Qt.white)
+        dark_palette.setColor(QPalette.Text, Qt.white)
+        dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ButtonText, Qt.white)
+        dark_palette.setColor(QPalette.BrightText, Qt.red)
+        dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.HighlightedText, Qt.black)
+        self.app.setPalette(dark_palette)
+
+    def _apply_light_theme(self):
+        light_palette = QPalette()
+        self.app.setPalette(light_palette)
+
+    def toggle_theme(self):
+        current = self.settings.get_theme()
+        if current == "dark":
+            self.settings.set_theme("light")
+        elif current == "light":
+            self.settings.set_theme("system")
+        else:
+            self.settings.set_theme("dark")
+        self._setup_theme()
+
+class UndoManager:
+    """Two-stack undo/redo. `current` (the live config) is supplied by the
+    caller so undo/redo stay symmetric: undo() returns a prior snapshot,
+    redo() returns the one you just stepped away from."""
+
+    def __init__(self):
+        self.undo_stack = deque(maxlen=UNDO_LIMIT)
+        self.redo_stack = deque(maxlen=UNDO_LIMIT)
+
+    def push(self, snapshot: dict):
+        """Record a deep-copied snapshot of the state BEFORE a change."""
+        self.undo_stack.append(snapshot)
+        self.redo_stack.clear()
+
+    def can_undo(self) -> bool:
+        return bool(self.undo_stack)
+
+    def can_redo(self) -> bool:
+        return bool(self.redo_stack)
+
+    def undo(self, current: dict) -> Optional[dict]:
+        """Return a deep copy of the state to revert to, or None."""
+        if not self.undo_stack:
+            return None
+        self.redo_stack.append(copy.deepcopy(current))
+        return self.undo_stack.pop()
+
+    def redo(self, current: dict) -> Optional[dict]:
+        """Return a deep copy of the state to move forward to, or None."""
+        if not self.redo_stack:
+            return None
+        self.undo_stack.append(copy.deepcopy(current))
+        return self.redo_stack.pop()
+
+# Config file model, validation and state stores
+class JSONHighlighter(QSyntaxHighlighter):
+    """Syntax highlighter for JSON editor"""
+
+    def __init__(self, document):
+        super().__init__(document)
+        self._rules = []
+
+        # Keywords
+        keyword_format = QTextCharFormat()
+        keyword_format.setForeground(QColor("#569CD6"))
+        keyword_format.setFontWeight(QFont.Bold)
+        keywords = ["true", "false", "null"]
+        self._rules += [(r'\b%s\b' % keyword, keyword_format) for keyword in keywords]
+
+        # Strings
+        string_format = QTextCharFormat()
+        string_format.setForeground(QColor("#CE9178"))
+        self._rules.append((r'".*?"', string_format))
+
+        # Numbers
+        number_format = QTextCharFormat()
+        number_format.setForeground(QColor("#B5CEA8"))
+        self._rules.append((r'\b[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?\b', number_format))
+
+        # Comments (JSON doesn't support comments, but we'll highlight them if present)
+        comment_format = QTextCharFormat()
+        comment_format.setForeground(QColor("#6A9955"))
+        self._rules.append((r'//[^\n]*', comment_format))
+        self._rules.append((r'/\*.*?\*/', comment_format))
+
+        # Properties
+        property_format = QTextCharFormat()
+        property_format.setForeground(QColor("#9CDCFE"))
+        self._rules.append((r'"[^"]*"\s*(?=:)', property_format))
+
+    def highlightBlock(self, text):
+        for pattern, fmt in self._rules:
+            expression = re.compile(pattern)
+            for match in expression.finditer(text):
+                start, end = match.span()
+                self.setFormat(start, end - start, fmt)
+
+def section(cfg_data, key: str) -> dict:
+    """Return cfg_data[key] when it is a dict, else an empty dict."""
+    v = cfg_data.get(key) if isinstance(cfg_data, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def deep_merge(base: dict, incoming: dict) -> dict:
+    """Recursively merge `incoming` into a copy of `base` (later wins).
+
+    Nested dicts are merged key-by-key; any non-dict value replaces wholesale.
+    Generic building block for layered configs (e.g. openclaude's
+    user -> project -> local settings.json chain).
+    """
+    out = dict(base) if isinstance(base, dict) else {}
+    for k, v in (incoming or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def merge_layers(layers) -> dict:
+    """Merge an ordered iterable of config dicts; later layers override earlier."""
+    result: dict = {}
+    for layer in layers:
+        if isinstance(layer, dict):
+            result = deep_merge(result, layer)
+    return result
+
+
+def config_home(default_dir, env_vars=()) -> Path:
+    """Resolve a config directory, honoring env overrides (first set wins).
+
+    e.g. config_home("~/.openclaude", ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR")).
+    """
+    for name in env_vars:
+        val = os.environ.get(name)
+        if val:
+            return Path(val).expanduser()
+    return Path(default_dir).expanduser()
+
+
+class ConfigFile:
+    """Enhanced config file handler with backup and validation"""
+
+    def __init__(self, path: Path, kind: str):
+        self.path = Path(path)
+        self.kind = kind
+        self.data = {}
+        self.error = None
+        self.backup_dir = Path.home() / ".cache" / APP_NAME / "backups"
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def targets(cwd: Path) -> List[Tuple[str, Path, str]]:
+        """Get available config file targets"""
+        home = Path.home()
+        proj_dir = cwd / ".opencode"
+        candidates = [
+            ("Global opencode.json", home / ".config" / "opencode" / "opencode.json", "opencode"),
+            ("Project opencode.json", (proj_dir / "opencode.json") if (proj_dir / "opencode.json").exists()
+             else (cwd / "opencode.json"), "opencode"),
+            ("Global tui.json", home / ".config" / "opencode" / "tui.json", "tui"),
+            ("Project tui.json", (proj_dir / "tui.json") if (proj_dir / "tui.json").exists()
+             else (cwd / "tui.json"), "tui"),
+        ]
+        return [(label, p, kind) for label, p, kind in candidates]
+
+    @staticmethod
+    def kind_for(path: Path) -> str:
+        """Determine config kind from path"""
+        name = path.name.lower()
+        if name == "opencode.json":
+            return "opencode"
+        if name == "tui.json":
+            return "tui"
+        return "generic"
+
+    def load(self) -> bool:
+        """Load config file with error handling"""
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            self.data = json.loads(raw)
+            self.error = None
+            return True
+        except FileNotFoundError:
+            self.data = {}
+            self.error = f"File not found: {self.path}"
+            return False
+        except json.JSONDecodeError as e:
+            self.error = f"Invalid JSON: {e}"
+            return False
+        except OSError as e:
+            self.error = f"Read error: {e}"
+            return False
+
+    def backup_path(self) -> Path:
+        """Generate backup path with timestamp"""
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return self.backup_dir / f"{self.path.name}.bak-{ts}"
+
+    def create_backup(self) -> bool:
+        """Create backup of current file"""
+        try:
+            if self.path.exists():
+                shutil.copy2(self.path, self.backup_path())
+            return True
+        except OSError as e:
+            self.error = f"Backup failed: {e}"
+            return False
+
+    def save(self, data: dict) -> Tuple[bool, str]:
+        """Atomic save with backup"""
+        if not isinstance(data, dict):
+            return False, "Root must be a JSON object."
+
+        try:
+            content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        except (TypeError, ValueError) as e:
+            return False, f"Cannot serialize config: {e}"
+
+        try:
+            # Create backup before saving
+            self.create_backup()
+
+            # Atomic write
+            fd, tmp = tempfile.mkstemp(
+                dir=str(self.path.parent),
+                prefix=f"{self.path.name}.",
+                suffix=".tmp"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, self.path)
+
+            self.data = data
+            return True, f"Saved to {self.path}"
+        except OSError as e:
+            return False, f"Save error: {e}"
+
+    def export(self, path: Path) -> Tuple[bool, str]:
+        """Export config to specified path"""
+        try:
+            content = json.dumps(self.data, indent=2, ensure_ascii=False) + "\n"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return True, f"Exported to {path}"
+        except OSError as e:
+            return False, f"Export error: {e}"
+
+class Validator:
+    """Enhanced validator with schema caching and detailed error reporting"""
+
+    def __init__(self):
+        self.schemas = {}  # kind -> schema dict
+        self.schema_error = None
+        self.last_schema_fetch = 0
+        self.schema_cache_duration = 86400  # 24 hours
+
+    def _schema_source(self, kind: str) -> Tuple[str, Path]:
+        """Return (url, cache_path) for the given config kind."""
+        if kind == "tui":
+            return TUI_SCHEMA_URL, TUI_SCHEMA_CACHE
+        return SCHEMA_URL, SCHEMA_CACHE
+
+    def _load_schema(self, kind: str = "opencode") -> Optional[dict]:
+        """Load schema (kind-aware) with caching and periodic refresh"""
+        if not HAVE_JSONSCHEMA:
+            return None
+
+        url, cache_path = self._schema_source(kind)
+        current_time = time.time()
+        if self.schemas.get(kind) is not None and (current_time - self.last_schema_fetch) < self.schema_cache_duration:
+            return self.schemas[kind]
+
+        if self.schema_error is not None and (current_time - self.last_schema_fetch) < 3600:  # 1 hour
+            return None
+
+        data = None
+        try:
+            # Try cache first
+            if cache_path.exists():
+                data = json.loads(cache_path.read_text())
+                self.schemas[kind] = data
+                self.last_schema_fetch = current_time
+                return data
+        except Exception:
+            pass
+
+        # Fetch from network
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode("utf-8"))
+
+            # Save to cache
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(data))
+            except OSError:
+                pass
+
+            self.schemas[kind] = data
+            self.last_schema_fetch = current_time
+            return data
+        except Exception as e:
+            self.schema_error = f"Could not fetch schema: {e}"
+            self.last_schema_fetch = current_time
+            return None
+
+    def validate(self, data: dict, kind: str, known_keys: set = None) -> Tuple[bool, List[str], List[str]]:
+        """Validate config.
+
+        Returns (hard_ok, hard_errors, schema_warnings).
+
+        Hard errors are structural checks we can trust regardless of schema.
+        Schema-derived findings are treated as advisory *warnings* because the
+        official opencode schema is stricter/incomplete (e.g. it rejects the
+        `local` MCP type that opencode actually supports), so a valid config
+        would otherwise always be flagged.
+
+        `known_keys` may be injected by the active adapter; when omitted we fall
+        back to the built-in opencode/tui key sets.
+        """
+        if not isinstance(data, dict):
+            return False, ["Root must be a JSON object."], []
+
+        if known_keys is None:
+            known_keys = OPENCODE_KEYS if kind in ("opencode", "generic") else TUI_KEYS
+        hard_ok, hard = self._basic_checks(data, known_keys)
+        if not hard_ok:
+            return False, hard, []
+
+        warnings: List[str] = []
+        if HAVE_JSONSCHEMA:
+            schema = self._load_schema(kind)
+            if schema is not None:
+                try:
+                    for e in jsonschema.Draft7Validator(schema).iter_errors(data):
+                        warnings.append(f"schema: {e.message} (path: {_path_of(e)})")
+                except Exception as ex:
+                    warnings.append(f"schema error: {ex}")
+        return True, [], warnings
+
+    def _basic_checks(self, data: dict, known_keys: set) -> Tuple[bool, List[str]]:
+        """Basic structural validation"""
+        errors = []
+
+        if "provider" in data and not isinstance(data["provider"], dict):
+            errors.append("'provider' must be an object.")
+
+        if "mcp" in data and not isinstance(data["mcp"], dict):
+            errors.append("'mcp' must be an object.")
+
+        if "plugin" in data and not isinstance(data["plugin"], list):
+            errors.append("'plugin' must be an array.")
+
+        if "mcp" in data:
+            for name, cfg in data["mcp"].items():
+                if not isinstance(cfg, dict):
+                    errors.append(f"mcp[{name!r}] must be an object.")
+                    continue
+
+                t = cfg.get("type")
+                if t not in (None, "local", "remote"):
+                    errors.append(f"mcp[{name!r}].type must be 'local' or 'remote'.")
+
+                if t == "local" and "command" in cfg and not isinstance(cfg["command"], list):
+                    errors.append(f"mcp[{name!r}].command must be an array.")
+
+                if t == "remote" and "url" in cfg and not isinstance(cfg["url"], str):
+                    errors.append(f"mcp[{name!r}].url must be a string.")
+
+        return (len(errors) == 0), errors
+
+def _path_of(e) -> str:
+    """Get path from validation error"""
+    try:
+        return "/".join(str(x) for x in e.absolute_path)
+    except Exception:
+        return "?"
+
+class PluginStateStore:
+    """Enhanced plugin state store with persistence"""
+
+    def __init__(self):
+        self.path = PLUGIN_STATE_CACHE
+        self._data = {}
+        self._load()
+
+    def _load(self):
+        """Load plugin state from cache"""
+        try:
+            if self.path.exists():
+                self._data = json.loads(self.path.read_text())
+        except Exception:
+            self._data = {}
+
+    def _save(self):
+        """Save plugin state to cache"""
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self._data, indent=2))
+        except OSError:
+            pass
+
+    def get_disabled(self, cfg_path: Path) -> set:
+        """Get disabled plugins for config file"""
+        return set(self._data.get(str(cfg_path), []))
+
+    def set_disabled(self, cfg_path: Path, disabled: set):
+        """Set disabled plugins for config file"""
+        key = str(cfg_path)
+        if disabled:
+            self._data[key] = sorted(disabled)
+        else:
+            self._data.pop(key, None)
+        self._save()
+
+class TuiPluginStateStore:
+    """Remember disabled tui plugins in the editor cache, keying each by name and
+    storing its full entry so re-enabling restores tuple-form options verbatim."""
+
+    def __init__(self):
+        self.path = Path.home() / ".cache" / APP_NAME / "tui-plugin-state.json"
+        self._data = {}
+        self._load()
+
+    def _load(self):
+        try:
+            if self.path.exists():
+                self._data = json.loads(self.path.read_text())
+        except Exception:
+            self._data = {}
+
+    def _save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self._data))
+        except OSError:
+            pass
+
+    def get_entries(self, cfg_path: Path) -> dict:
+        """{name: full entry} for disabled plugins of this config."""
+        entries = self._data.get(str(cfg_path), {})
+        return dict(entries) if isinstance(entries, dict) else {}
+
+    def set_entry(self, cfg_path: Path, name: str, entry):
+        key = str(cfg_path)
+        self._data.setdefault(key, {})[name] = entry
+        self._save()
+
+    def remove_entry(self, cfg_path: Path, name: str):
+        key = str(cfg_path)
+        d = self._data.get(key, {})
+        if name in d:
+            d.pop(name, None)
+            if not d:
+                self._data.pop(key, None)
+            self._save()
+
+    def clear(self, cfg_path: Path, names=None):
+        key = str(cfg_path)
+        d = self._data.get(key, {})
+        if names is None:
+            d = {}
+        else:
+            for n in names:
+                d.pop(n, None)
+        if d:
+            self._data[key] = d
+        else:
+            self._data.pop(key, None)
+        self._save()
+
+# JSON parsing / import helpers for providers, MCP servers and models
+def _load_json_file(path: Path) -> dict:
+    """Load JSON with error handling"""
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _slugify(s: str) -> str:
+    """Convert string to slug"""
+    s = re.sub(r"[^a-zA-Z0-9_.\-]+", "-", str(s)).strip("-")
+    return s or "item"
+
+def _looks_like_provider_cfg(v) -> bool:
+    """Check if object looks like a provider config"""
+    return isinstance(v, dict) and any(k in v for k in ("npm", "models", "options", "name", "id"))
+
+def parse_provider_import(obj: dict) -> dict:
+    """Parse provider import from various JSON formats"""
+    if isinstance(obj, dict) and isinstance(obj.get("provider"), dict) and obj["provider"]:
+        obj = obj["provider"]
+
+    if isinstance(obj, dict) and obj and all(_looks_like_provider_cfg(v) for v in obj.values()):
+        return obj
+
+    if _looks_like_provider_cfg(obj):
+        key = _slugify(obj.get("id") or obj.get("name") or "provider")
+        cfg = {k: v for k, v in obj.items() if k != "id"}
+        return {key: cfg}
+
+    raise ValueError(
+        "Unrecognized provider JSON. Expected a provider object, a "
+        "{name: provider} map, or a full config containing 'provider'."
+    )
+
+def _looks_like_mcp_cfg(v) -> bool:
+    """Check if object looks like an MCP config"""
+    return isinstance(v, dict) and any(k in v for k in ("type", "command", "url", "enabled"))
+
+def parse_mcp_import(obj: dict) -> dict:
+    """Parse MCP import from various JSON formats"""
+    if isinstance(obj, dict) and isinstance(obj.get("mcp"), dict) and obj["mcp"]:
+        obj = obj["mcp"]
+
+    if isinstance(obj, dict) and obj and all(_looks_like_mcp_cfg(v) for v in obj.values()):
+        return obj
+
+    if _looks_like_mcp_cfg(obj):
+        key = _slugify(obj.get("name") or obj.get("id") or "server")
+        cfg = {k: v for k, v in obj.items() if k not in ("name", "id")}
+        return {key: cfg}
+
+    raise ValueError(
+        "Unrecognized MCP JSON. Expected a server object or a {name: server} map."
+    )
+
+def merge_dict(base: dict, incoming: dict) -> dict:
+    """Merge two configs with special handling for models/options"""
+    out = dict(base)
+    for k, v in incoming.items():
+        if k in ("models", "options") and isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = {**out[k], **v}
+        else:
+            out[k] = v
+    return out
+
+def _extract_models_map(data) -> dict:
+    """Extract models map from various formats"""
+    if isinstance(data, dict):
+        if isinstance(data.get("models"), dict):
+            return data["models"]
+        if data and all(isinstance(v, dict) for v in data.values()):
+            return data
+
+    if isinstance(data, list):
+        out = {}
+        for item in data:
+            if isinstance(item, dict) and "id" in item:
+                out[item["id"]] = {k: v for k, v in item.items() if k != "id"}
+        if not out:
+            raise ValueError("Array items must be objects with an 'id' field.")
+        return out
+
+    raise ValueError("Unrecognized models JSON shape.")
+
+# Model catalog, normalized model formats, matching and fallback logic
+class ModelCatalog:
+    """Enhanced model catalog with filtering and preview"""
+
+    def __init__(self):
+        self.raw = None
+        self.by_provider = {}  # provider_id -> {model_id: spec}
+        self.flat = {}         # model_id -> spec
+        self.source = None
+        self.last_updated = None
+        self._formats_cache = None
+        self._model_index = {}  # model_id -> [provider_id, ...]
+
+    def loaded(self) -> bool:
+        """Check if catalog is loaded"""
+        return self.raw is not None
+
+    def load(self, path: Path):
+        """Load catalog from file"""
+        data = _load_json_file(path)
+        self._ingest(data)
+        self.source = str(path)
+        self.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def load_text(self, text: str):
+        """Load catalog from text"""
+        data = json.loads(text)
+        self._ingest(data)
+        self.source = "(pasted)"
+        self.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _ingest(self, data: dict):
+        """Process catalog data"""
+        if not isinstance(data, dict) or not data:
+            raise ValueError("Catalog JSON must be a non-empty object.")
+
+        by_provider, flat = {}, {}
+
+        # models.dev-style dump: {providerId: {..., "models": {id: spec}}}
+        if all(isinstance(v, dict) and "models" in v for v in data.values()):
+            for pid, pdata in data.items():
+                models = pdata.get("models", {})
+                if isinstance(models, dict):
+                    by_provider[pid] = models
+                    for mid, spec in models.items():
+                        flat.setdefault(mid, spec)
+
+        # Single provider dump: {"id":..., "models": {...}}
+        elif "models" in data and isinstance(data["models"], dict):
+            pid = data.get("id") or "provider"
+            by_provider[pid] = data["models"]
+            flat.update(data["models"])
+
+        # Flat map: {modelId: spec}
+        elif all(isinstance(v, dict) for v in data.values()):
+            flat.update(data)
+            # Provide a synthetic provider so the normalized formats still work.
+            by_provider["provider"] = data
+
+        else:
+            raise ValueError("Unrecognized model catalog format.")
+
+        self.raw, self.by_provider, self.flat = data, by_provider, flat
+        self._formats_cache = None
+        self._model_index = {}
+        for pid, models in by_provider.items():
+            for mid in models:
+                self._model_index.setdefault(mid, []).append(pid)
+
+    def models_for(self, provider_key: str, npm: str = None) -> dict:
+        """Get models for provider"""
+        candidates = [provider_key, npm, (npm or "").split("/")[-1]]
+        for candidate in candidates:
+            if candidate and candidate in self.by_provider:
+                return self.by_provider[candidate]
+        return self.flat
+
+    def filter_models(self, search: str) -> dict:
+        """Filter models by search string"""
+        if not search:
+            return self.flat
+
+        search = search.lower()
+        return {
+            mid: spec for mid, spec in self.flat.items()
+            if search in mid.lower() or
+               (isinstance(spec.get("name"), str) and search in spec["name"].lower())
+        }
+
+    def formats(self) -> Dict[str, Dict[str, "ModelFormat"]]:
+        """Lazily build normalized formats: provider -> model_id -> ModelFormat."""
+        if getattr(self, "_formats_cache", None) is not None:
+            return self._formats_cache
+        cache = {}
+        for pid, models in self.by_provider.items():
+            pmap = {}
+            for mid, spec in models.items():
+                pmap[mid] = ModelFormat.from_spec(pid, mid, spec)
+            cache[pid] = pmap
+        self._formats_cache = cache
+        return cache
+
+    def all_formats(self) -> List["ModelFormat"]:
+        """Flatten all formats across providers."""
+        return [fmt for pmap in self.formats().values() for fmt in pmap.values()]
+
+    def find_model(self, model_id: str) -> List["ModelFormat"]:
+        """Match a model id across the whole catalog (may match many providers)."""
+        providers = self._model_index.get(model_id)
+        if not providers:
+            return []
+        fmts = self.formats()
+        return [fmts[p][model_id] for p in providers if model_id in fmts.get(p, {})]
+
+def try_load_bundled_catalog(catalog) -> bool:
+    """Silently load the bundled models.dev catalog into `catalog` if present.
+
+    Never prompts or raises; returns True when the catalog was loaded."""
+    if catalog is None or catalog.loaded():
+        return catalog is not None and catalog.loaded()
+    try:
+        bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
+        if bundled.exists():
+            catalog.load(bundled)
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+def _merge_model_spec(existing, catalog_spec: dict, overwrite: bool) -> dict:
+    """Merge model spec with catalog spec"""
+    if not isinstance(existing, dict):
+        existing = {}
+    existing = dict(existing)
+    for k, v in catalog_spec.items():
+        if k in ("cost", "limit") and isinstance(v, dict):
+            sub = dict(existing.get(k, {})) if isinstance(existing.get(k), dict) else {}
+            for sk, sv in v.items():
+                if overwrite or sk not in sub:
+                    sub[sk] = sv
+            existing[k] = sub
+        else:
+            if overwrite or k not in existing:
+                existing[k] = v
+    return existing
+
+
+# ---------------------------------------------------------------------------
+# Model Format normalization
+# ---------------------------------------------------------------------------
+
+# Flexible key aliases so new providers/schemas only need a map entry.
+SPEC_ALIASES = {
+    "context": ["limit.context", "context_window", "max_input_tokens", "context_length"],
+    "output": ["limit.output", "max_output_tokens", "output_tokens", "max_tokens"],
+    "modalities": ["modalities", "input_modalities", "supported_media"],
+    "cost_in": ["cost.input", "cost_in", "input_cost"],
+    "cost_out": ["cost.output", "cost_out", "output_cost"],
+    "cost_cache_read": ["cost.cache_read", "cache_read"],
+    "cost_cache_write": ["cost.cache_write", "cache_write"],
+}
+
+
+def _deep_get(spec: dict, dotted: str):
+    """Resolve a dotted path ('limit.context') in a dict."""
+    cur = spec
+    for part in dotted.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _first_value(spec: dict, aliases) -> Optional[object]:
+    for key in aliases:
+        v = _deep_get(spec, key)
+        if v is not None:
+            return v
+    return None
+
+
+def _as_bool(v) -> bool:
+    return bool(v) if v is not None else False
+
+
+@dataclass
+class Modalities:
+    """Normalized input/output modalities of a model."""
+    input_mods: List[str] = field(default_factory=lambda: ["text"])
+    output_mods: List[str] = field(default_factory=lambda: ["text"])
+    inferred: bool = False
+
+    @property
+    def has_image_input(self) -> bool:
+        return any(m in ("image", "vision") for m in self.input_mods)
+
+    @property
+    def has_pdf_input(self) -> bool:
+        return "pdf" in self.input_mods
+
+    @property
+    def supports_text_input(self) -> bool:
+        return "text" in self.input_mods or not self.input_mods
+
+    @property
+    def supports_text_output(self) -> bool:
+        return "text" in self.output_mods or not self.output_mods
+
+    def label(self) -> str:
+        in_str = "+".join(self.input_mods) if self.input_mods else "?"
+        out_str = "+".join(self.output_mods) if self.output_mods else "?"
+        mark = "~" if self.inferred else ""
+        return f"in:{in_str}{mark} / out:{out_str}"
+
+
+@dataclass
+class ModelFormat:
+    """Normalized description of a model across any provider."""
+    provider: str
+    model_id: str
+    name: str
+    context: Optional[int] = None
+    output: Optional[int] = None
+    modalities: Modalities = field(default_factory=Modalities)
+    attachment: bool = False
+    reasoning: bool = False
+    tools: bool = False
+    temperature: bool = False
+    cost_in: Optional[float] = None
+    cost_out: Optional[float] = None
+    cost_cache_read: Optional[float] = None
+    cost_cache_write: Optional[float] = None
+
+    def context_k(self) -> str:
+        return _fmt_tokens(self.context)
+
+    def output_k(self) -> str:
+        return _fmt_tokens(self.output)
+
+    def cost_in_label(self) -> str:
+        return _fmt_cost(self.cost_in)
+
+    def cost_out_label(self) -> str:
+        return _fmt_cost(self.cost_out)
+
+    @classmethod
+    def from_spec(cls, provider: str, model_id: str, spec: dict) -> "ModelFormat":
+        spec = spec or {}
+
+        context = _first_value(spec, SPEC_ALIASES["context"])
+        output = _first_value(spec, SPEC_ALIASES["output"])
+
+        mods = _parse_modalities(spec)
+
+        attachment = _as_bool(spec.get("attachment"))
+        reasoning = _as_bool(spec.get("reasoning"))
+        tools = _as_bool(spec.get("tool_call") or spec.get("tools"))
+        temperature = _as_bool(spec.get("temperature"))
+
+        cost_in = _first_value(spec, SPEC_ALIASES["cost_in"])
+        cost_out = _first_value(spec, SPEC_ALIASES["cost_out"])
+        cache_read = _first_value(spec, SPEC_ALIASES["cost_cache_read"])
+        cache_write = _first_value(spec, SPEC_ALIASES["cost_cache_write"])
+
+        return cls(
+            provider=provider,
+            model_id=model_id,
+            name=str(spec.get("name") or model_id),
+            context=_as_int(context),
+            output=_as_int(output),
+            modalities=mods,
+            attachment=attachment,
+            reasoning=reasoning,
+            tools=tools,
+            temperature=temperature,
+            cost_in=_as_float(cost_in),
+            cost_out=_as_float(cost_out),
+            cost_cache_read=_as_float(cache_read),
+            cost_cache_write=_as_float(cache_write),
+        )
+
+
+def _parse_modalities(spec: dict) -> Modalities:
+    """Parse modalities, inferring from attachment when missing."""
+    raw = _first_value(spec, SPEC_ALIASES["modalities"])
+
+    if isinstance(raw, dict):
+        in_mods = raw.get("input")
+        out_mods = raw.get("output")
+        inferred = False
+    elif isinstance(raw, list):
+        in_mods, out_mods = raw, ["text"]
+        inferred = True
+    else:
+        in_mods, out_mods = None, None
+        inferred = True
+
+    in_list = [str(m) for m in in_mods] if in_mods else None
+    out_list = [str(m) for m in out_mods] if out_mods else None
+
+    # Fallback: attachment implies image input
+    if not in_list and _as_bool(spec.get("attachment")):
+        in_list = ["text", "image"]
+    elif not in_list:
+        in_list = ["text"]
+
+    if not out_list:
+        out_list = ["text"]
+
+    return Modalities(input_mods=in_list, output_mods=out_list, inferred=inferred)
+
+
+def _as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_tokens(v) -> str:
+    if v is None:
+        return "?"
+    if v >= 1000000:
+        return f"{v / 1000000:.1f}M"
+    if v >= 1000:
+        return f"{v / 1000:.0f}k"
+    return str(v)
+
+
+def _fmt_cost(v) -> str:
+    if v is None:
+        return "?"
+    return f"${v:.4f}"
+
+
+def build_spec_from_format(fmt: ModelFormat) -> dict:
+    """Convert a normalized ModelFormat back into a config-shaped spec."""
+    spec = {}
+    if fmt.name and fmt.name != fmt.model_id:
+        spec["name"] = fmt.name
+
+    limit = {}
+    if fmt.context is not None:
+        limit["context"] = fmt.context
+    if fmt.output is not None:
+        limit["output"] = fmt.output
+    if limit:
+        spec["limit"] = limit
+
+    cost = {}
+    if fmt.cost_in is not None:
+        cost["input"] = fmt.cost_in
+    if fmt.cost_out is not None:
+        cost["output"] = fmt.cost_out
+    if fmt.cost_cache_read is not None:
+        cost["cache_read"] = fmt.cost_cache_read
+    if fmt.cost_cache_write is not None:
+        cost["cache_write"] = fmt.cost_cache_write
+    if cost:
+        spec["cost"] = cost
+
+    if not fmt.modalities.inferred:
+        spec["modalities"] = {
+            "input": list(fmt.modalities.input_mods),
+            "output": list(fmt.modalities.output_mods),
+        }
+
+    if fmt.attachment:
+        spec["attachment"] = True
+    if fmt.reasoning:
+        spec["reasoning"] = True
+    if fmt.tools:
+        spec["tool_call"] = True
+    if fmt.temperature:
+        spec["temperature"] = True
+    return spec
+
+
+@dataclass
+class ApplyReport:
+    """Result of applying catalog specs to a config's providers."""
+    matched: List[str] = field(default_factory=list)
+    filled: List[str] = field(default_factory=list)
+    added: List[str] = field(default_factory=list)
+    unchanged: List[str] = field(default_factory=list)
+    unknown: List[str] = field(default_factory=list)
+    ambiguous: List[tuple] = field(default_factory=list)
+
+    def any_changes(self) -> bool:
+        return bool(self.matched or self.filled or self.added)
+
+
+def apply_catalog_to_config(catalog, config_providers: dict, *,
+                            overwrite: bool = False,
+                            add_new: bool = False,
+                            resolve_fn=None) -> ApplyReport:
+    """Match each configured model id against the catalog and merge specs."""
+    report = ApplyReport()
+    formats = catalog.formats()
+
+    for prov_name, prov_cfg in list((config_providers or {}).items()):
+        if not isinstance(prov_cfg, dict):
+            continue
+        models = prov_cfg.get("models")
+        if models is None:
+            # Only create an empty models map if we'll actually add something.
+            has_new = add_new and bool(formats.get(prov_name))
+            models = prov_cfg.setdefault("models", {}) if has_new else {}
+        if not isinstance(models, dict):
+            continue
+
+        for mid, spec in list(models.items()):
+            matches = catalog.find_model(mid)
+            if not matches:
+                report.unknown.append(f"{prov_name}/{mid}")
+                continue
+
+            chosen = _resolve_match(matches, prov_name, mid, resolve_fn)
+            if chosen is None:
+                report.ambiguous.append((prov_name, mid, matches))
+                continue
+
+            merged = _merge_model_spec(spec, build_spec_from_format(chosen), overwrite)
+            changed = merged != (spec or {})
+            if changed:
+                models[mid] = merged
+                report.filled.append(f"{prov_name}/{mid}")
+            else:
+                report.unchanged.append(f"{prov_name}/{mid}")
+
+        if add_new:
+            known_ids = set(models.keys())
+            for fmt in formats.get(prov_name, {}).values():
+                if fmt.model_id not in known_ids:
+                    models[fmt.model_id] = build_spec_from_format(fmt)
+                    report.added.append(f"{prov_name}/{fmt.model_id}")
+                    known_ids.add(fmt.model_id)
+
+    return report
+
+
+def _resolve_match(matches, prov_name, mid=None, resolve_fn=None):
+    """Pick a match: prefer same provider name, else ask resolve_fn, else first."""
+    if len(matches) == 1:
+        return matches[0]
+    for m in matches:
+        if m.provider == prov_name:
+            return m
+    if resolve_fn is not None:
+        return resolve_fn(prov_name, mid, matches)
+    return None
+
+
+def _format_completeness(fmt: ModelFormat) -> int:
+    """Count how much metadata a format carries (used to rank matches)."""
+    score = 0
+    for v in (fmt.context, fmt.output, fmt.cost_in, fmt.cost_out,
+              fmt.cost_cache_read, fmt.cost_cache_write):
+        if v is not None:
+            score += 1
+    if not fmt.modalities.inferred:
+        score += 1
+    if fmt.name and fmt.name != fmt.model_id:
+        score += 1
+    return score
+
+
+def _sort_matches(matches, prov_name):
+    """Order matches: same provider name first, then by completeness (desc)."""
+    return sorted(
+        matches,
+        key=lambda m: (m.provider != prov_name, -_format_completeness(m)),
+    )
+
+
+_VERSION_SUFFIX = re.compile(
+    r'[-_](\d{4}[-_]\d{2}[-_]\d{2}'
+    r'|\d{4}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'
+    r'|v\d+(\.\d+)*|latest|preview|stable)$',
+    re.IGNORECASE)
+
+
+def _normalize_model_id(mid: str) -> str:
+    """Normalize a model id for fuzzy fallback: lowercase, underscores to
+    hyphens, and trailing version/date suffixes stripped."""
+    s = str(mid).strip().lower().replace("_", "-")
+    prev = None
+    while prev != s:
+        prev = s
+        s = _VERSION_SUFFIX.sub("", s)
+    return s.strip("-") or str(mid).strip().lower()
+
+
+def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
+    """Try to find a catalog format for an unmatched model id.
+
+    Order: (a) exact id within the reference provider, (b) normalized-id
+    match anywhere, (c) normalized-id match within the reference provider,
+    (d) longest shared prefix within the reference provider.
+    Returns a ModelFormat or None. Never raises on a missing catalog.
+    """
+    if catalog is None or not getattr(catalog, "loaded", lambda: False)():
+        return None
+    formats = catalog.formats()
+
+    # (a) exact id within reference provider
+    if reference_provider:
+        fmt = formats.get(reference_provider, {}).get(mid)
+        if fmt is not None:
+            return fmt
+
+    normalized = _normalize_model_id(mid)
+    if not normalized:
+        return None
+
+    # (b) normalized match within the reference provider first
+    if reference_provider:
+        pmap = formats.get(reference_provider, {})
+        if normalized in pmap:
+            return pmap[normalized]
+
+    # (c) normalized match anywhere in the catalog
+    for pid, pmap in formats.items():
+        if normalized in pmap:
+            return pmap[normalized]
+
+    # (d) longest shared prefix within the reference provider
+    if reference_provider:
+        pmap = formats.get(reference_provider, {})
+        best, best_len = None, 0
+        for cand_id in pmap:
+            cand_norm = _normalize_model_id(cand_id)
+            if not cand_norm:
+                continue
+            common = 0
+            for a, b in zip(normalized, cand_norm):
+                if a != b:
+                    break
+                common += 1
+            # Require a meaningful prefix and a remaining "family" shape.
+            if common > best_len and common >= min(len(normalized), len(cand_norm)) - 4 \
+                    and common >= 4:
+                best, best_len = pmap[cand_id], common
+        return best
+
+    return None
+
+
+# Provider model-list fetching (adapters, SSRF guard, response parsing)
+# ---------------------------------------------------------------------------
+# Provider model fetching (import a new provider by fetching its model list)
+# ---------------------------------------------------------------------------
+
+class FetchError(Exception):
+    """Raised when fetching or parsing a provider's model list fails."""
+
+
+@dataclass
+class ProviderFetchSpec:
+    """Describes how to fetch a model list from a provider API."""
+    base_url: str
+    adapter: str = "openai"           # openai | anthropic | gemini | models_dev | generic
+    api_key: str = ""
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    # Generic adapter only:
+    items_path: str = ""              # dotted path to the array, e.g. "data" or "result.models"
+    id_field: str = ""                # field within each item holding the model id
+    name_field: str = ""              # field within each item holding the display name
+    allow_local: bool = False         # permit localhost / private IPs (Ollama, LM Studio)
+    timeout: int = 15
+
+
+# Well-known adapter presets: (endpoint suffix, auth mode, items_path, id_field).
+FETCH_ADAPTERS = {
+    "openai": {
+        "label": "OpenAI-compatible (/models)",
+        "suffix": "/models",
+        "auth": "bearer",
+        "items_path": "data",
+        "id_field": "id",
+        "name_field": "id",
+    },
+    "anthropic": {
+        "label": "Anthropic / Claude (/v1/models)",
+        "suffix": "/v1/models",
+        "auth": "x-api-key",
+        "items_path": "data",
+        "id_field": "id",
+        "name_field": "display_name",
+    },
+    "gemini": {
+        "label": "Google Gemini (/v1beta/models)",
+        "suffix": "/v1beta/models",
+        "auth": "query-key",
+        "items_path": "models",
+        "id_field": "name",
+        "name_field": "displayName",
+    },
+    "models_dev": {
+        "label": "models.dev catalog (api.json)",
+        "suffix": "",
+        "auth": "none",
+        "items_path": "",   # handled specially (catalog dump)
+        "id_field": "id",
+        "name_field": "name",
+    },
+    "generic": {
+        "label": "Generic JSON (custom path)",
+        "suffix": "",
+        "auth": "bearer",
+        "items_path": "data",
+        "id_field": "id",
+        "name_field": "name",
+    },
+}
+
+
+def _is_local_host(host: str) -> bool:
+    """True if host is localhost or resolves to a private/loopback address."""
+    if not host:
+        return True
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    # Resolve hostname; if any resolved address is private, treat as local.
+    try:
+        infos = socket.getaddrinfo(host, None)
+        for info in infos:
+            addr = info[4][0]
+            try:
+                ip = ipaddress.ip_address(addr)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    return True
+            except ValueError:
+                continue
+    except (socket.gaierror, OSError):
+        # Cannot resolve; let the request itself fail rather than blocking.
+        return False
+    return False
+
+
+def _validate_fetch_url(url: str, allow_local: bool):
+    """Basic SSRF guard: require http(s) and block private hosts unless allowed."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise FetchError("URL must use http:// or https://")
+    if not parsed.hostname:
+        raise FetchError("URL has no host")
+    if not allow_local and _is_local_host(parsed.hostname):
+        raise FetchError(
+            f"Refusing to fetch from local/private host '{parsed.hostname}'. "
+            "Enable 'Allow local URL' for Ollama/LM Studio.")
+    return parsed
+
+
+def _build_fetch_url(spec: ProviderFetchSpec) -> str:
+    """Combine base_url + adapter suffix (+ query key for Gemini)."""
+    preset = FETCH_ADAPTERS.get(spec.adapter, FETCH_ADAPTERS["generic"])
+    base = spec.base_url.rstrip("/")
+    suffix = preset["suffix"]
+    # Only append the suffix when the base doesn't already include it.
+    if suffix and not base.endswith(suffix.rstrip("/")):
+        url = base + suffix
+    else:
+        url = base
+    if preset["auth"] == "query-key" and spec.api_key:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}key={urllib.parse.quote(spec.api_key)}"
+    return url
+
+
+def _build_fetch_headers(spec: ProviderFetchSpec) -> Dict[str, str]:
+    preset = FETCH_ADAPTERS.get(spec.adapter, FETCH_ADAPTERS["generic"])
+    headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}", "Accept": "application/json"}
+    auth = preset["auth"]
+    if spec.api_key and auth == "bearer":
+        headers["Authorization"] = f"Bearer {spec.api_key}"
+    elif spec.api_key and auth == "x-api-key":
+        headers["x-api-key"] = spec.api_key
+        headers["anthropic-version"] = "2023-06-01"
+    headers.update(spec.extra_headers or {})
+    return headers
+
+
+def _extract_by_path(data, dotted: str):
+    """Follow a dotted path; empty path returns data unchanged."""
+    if not dotted:
+        return data
+    cur = data
+    for part in dotted.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+    return cur
+
+
+def _gemini_model_id(raw_id: str) -> str:
+    """Gemini ids come as 'models/gemini-1.5-pro'; strip the prefix."""
+    if isinstance(raw_id, str) and raw_id.startswith("models/"):
+        return raw_id[len("models/"):]
+    return raw_id
+
+
+def parse_fetched_models(data, spec: ProviderFetchSpec) -> dict:
+    """Normalize a fetched API response into a {model_id: spec} map."""
+    preset = FETCH_ADAPTERS.get(spec.adapter, FETCH_ADAPTERS["generic"])
+
+    # models.dev returns a full catalog dump; flatten across providers.
+    if spec.adapter == "models_dev":
+        flat = {}
+        if isinstance(data, dict):
+            for _pid, pdata in data.items():
+                if isinstance(pdata, dict) and isinstance(pdata.get("models"), dict):
+                    for mid, mspec in pdata["models"].items():
+                        flat.setdefault(mid, mspec)
+        if not flat:
+            raise FetchError("models.dev response contained no models.")
+        return flat
+
+    items_path = spec.items_path or preset["items_path"]
+    id_field = spec.id_field or preset["id_field"]
+    name_field = spec.name_field or preset["name_field"]
+
+    items = _extract_by_path(data, items_path)
+    # Some APIs return the array at the top level.
+    if items is None and isinstance(data, list):
+        items = data
+    if not isinstance(items, list):
+        raise FetchError(
+            f"Could not find a model array at path '{items_path or '(root)'}'. "
+            "Check the format / path.")
+
+    out = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get(id_field)
+        if not raw_id:
+            continue
+        mid = _gemini_model_id(raw_id) if spec.adapter == "gemini" else str(raw_id)
+        model_spec = {}
+        display = item.get(name_field)
+        if display and str(display) != mid:
+            model_spec["name"] = str(display)
+        out[mid] = model_spec
+    if not out:
+        raise FetchError("No models with a valid id were found in the response.")
+    return out
+
+
+def fetch_provider_models(spec: ProviderFetchSpec, *, opener=None) -> dict:
+    """Fetch and normalize a provider's model list. Returns {model_id: spec}.
+
+    `opener` is an optional callable(url, headers, timeout) -> bytes, injected
+    for testing so no real network call is made.
+    """
+    url = _build_fetch_url(spec)
+    _validate_fetch_url(url, spec.allow_local)
+    headers = _build_fetch_headers(spec)
+
+    if opener is not None:
+        raw = opener(url, headers, spec.timeout)
+    else:
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=spec.timeout) as r:
+                raw = r.read()
+        except Exception as e:  # urllib raises many subclasses; surface uniformly
+            raise FetchError(f"Request failed: {e}") from e
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise FetchError(f"Response was not valid JSON: {e}") from e
+
+    return parse_fetched_models(data, spec)
+
+
+# Agent adapter spec + registry.
+#
+# An AdapterSpec describes ONE agent CLI's config surface (file locations,
+# known keys, which tabs to show) so the editor can be extended to a new CLI
+# (opencode, openclaude, ...) by registering an adapter instead of editing the
+# core. This is the seam that keeps `core` generic and each agent's specifics
+# isolated in its own adapter module.
+
+@dataclass
+class AdapterSpec:
+    name: str                                  # unique id, e.g. "opencode"
+    app_title: str                             # window title base
+    version: str
+    kinds: List[str]                           # config kinds, e.g. ["opencode", "tui"]
+    known_keys: Dict[str, set]                 # kind -> allowed top-level keys
+    raw_files: List[Tuple[str, str]]           # [(label, kind)] for the Raw JSON combo
+    targets_fn: Callable                       # (cwd) -> [(label, Path, kind)]
+    make_tabs_fn: Callable                     # (window) -> [(tab_widget, title, kind|None)]
+    capabilities: set = field(default_factory=set)
+    # Optional session hooks. When None, MainWindow uses its built-in opencode
+    # behavior; an adapter with a different config topology (e.g. openclaude's
+    # layered settings) provides these to take over load/refresh/save.
+    initial_load_fn: Optional[Callable] = None   # (window) -> None
+    refresh_fn: Optional[Callable] = None        # (window) -> None
+    save_fn: Optional[Callable] = None           # (window) -> None
+
+    def targets(self, cwd):
+        return self.targets_fn(cwd)
+
+    def make_tabs(self, window):
+        return self.make_tabs_fn(window)
+
+    def known_keys_for(self, kind: str) -> set:
+        if kind in self.known_keys:
+            return self.known_keys[kind]
+        # fall back to the first/primary kind's keys
+        return self.known_keys.get(self.kinds[0], set()) if self.kinds else set()
+
+    def has(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+
+_REGISTRY: Dict[str, AdapterSpec] = {}
+_DEFAULT: List[str] = []  # holds the name of the first-registered adapter
+
+
+def register_adapter(spec: AdapterSpec) -> AdapterSpec:
+    """Register an adapter; the first one registered becomes the default."""
+    _REGISTRY[spec.name] = spec
+    if not _DEFAULT:
+        _DEFAULT.append(spec.name)
+    return spec
+
+
+def get_adapter(name: str) -> Optional[AdapterSpec]:
+    return _REGISTRY.get(name)
+
+
+def list_adapters() -> List[str]:
+    return sorted(_REGISTRY)
+
+
+def default_adapter() -> Optional[AdapterSpec]:
+    return _REGISTRY.get(_DEFAULT[0]) if _DEFAULT else None
+# Shared GUI components and generic import dialogs
+# GUI Components
+def _esc_html(s) -> str:
+    return html.escape(str(s), quote=True)
+
+class MaskedLineEdit(QWidget):
+    """Line edit with optional masking for sensitive fields"""
+
+    SECRET_HINT = re.compile(r"(key|token|secret|password|auth)", re.I)
+
+    def __init__(self, value="", parent=None, field_name="", placeholder=""):
+        super().__init__(parent)
+        self.field_name = field_name
+        self.is_secret = bool(self.SECRET_HINT.search(field_name))
+        self._real_value = str(value) if value is not None else ""
+        self.toggle_btn = None
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.setText(self._display_value())
+        layout.addWidget(self.edit)
+
+        if self.is_secret:
+            self.toggle_btn = QPushButton("👁")
+            self.toggle_btn.setCheckable(True)
+            self.toggle_btn.setFixedWidth(30)
+            self.toggle_btn.toggled.connect(self._toggle_visibility)
+            layout.addWidget(self.toggle_btn)
+
+    def _revealed(self) -> bool:
+        return self.toggle_btn is not None and self.toggle_btn.isChecked()
+
+    def _display_value(self) -> str:
+        """Get display value (masked if secret)"""
+        if not self.is_secret or self._revealed():
+            return self._real_value
+        return _mask(self._real_value)
+
+    def _toggle_visibility(self, checked: bool):
+        """Toggle visibility of secret value"""
+        self.edit.setText(self._display_value())
+
+    def set_value(self, value):
+        """Set value"""
+        self._real_value = str(value) if value is not None else ""
+        self.edit.setText(self._display_value())
+
+    def value(self) -> str:
+        """Get current value"""
+        if self.is_secret and not self._revealed():
+            return self._real_value
+        return self.edit.text()
+
+def _mask(v: str, visible: bool = False) -> str:
+    """Mask sensitive value"""
+    if v is None:
+        return ""
+    s = str(v)
+    if visible or not s:
+        return s
+    if len(s) <= 4:
+        return "*" * len(s)
+    return s[:3] + "*" * (len(s) - 4) + s[-1]
+
+class SearchableTableWidget(QTableWidget):
+    """Table widget with search/filter functionality"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._search_text = ""
+        self._original_data = []
+
+    def set_data(self, data: List[dict]):
+        """Set table data"""
+        self._original_data = data
+        self._apply_filter()
+
+    def set_search_text(self, text: str):
+        """Set search text"""
+        self._search_text = text.lower()
+        self._apply_filter()
+
+    def _apply_filter(self):
+        """Apply current filter to data"""
+        if not self._search_text:
+            self.setRowCount(len(self._original_data))
+            for row, item in enumerate(self._original_data):
+                self._populate_row(row, item)
+            return
+
+        filtered = [
+            item for item in self._original_data
+            if self._matches_search(item)
+        ]
+        self.setRowCount(len(filtered))
+        for row, item in enumerate(filtered):
+            self._populate_row(row, item)
+
+    def _matches_search(self, item: dict) -> bool:
+        """Check if item matches search text"""
+        search = self._search_text.lower()
+        for col in range(self.columnCount()):
+            header = self.horizontalHeaderItem(col).text().lower()
+            value = str(item.get(header, "")).lower()
+            if search in value:
+                return True
+        return False
+
+    def _populate_row(self, row: int, item: dict):
+        """Populate table row with item data"""
+        for col in range(self.columnCount()):
+            header = self.horizontalHeaderItem(col).text()
+            value = item.get(header, "")
+            self.setItem(row, col, QTableWidgetItem(str(value)))
+
+class JsonImportDialog(QDialog):
+    """Enhanced JSON import dialog with syntax highlighting"""
+
+    def __init__(self, parent, title: str, hint: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(700, 500)
+        self.result_data = None
+
+        layout = QVBoxLayout(self)
+
+        if hint:
+            hint_label = QLabel(hint)
+            hint_label.setWordWrap(True)
+            layout.addWidget(hint_label)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        load_btn = QPushButton("Load from file...")
+        load_btn.clicked.connect(self._load_file)
+        paste_btn = QPushButton("Paste from clipboard")
+        paste_btn.clicked.connect(self._paste)
+        button_layout.addWidget(load_btn)
+        button_layout.addWidget(paste_btn)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+        # Editor
+        self.editor = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = JSONHighlighter(self.editor.document())
+        layout.addWidget(self.editor)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _load_file(self):
+        """Load JSON from file"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load JSON", str(Path.home()),
+            "JSON files (*.json);;All files (*)"
+        )
+        if path:
+            try:
+                self.editor.setPlainText(Path(path).read_text(encoding="utf-8"))
+            except OSError as e:
+                QMessageBox.warning(self, "Load Error", str(e))
+
+    def _paste(self):
+        """Paste from clipboard"""
+        cb = QApplication.clipboard()
+        self.editor.setPlainText(cb.text())
+
+    def _accept(self):
+        """Validate and accept"""
+        try:
+            self.result_data = json.loads(self.editor.toPlainText())
+            self.accept()
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "Invalid JSON", str(e))
+
+
+# Shared base for form-style tabs.
+#
+# A BaseTab bundles the small helpers that config tabs repeat: "touched"-group
+# tracking (only serialize sections the user actually edited) and the
+# widget<->value setters. New tabs (opencode or a future agent adapter) inherit
+# this instead of copy-pasting _t/_put/_set_* into every tab.
+
+class BaseTab(QWidget):
+    """Base class for form tabs with touched-tracking and value helpers."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self._touched = set()
+
+    def _t(self, group):
+        """Return a slot that marks `group` touched and flags the doc dirty."""
+        def _h(*_):
+            self._touched.add(group)
+            self.app.mark_dirty()
+        return _h
+
+    def _put(self, d, k, val, empty):
+        """Set d[k]=val, or remove the key when val equals the 'empty' sentinel."""
+        if val != empty:
+            d[k] = val
+        else:
+            d.pop(k, None)
+
+    def _set_checked(self, cb, val):
+        cb.blockSignals(True)
+        cb.setChecked(bool(val))
+        cb.blockSignals(False)
+
+    def _set_spin(self, spin, val):
+        spin.blockSignals(True)
+        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
+        spin.blockSignals(False)
+
+    def _set_double(self, spin, val):
+        spin.blockSignals(True)
+        spin.setValue(float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else spin.minimum())
+        spin.blockSignals(False)
+
+    def _set_combo(self, combo, val, fallback):
+        combo.blockSignals(True)
+        idx = combo.findData(val)
+        combo.setCurrentIndex(idx if idx >= 0 else fallback)
+        combo.blockSignals(False)
+# Model editing and management dialogs (Models Manager and friends)
+class ModelEditDialog(QDialog):
+    """Enhanced model edit dialog with validation"""
+
+    def __init__(self, parent, model_id: str = "", spec: Optional[dict] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Model" if model_id else "Add Model")
+        self.resize(500, 600)
+
+        spec = spec or {}
+        layout = QFormLayout(self)
+
+        # Model ID
+        self.id_edit = QLineEdit(model_id)
+        self.id_edit.setPlaceholderText("e.g. gpt-4o")
+        layout.addRow("Model ID*", self.id_edit)
+
+        # Basic fields
+        self.name_edit = QLineEdit(spec.get("name", ""))
+        self.name_edit.setPlaceholderText("Human-readable name")
+        layout.addRow("Name", self.name_edit)
+
+        self.attachment_check = QCheckBox("Supports file attachments")
+        self.attachment_check.setChecked(spec.get("attachment", False))
+        layout.addRow("", self.attachment_check)
+
+        self.reasoning_check = QCheckBox("Supports reasoning")
+        self.reasoning_check.setChecked(spec.get("reasoning", False))
+        layout.addRow("", self.reasoning_check)
+
+        self.temperature_check = QCheckBox("Supports temperature setting")
+        self.temperature_check.setChecked(spec.get("temperature", False))
+        layout.addRow("", self.temperature_check)
+
+        self.tool_call_check = QCheckBox("Supports tool calls")
+        self.tool_call_check.setChecked(spec.get("tool_call", True))
+        layout.addRow("", self.tool_call_check)
+
+        # Cost fields
+        cost_group = QGroupBox("Cost (per 1M tokens)")
+        cost_layout = QFormLayout()
+
+        self.cost_in_edit = QLineEdit(str(spec.get("cost", {}).get("input", "")))
+        self.cost_in_edit.setPlaceholderText("e.g. 5.00")
+        cost_layout.addRow("Input ($)", self.cost_in_edit)
+
+        self.cost_out_edit = QLineEdit(str(spec.get("cost", {}).get("output", "")))
+        self.cost_out_edit.setPlaceholderText("e.g. 15.00")
+        cost_layout.addRow("Output ($)", self.cost_out_edit)
+
+        self.cost_cache_read_edit = QLineEdit(str(spec.get("cost", {}).get("cache_read", "")))
+        cost_layout.addRow("Cache Read ($)", self.cost_cache_read_edit)
+
+        self.cost_cache_write_edit = QLineEdit(str(spec.get("cost", {}).get("cache_write", "")))
+        cost_layout.addRow("Cache Write ($)", self.cost_cache_write_edit)
+
+        cost_group.setLayout(cost_layout)
+        layout.addRow(cost_group)
+
+        # Limit fields
+        limit_group = QGroupBox("Limits")
+        limit_layout = QFormLayout()
+
+        self.limit_ctx_edit = QLineEdit(str(spec.get("limit", {}).get("context", "")))
+        self.limit_ctx_edit.setPlaceholderText("e.g. 128000")
+        limit_layout.addRow("Context (tokens)", self.limit_ctx_edit)
+
+        self.limit_out_edit = QLineEdit(str(spec.get("limit", {}).get("output", "")))
+        self.limit_out_edit.setPlaceholderText("e.g. 4096")
+        limit_layout.addRow("Output (tokens)", self.limit_out_edit)
+
+        limit_group.setLayout(limit_layout)
+        layout.addRow(limit_group)
+
+        # Additional fields
+        self.extra_edit = QPlainTextEdit()
+        extra_data = {k: v for k, v in spec.items() if k not in {
+            "name", "attachment", "reasoning", "temperature", "tool_call",
+            "cost", "limit"
+        }}
+        self.extra_edit.setPlainText(json.dumps(extra_data, indent=2))
+        layout.addRow("Additional Fields (JSON)", self.extra_edit)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addRow(button_box)
+
+        self.result_id = None
+        self.result_spec = None
+
+    def _accept(self):
+        """Validate and accept dialog"""
+        model_id = self.id_edit.text().strip()
+        if not model_id:
+            QMessageBox.warning(self, "Error", "Model ID is required")
+            return
+
+        try:
+            extra_data = json.loads(self.extra_edit.toPlainText() or "{}")
+            if not isinstance(extra_data, dict):
+                raise ValueError("Additional fields must be a JSON object")
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "Error", f"Invalid JSON in additional fields: {e}")
+            return
+        except ValueError as e:
+            QMessageBox.warning(self, "Error", str(e))
+            return
+
+        # Build spec
+        spec = dict(extra_data)
+
+        if self.name_edit.text().strip():
+            spec["name"] = self.name_edit.text().strip()
+
+        spec["attachment"] = self.attachment_check.isChecked()
+        spec["reasoning"] = self.reasoning_check.isChecked()
+        spec["temperature"] = self.temperature_check.isChecked()
+        spec["tool_call"] = self.tool_call_check.isChecked()
+
+        # Cost
+        cost = {}
+        for fname, edit in [
+            ("input", self.cost_in_edit),
+            ("output", self.cost_out_edit),
+            ("cache_read", self.cost_cache_read_edit),
+            ("cache_write", self.cost_cache_write_edit)
+        ]:
+            value = edit.text().strip()
+            if value:
+                try:
+                    cost[fname] = float(value)
+                except ValueError:
+                    QMessageBox.warning(self, "Error", f"Invalid cost value for {fname}")
+                    return
+        if cost:
+            spec["cost"] = cost
+
+        # Limits
+        limit = {}
+        for fname, edit in [
+            ("context", self.limit_ctx_edit),
+            ("output", self.limit_out_edit)
+        ]:
+            value = edit.text().strip()
+            if value:
+                try:
+                    limit[fname] = int(value)
+                except ValueError:
+                    QMessageBox.warning(self, "Error", f"Invalid limit value for {fname}")
+                    return
+        if limit:
+            spec["limit"] = limit
+
+        self.result_id = model_id
+        self.result_spec = spec
+        self.accept()
+
+class ModelsManagerDialog(QDialog):
+    """Enhanced models manager with bulk operations"""
+
+    def __init__(self, app, provider_key: str, provider_cfg: dict):
+        super().__init__(app)
+        self.app = app
+        self.provider_key = provider_key
+        self.provider_cfg = provider_cfg
+        self.models = dict(provider_cfg.get("models", {})) if isinstance(provider_cfg.get("models"), dict) else {}
+        self.setWindowTitle(f"Models - {provider_key}")
+        self.resize(900, 600)
+
+        layout = QVBoxLayout(self)
+
+        # Search bar
+        search_layout = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search models...")
+        self.search_edit.textChanged.connect(self._filter_models)
+        search_layout.addWidget(self.search_edit)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        for text, slot in [
+            ("+ Add", self._add_model),
+            ("Edit", self._edit_model),
+            ("Remove", self._remove_model),
+            ("Import", self._import_models),
+            ("Export", self._export_models),
+            ("Apply Catalog", self._apply_catalog),
+            ("Match from Catalog", self._match_catalog),
+            ("Bulk Edit", self._bulk_edit)
+        ]:
+            btn = QPushButton(text)
+            btn.clicked.connect(slot)
+            button_layout.addWidget(btn)
+
+        layout.addLayout(search_layout)
+        layout.addLayout(button_layout)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "ID", "Name", "Attachment", "Reasoning", "Cost (in/out)",
+            "Context/Output", "Actions"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        layout.addWidget(self.table)
+
+        # Status bar
+        self.status_label = QLabel()
+        layout.addWidget(self.status_label)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self._update_table()
+
+    def _update_table(self):
+        """Update table with current models"""
+        self.table.setRowCount(len(self.models))
+        for row, (model_id, spec) in enumerate(sorted(self.models.items())):
+            if not isinstance(spec, dict):
+                spec = {}
+
+            # ID
+            self.table.setItem(row, 0, QTableWidgetItem(model_id))
+
+            # Name
+            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name", "")))
+
+            # Attachment
+            self.table.setItem(row, 2, QTableWidgetItem("✓" if spec.get("attachment") else ""))
+
+            # Reasoning
+            self.table.setItem(row, 3, QTableWidgetItem("✓" if spec.get("reasoning") else ""))
+
+            # Cost
+            cost = spec.get("cost", {}) if isinstance(spec.get("cost"), dict) else {}
+            cost_text = f"{cost.get('input', '')}/{cost.get('output', '')}"
+            self.table.setItem(row, 4, QTableWidgetItem(cost_text))
+
+            # Limits
+            limit = spec.get("limit", {}) if isinstance(spec.get("limit"), dict) else {}
+            limit_text = f"{limit.get('context', '')}/{limit.get('output', '')}"
+            self.table.setItem(row, 5, QTableWidgetItem(limit_text))
+
+            # Actions
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+
+            edit_btn = QPushButton("Edit")
+            edit_btn.setFixedWidth(60)
+            edit_btn.clicked.connect(lambda _, m=model_id: self._edit_model(m))
+            actions_layout.addWidget(edit_btn)
+
+            remove_btn = QPushButton("Remove")
+            remove_btn.setFixedWidth(60)
+            remove_btn.clicked.connect(lambda _, m=model_id: self._remove_model(m))
+            actions_layout.addWidget(remove_btn)
+
+            match_btn = QPushButton("Match")
+            match_btn.setFixedWidth(60)
+            match_btn.clicked.connect(lambda _, m=model_id: self._match_single(m))
+            actions_layout.addWidget(match_btn)
+
+            self.table.setCellWidget(row, 6, actions_widget)
+
+        self.status_label.setText(f"{len(self.models)} models")
+
+    def _filter_models(self, text: str):
+        """Filter models by search text"""
+        if not text:
+            self._update_table()
+            return
+
+        text = text.lower()
+        filtered = {
+            mid: spec for mid, spec in self.models.items()
+            if text in mid.lower() or
+               (isinstance(spec.get("name"), str) and text in spec["name"].lower())
+        }
+
+        self.table.setRowCount(len(filtered))
+        for row, (model_id, spec) in enumerate(sorted(filtered.items())):
+            if not isinstance(spec, dict):
+                spec = {}
+
+            self.table.setItem(row, 0, QTableWidgetItem(model_id))
+            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name", "")))
+            self.table.setItem(row, 2, QTableWidgetItem("✓" if spec.get("attachment") else ""))
+            self.table.setItem(row, 3, QTableWidgetItem("✓" if spec.get("reasoning") else ""))
+
+            cost = spec.get("cost", {}) if isinstance(spec.get("cost"), dict) else {}
+            cost_text = f"{cost.get('input', '')}/{cost.get('output', '')}"
+            self.table.setItem(row, 4, QTableWidgetItem(cost_text))
+
+            limit = spec.get("limit", {}) if isinstance(spec.get("limit"), dict) else {}
+            limit_text = f"{limit.get('context', '')}/{limit.get('output', '')}"
+            self.table.setItem(row, 5, QTableWidgetItem(limit_text))
+
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+
+            edit_btn = QPushButton("Edit")
+            edit_btn.setFixedWidth(60)
+            edit_btn.clicked.connect(lambda _, m=model_id: self._edit_model(m))
+            actions_layout.addWidget(edit_btn)
+
+            remove_btn = QPushButton("Remove")
+            remove_btn.setFixedWidth(60)
+            remove_btn.clicked.connect(lambda _, m=model_id: self._remove_model(m))
+            actions_layout.addWidget(remove_btn)
+
+            match_btn = QPushButton("Match")
+            match_btn.setFixedWidth(60)
+            match_btn.clicked.connect(lambda _, m=model_id: self._match_single(m))
+            actions_layout.addWidget(match_btn)
+
+            self.table.setCellWidget(row, 6, actions_widget)
+
+        self.status_label.setText(f"{len(filtered)} models (filtered)")
+
+    def _add_model(self):
+        """Add new model"""
+        dlg = ModelEditDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            if dlg.result_id in self.models:
+                if not _confirm(self, "Model exists", f"Overwrite existing model '{dlg.result_id}'?"):
+                    return
+            self.models[dlg.result_id] = dlg.result_spec
+            self._update_table()
+            self.app.mark_dirty()
+
+    def _edit_model(self, model_id: Optional[str] = None):
+        """Edit existing model"""
+        if model_id is None:
+            selected = self.table.selectedItems()
+            if not selected:
+                QMessageBox.information(self, "Edit", "Please select a model to edit")
+                return
+            model_id = selected[0].text()
+
+        if model_id not in self.models:
+            QMessageBox.warning(self, "Error", f"Model '{model_id}' not found")
+            return
+
+        dlg = ModelEditDialog(self, model_id, self.models[model_id])
+        if dlg.exec() == QDialog.Accepted:
+            if dlg.result_id != model_id:
+                self.models.pop(model_id)
+            self.models[dlg.result_id] = dlg.result_spec
+            self._update_table()
+            self.app.mark_dirty()
+
+    def _remove_model(self, model_id: Optional[str] = None):
+        """Remove model(s)"""
+        if model_id is None:
+            selected = self.table.selectedItems()
+            if not selected:
+                QMessageBox.information(self, "Remove", "Please select models to remove")
+                return
+
+            model_ids = {selected[i].text() for i in range(0, len(selected), self.table.columnCount())}
+            if not _confirm(self, "Remove Models", f"Remove {len(model_ids)} selected models?"):
+                return
+
+            for mid in model_ids:
+                self.models.pop(mid, None)
+        else:
+            if not _confirm(self, "Remove Model", f"Remove model '{model_id}'?"):
+                return
+            self.models.pop(model_id, None)
+
+        self._update_table()
+        self.app.mark_dirty()
+
+    def _import_models(self):
+        """Import models from JSON"""
+        dlg = JsonImportDialog(
+            self, "Import Models",
+            "Paste or load models JSON. Supported formats:\n"
+            "- {modelId: spec} map\n"
+            "- {'models': {modelId: spec}} object\n"
+            "- Array of model specs with 'id' field"
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        try:
+            models_map = _extract_models_map(dlg.result_data)
+        except ValueError as e:
+            QMessageBox.warning(self, "Import Error", str(e))
+            return
+
+        added = 0
+        updated = 0
+        for model_id, spec in models_map.items():
+            if model_id in self.models:
+                updated += 1
+            else:
+                added += 1
+            self.models[model_id] = spec
+
+        self._update_table()
+        self.app.mark_dirty()
+        QMessageBox.information(
+            self, "Import Complete",
+            f"Added {added} new models, updated {updated} existing models"
+        )
+
+    def _export_models(self):
+        """Export models to JSON file"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Models", f"{self.provider_key}-models.json",
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.models, f, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "Export Complete", f"Exported to {path}")
+        except OSError as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+    def _apply_catalog(self):
+        """Apply model catalog to update existing models"""
+        if not self.app.model_catalog.loaded():
+            if hasattr(self.app, "_ensure_catalog"):
+                if not self.app._ensure_catalog():
+                    return
+            else:
+                if not _confirm(self, "No Catalog", "No model catalog loaded. Load one now?"):
+                    return
+                if not self.app.load_model_catalog():
+                    return
+
+        catalog = self.app.model_catalog
+        models = catalog.models_for(self.provider_key, self.provider_cfg.get("npm"))
+
+        if not models:
+            QMessageBox.information(self, "Apply Catalog", "No matching models found in catalog")
+            return
+
+        # Show preview dialog
+        preview_dlg = CatalogPreviewDialog(self, models, self.models)
+        if preview_dlg.exec() != QDialog.Accepted:
+            return
+
+        overwrite = preview_dlg.overwrite_checkbox.isChecked()
+        updated = 0
+
+        for model_id in preview_dlg.selected_models:
+            if model_id in self.models and model_id in models:
+                self.models[model_id] = _merge_model_spec(
+                    self.models[model_id], models[model_id], overwrite
+                )
+                updated += 1
+
+        self._update_table()
+        self.app.mark_dirty()
+        QMessageBox.information(
+            self, "Apply Catalog",
+            f"Updated {updated} models from catalog"
+        )
+
+    def _match_catalog(self):
+        """Match & format all models in this provider against the catalog."""
+        self._match_models(set(self.models.keys()))
+
+    def _match_single(self, model_id: str):
+        """Match & format a single model against the catalog."""
+        self._match_models({model_id})
+
+    def _match_models(self, model_ids):
+        """Preview and apply matched catalog format for the given models."""
+        if not self.app.model_catalog.loaded():
+            if hasattr(self.app, "_ensure_catalog"):
+                if not self.app._ensure_catalog():
+                    return
+            else:
+                if not _confirm(self, "No Catalog", "No model catalog loaded. Load one now?"):
+                    return
+                if not self.app.load_model_catalog():
+                    return
+
+        catalog = self.app.model_catalog
+        scope = set(model_ids)
+
+        entries = []  # (model_id, old_spec, new_spec, status)
+        ambiguous_data = {}
+        for mid in sorted(scope):
+            if mid not in self.models:
+                continue
+            matches = catalog.find_model(mid)
+            if not matches:
+                entries.append((mid, dict(self.models[mid]), None, "unknown"))
+                continue
+            chosen = _resolve_match(matches, self.provider_key, mid)
+            if chosen is None:
+                entries.append((mid, dict(self.models[mid]), None, "ambiguous"))
+                ambiguous_data[mid] = (self.provider_key, matches)
+                continue
+            merged = _merge_model_spec(
+                self.models[mid], build_spec_from_format(chosen), overwrite=False)
+            status = "matched" if merged != (self.models[mid] or {}) else "unchanged"
+            entries.append((mid, dict(self.models[mid]), merged, status))
+
+        if not any(e[2] is not None or e[3] == "ambiguous" for e in entries):
+            QMessageBox.information(
+                self, "Match from Catalog",
+                "No models matched. Check the model ids against the catalog."
+            )
+            return
+
+        dlg = MatchFormatPreviewDialog(
+            self, entries, ambiguous_data, catalog=self.app.model_catalog)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        overwrite = dlg.overwrite_checkbox.isChecked()
+        applied = 0
+        for mid, old_spec, new_spec, status in dlg.selected_entries:
+            # Use the provider picked in the combo for ambiguous entries.
+            if status == "ambiguous":
+                new_spec = dlg.resolved_specs.get(mid, new_spec)
+            elif status == "mapped":
+                new_spec = dlg.mapped_specs.get(mid, new_spec)
+            if new_spec is None:
+                continue
+            self.models[mid] = _merge_model_spec(
+                self.models[mid], new_spec, overwrite=overwrite)
+            applied += 1
+
+        self._update_table()
+        self.app.mark_dirty()
+        if applied:
+            QMessageBox.information(
+                self, "Match from Catalog", f"Updated {applied} model(s) from catalog")
+        else:
+            QMessageBox.information(self, "Match from Catalog", "No changes were applied.")
+
+    def _bulk_edit(self):
+        """Bulk edit selected models"""
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "Bulk Edit", "Please select models to edit")
+            return
+
+        model_ids = {selected[i].text() for i in range(0, len(selected), self.table.columnCount())}
+        if not model_ids:
+            return
+
+        dlg = BulkEditDialog(self, self.models, model_ids)
+        if dlg.exec() == QDialog.Accepted:
+            for model_id in model_ids:
+                if model_id in self.models:
+                    self.models[model_id] = dlg.apply_to_model(self.models[model_id])
+            self._update_table()
+            self.app.mark_dirty()
+
+    def result(self) -> dict:
+        """Get result models"""
+        return self.models
+
+class BulkEditDialog(QDialog):
+    """Dialog for bulk editing model fields"""
+
+    def __init__(self, parent, models: dict, model_ids: set):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk Edit Models")
+        self.resize(500, 400)
+
+        self.models = models
+        self.model_ids = model_ids
+
+        layout = QVBoxLayout(self)
+
+        # Info
+        info_label = QLabel(f"Editing {len(model_ids)} models")
+        layout.addWidget(info_label)
+
+        # Fields to edit
+        self.field_combo = QComboBox()
+        self.field_combo.addItems(MODEL_FIELDS)
+        layout.addWidget(self.field_combo)
+
+        # Value
+        self.value_edit = QLineEdit()
+        self.value_edit.setPlaceholderText("Leave empty to remove field")
+        layout.addWidget(self.value_edit)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def apply_to_model(self, model: dict) -> dict:
+        """Apply bulk edit to a model"""
+        field = self.field_combo.currentText()
+        value = self.value_edit.text().strip()
+
+        if not field:
+            return model
+
+        model = dict(model)
+
+        # Handle nested fields
+        if "." in field:
+            parts = field.split(".")
+            current = model
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+                if not isinstance(current, dict):
+                    current = {}
+            last_part = parts[-1]
+
+            if value:
+                try:
+                    if last_part in ("input", "output", "cache_read", "cache_write"):
+                        current[last_part] = float(value)
+                    else:
+                        current[last_part] = int(value)
+                except ValueError:
+                    pass
+            else:
+                current.pop(last_part, None)
+                # Clean up empty parent objects
+                for part in reversed(parts[:-1]):
+                    parent = model
+                    for p in parts[:parts.index(part)]:
+                        parent = parent[p]
+                    if not parent.get(part):
+                        parent.pop(part, None)
+        else:
+            if value:
+                if field in ("attachment", "reasoning", "temperature", "tool_call"):
+                    model[field] = value.lower() in ("true", "1", "yes")
+                else:
+                    try:
+                        model[field] = int(value)
+                    except ValueError:
+                        try:
+                            model[field] = float(value)
+                        except ValueError:
+                            model[field] = value
+            else:
+                model.pop(field, None)
+
+        return model
+
+# Catalog dialogs: preview/match, browse, apply, fetch and format card
+class CatalogPreviewDialog(QDialog):
+    """Dialog to preview catalog application"""
+
+    def __init__(self, parent, catalog_models: dict, existing_models: dict):
+        super().__init__(parent)
+        self.setWindowTitle("Apply Model Catalog")
+        self.resize(800, 600)
+
+        layout = QVBoxLayout(self)
+
+        # Info
+        info_label = QLabel(
+            f"Found {len(catalog_models)} models in catalog that match this provider.\n"
+            "Select which models to update and whether to overwrite existing values."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Search
+        search_layout = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search models...")
+        self.search_edit.textChanged.connect(self._filter_models)
+        search_layout.addWidget(self.search_edit)
+        layout.addLayout(search_layout)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels([
+            "Apply", "Model ID", "Name", "Current Values", "Catalog Values"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self.table)
+
+        # Overwrite checkbox
+        self.overwrite_checkbox = QCheckBox("Overwrite existing values (otherwise only fill missing fields)")
+        layout.addWidget(self.overwrite_checkbox)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        # Populate table
+        self.catalog_models = catalog_models
+        self.existing_models = existing_models
+        self._update_table()
+
+    def _update_table(self):
+        """Update table with models"""
+        self.table.setRowCount(len(self.catalog_models))
+        for row, (model_id, catalog_spec) in enumerate(sorted(self.catalog_models.items())):
+            # Apply checkbox
+            apply_check = QCheckBox()
+            apply_check.setChecked(model_id in self.existing_models)
+            self.table.setCellWidget(row, 0, apply_check)
+
+            # Model ID
+            self.table.setItem(row, 1, QTableWidgetItem(model_id))
+
+            # Name
+            name = catalog_spec.get("name", "")
+            self.table.setItem(row, 2, QTableWidgetItem(name))
+
+            # Current values
+            current_spec = self.existing_models.get(model_id, {})
+            current_text = self._spec_to_text(current_spec)
+            self.table.setItem(row, 3, QTableWidgetItem(current_text))
+
+            # Catalog values
+            catalog_text = self._spec_to_text(catalog_spec)
+            self.table.setItem(row, 4, QTableWidgetItem(catalog_text))
+
+    def _filter_models(self, text: str):
+        """Filter models by search text"""
+        if not text:
+            self._update_table()
+            return
+
+        text = text.lower()
+        filtered = {
+            mid: spec for mid, spec in self.catalog_models.items()
+            if text in mid.lower() or
+               (isinstance(spec.get("name"), str) and text in spec["name"].lower())
+        }
+
+        self.table.setRowCount(len(filtered))
+        for row, (model_id, catalog_spec) in enumerate(sorted(filtered.items())):
+            apply_check = QCheckBox()
+            apply_check.setChecked(model_id in self.existing_models)
+            self.table.setCellWidget(row, 0, apply_check)
+
+            self.table.setItem(row, 1, QTableWidgetItem(model_id))
+            self.table.setItem(row, 2, QTableWidgetItem(catalog_spec.get("name", "")))
+
+            current_spec = self.existing_models.get(model_id, {})
+            current_text = self._spec_to_text(current_spec)
+            self.table.setItem(row, 3, QTableWidgetItem(current_text))
+
+            catalog_text = self._spec_to_text(catalog_spec)
+            self.table.setItem(row, 4, QTableWidgetItem(catalog_text))
+
+    def _spec_to_text(self, spec: dict) -> str:
+        """Convert model spec to display text"""
+        parts = []
+        if "name" in spec:
+            parts.append(f"name: {spec['name']}")
+        if "attachment" in spec:
+            parts.append(f"attachment: {spec['attachment']}")
+        if "reasoning" in spec:
+            parts.append(f"reasoning: {spec['reasoning']}")
+        if "cost" in spec and isinstance(spec["cost"], dict):
+            cost = spec["cost"]
+            if "input" in cost or "output" in cost:
+                parts.append(f"cost: {cost.get('input', '')}/{cost.get('output', '')}")
+        if "limit" in spec and isinstance(spec["limit"], dict):
+            limit = spec["limit"]
+            if "context" in limit or "output" in limit:
+                parts.append(f"limit: {limit.get('context', '')}/{limit.get('output', '')}")
+        return ", ".join(parts)
+
+    @property
+    def selected_models(self) -> List[str]:
+        """Get selected model IDs"""
+        selected = []
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, 0).isChecked():
+                selected.append(self.table.item(row, 1).text())
+        return selected
+
+class CatalogModelPickerDialog(QDialog):
+    """Searchable picker over catalog formats (used to map unknown models)."""
+
+    def __init__(self, parent, catalog, initial_filter: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Map to Catalog Model")
+        self.resize(520, 520)
+        self._formats = list(catalog.all_formats()) if catalog is not None else []
+        self.selected_format = None
+
+        layout = QVBoxLayout(self)
+        self.search = QLineEdit(initial_filter)
+        self.search.setPlaceholderText("Filter by provider, model id or name...")
+        self.search.textChanged.connect(self._filter)
+        layout.addWidget(self.search)
+
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _item: self._accept())
+        layout.addWidget(self.list)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._filter()
+
+    def _filter(self):
+        text = self.search.text().lower()
+        self.list.clear()
+        shown = 0
+        for fmt in self._formats:
+            label = f"{fmt.provider} · {fmt.model_id}"
+            if text and text not in label.lower() and text not in (fmt.name or "").lower():
+                continue
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, fmt)
+            self.list.addItem(item)
+            shown += 1
+            if shown >= 400:  # keep the list snappy on huge catalogs
+                break
+
+    def _accept(self):
+        item = self.list.currentItem()
+        if item is not None:
+            self.selected_format = item.data(Qt.UserRole)
+        if self.selected_format is not None:
+            self.accept()
+
+
+class MatchFormatPreviewDialog(QDialog):
+    """Preview old vs new model config after matching against the catalog."""
+
+    def __init__(self, parent, entries, ambiguous_data=None,
+                 fallback_data=None, catalog=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preview Matched Models")
+        self.resize(900, 600)
+        # entries: list of (model_id, old_spec, new_spec|None, status)
+        self.entries = entries
+        self.resolved_specs = {}
+        self._ambiguous_data = ambiguous_data or {}
+        self.fallback_data = fallback_data or {}   # {model_id: ModelFormat}
+        self.mapped_specs = {}                     # {model_id: spec}
+        self.mapped_ids = {}                       # {model_id: catalog model_id}
+        self.catalog = catalog
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Review each model below. 'Old' is your current config, 'New' is the "
+            "matched catalog format. Check the ones you want to apply."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.overwrite_checkbox = QCheckBox("Overwrite existing values (otherwise only fill missing fields)")
+        layout.addWidget(self.overwrite_checkbox)
+
+        # Bulk resolve bar: set every ambiguous row to one provider at once.
+        self.bulk_bar = QWidget()
+        bulk_layout = QHBoxLayout(self.bulk_bar)
+        bulk_layout.setContentsMargins(0, 0, 0, 0)
+        bulk_layout.addWidget(QLabel("Set all ambiguous to:"))
+        self.bulk_combo = QComboBox()
+        self.bulk_combo.setMinimumWidth(220)
+        bulk_layout.addWidget(self.bulk_combo)
+        bulk_btn = QPushButton("Apply to all")
+        bulk_btn.clicked.connect(self._bulk_resolve)
+        bulk_layout.addWidget(bulk_btn)
+        self.apply_fallback_check = QCheckBox("Apply fallback")
+        self.apply_fallback_check.setChecked(True)
+        self.apply_fallback_check.toggled.connect(self._on_fallback_toggle)
+        bulk_layout.addWidget(self.apply_fallback_check)
+        bulk_layout.addStretch()
+        layout.addWidget(self.bulk_bar)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Apply", "Model ID", "Status", "Old Config", "New Config", "Catalog Provider"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.itemSelectionChanged.connect(self._show_diff)
+
+        # Diff panel: side-by-side visual old -> new for the selected row.
+        self.diff_title = QLabel("Select a row to preview the change")
+        self.diff_title.setStyleSheet("font-weight: bold;")
+        self.diff_view = QTextEdit()
+        self.diff_view.setReadOnly(True)
+        self.diff_view.setMinimumHeight(180)
+
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self.table)
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.addWidget(self.diff_title)
+        rl.addWidget(self.diff_view)
+        splitter.addWidget(right)
+        splitter.setSizes([360, 220])
+        layout.addWidget(splitter)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._populate()
+
+    def _flat(self, d, prefix=""):
+        """Flatten a nested dict into (path, value) leaves."""
+        out = []
+        if not isinstance(d, dict):
+            return [(prefix, d)]
+        for k, v in d.items():
+            p = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                out.extend(self._flat(v, p))
+            else:
+                out.append((p, v))
+        return out
+
+    def _show_diff(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            self.diff_title.setText("Select a row to preview the change")
+            self.diff_view.clear()
+            return
+        row = rows[0].row()
+        if not (0 <= row < len(self.entries)):
+            return
+        mid, old_spec, new_spec, status = self.entries[row]
+        if status == "ambiguous":
+            new_spec = self.resolved_specs.get(mid, new_spec)
+        self.diff_title.setText(
+            f"{mid} — {status}"
+            + (" (ambiguous: pick a catalog provider)" if status == "ambiguous" else ""))
+        self.diff_view.setHtml(self._diff_html(old_spec or {}, new_spec))
+
+    def _diff_html(self, old, new) -> str:
+        """Render an HTML table comparing old vs new field-by-field."""
+        if new is None:
+            return "<b>No catalog match for this model.</b>"
+        old_flat = dict(self._flat(old))
+        new_flat = dict(self._flat(new))
+        keys = sorted(set(old_flat) | set(new_flat))
+
+        def esc(v):
+            return _esc_html(json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v)
+
+        rows_html = []
+        for k in keys:
+            o = old_flat.get(k)
+            n = new_flat.get(k)
+            if o is None and n is None:
+                continue
+            if o == n:
+                rows_html.append(
+                    f"<tr><td class='k'>{_esc_html(k)}</td>"
+                    f"<td class='same'>{esc(n)}</td></tr>")
+            elif o is None:
+                rows_html.append(
+                    f"<tr><td class='k'>{_esc_html(k)}</td>"
+                    f"<td class='add' style='color:#1a7f37'>+ {esc(n)}</td></tr>")
+            elif n is None:
+                rows_html.append(
+                    f"<tr><td class='k'>{_esc_html(k)}</td>"
+                    f"<td class='del' style='color:#d1242f; text-decoration:line-through'>- {esc(o)}</td></tr>")
+            else:
+                rows_html.append(
+                    f"<tr><td class='k'>{_esc_html(k)}</td>"
+                    f"<td class='chg' style='color:#9a6700'>{esc(o)} → {esc(n)}</td></tr>")
+
+        return (
+            "<style>table{border-collapse:collapse;width:100%;font-family:monospace;font-size:12px}"
+            ".k{color:#57606a;padding:2px 10px 2px 0;vertical-align:top;white-space:nowrap}</style>"
+            "<table>" + "".join(rows_html) + "</table>"
+        ) if rows_html else "<i>No changes</i>"
+
+    def _populate(self):
+        self.table.setRowCount(len(self.entries))
+        for row, (mid, old_spec, new_spec, status) in enumerate(self.entries):
+            apply_check = QCheckBox()
+            # Ambiguous rows are pre-checked too: their combo already defaults
+            # to the best provider (same-name first, then most complete).
+            apply_check.setChecked(
+                (new_spec is not None and status != "unchanged") or status == "ambiguous")
+            self.table.setCellWidget(row, 0, apply_check)
+
+            self.table.setItem(row, 1, QTableWidgetItem(mid))
+            status_item = QTableWidgetItem(status)
+            if status.startswith("fallback:"):
+                status_item.setForeground(QColor("#0969da"))
+            elif status == "mapped":
+                status_item.setForeground(QColor("#8250df"))
+            self.table.setItem(row, 2, status_item)
+
+            old_text = json.dumps(old_spec, ensure_ascii=False) if old_spec else "(empty)"
+            if new_spec is not None:
+                new_text = json.dumps(new_spec, ensure_ascii=False)
+            elif status == "ambiguous":
+                new_text = "choose a provider"
+            else:
+                new_text = "no match"
+            self.table.setItem(row, 3, QTableWidgetItem(old_text))
+            self.table.setItem(row, 4, QTableWidgetItem(new_text))
+
+            # Resolve column: combo box listing catalog providers matching this id.
+            resolve_widget = QWidget()
+            resolve_layout = QHBoxLayout(resolve_widget)
+            resolve_layout.setContentsMargins(2, 0, 2, 0)
+            combo = QComboBox()
+            provider_key, matches = self._ambiguous_data.get(mid, (None, []))
+            if status == "ambiguous" and matches:
+                # Same-name provider first, then the most complete formats,
+                # so the pre-selection is a sensible default.
+                for m in _sort_matches(matches, provider_key):
+                    combo.addItem(m.provider, m)
+                combo.setCurrentIndex(0)
+                combo.currentIndexChanged.connect(
+                    lambda _, r=row, mm=mid: self._on_combo_change(r, mm))
+                # reflect the default selection now
+                self.resolved_specs[mid] = build_spec_from_format(combo.currentData())
+                self._refresh_new_cell(row, mid)
+            else:
+                combo.setEnabled(False)
+                combo.addItem("—")
+                # Unknown rows can be mapped to a catalog model manually.
+                if status == "unknown" and self.catalog is not None:
+                    map_btn = QPushButton("Map…")
+                    map_btn.clicked.connect(
+                        lambda _, r=row, mm=mid: self._map_unknown(r, mm))
+                    resolve_layout.addWidget(map_btn)
+            resolve_layout.addWidget(combo, 1)
+            self.table.setCellWidget(row, 5, resolve_widget)
+
+        self._fill_bulk_combo()
+        self.table.resizeColumnsToContents()
+
+    def _fill_bulk_combo(self):
+        """List providers across ambiguous rows, most frequent first."""
+        counts = {}
+        for mid, (_pk, matches) in self._ambiguous_data.items():
+            entry = next((e for e in self.entries if e[0] == mid), None)
+            if entry is None or entry[3] != "ambiguous":
+                continue
+            for m in matches:
+                counts[m.provider] = counts.get(m.provider, 0) + 1
+        self.bulk_combo.clear()
+        for prov, _n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            self.bulk_combo.addItem(prov)
+        n_ambiguous = sum(1 for e in self.entries if e[3] == "ambiguous")
+        has_fallback = any(e[3].startswith("fallback:") for e in self.entries)
+        self.bulk_bar.setVisible(
+            (self.bulk_combo.count() > 0 and n_ambiguous > 1) or has_fallback)
+
+    def _on_fallback_toggle(self, checked: bool):
+        """Check/uncheck every fallback row according to the Apply fallback box."""
+        for row, (mid, _old, _new, status) in enumerate(self.entries):
+            if not status.startswith("fallback:"):
+                continue
+            check = self.table.cellWidget(row, 0)
+            if check is not None:
+                check.setChecked(checked)
+
+    def _map_unknown(self, row, mid):
+        """Manually map an unknown model to a catalog format."""
+        if self.catalog is None:
+            return
+        old_spec = self.entries[row][1] or {}
+        dlg = CatalogModelPickerDialog(self, self.catalog, initial_filter=mid)
+        if dlg.exec() != QDialog.Accepted or dlg.selected_format is None:
+            return
+        fmt = dlg.selected_format
+        spec = build_spec_from_format(fmt)
+        self.mapped_specs[mid] = spec
+        self.mapped_ids[mid] = fmt.model_id
+        # Update the entry in place so selected_entries carries the new spec.
+        self.entries[row] = (mid, old_spec, spec, "mapped")
+        status_item = QTableWidgetItem("mapped")
+        status_item.setForeground(QColor("#8250df"))
+        self.table.setItem(row, 2, status_item)
+        self.table.setItem(row, 4, QTableWidgetItem(json.dumps(spec, ensure_ascii=False)))
+        check = self.table.cellWidget(row, 0)
+        if check is not None:
+            check.setChecked(True)
+        self._show_diff()
+
+    def _bulk_resolve(self):
+        """Point every ambiguous row's combo at the chosen provider where possible."""
+        provider = self.bulk_combo.currentText()
+        if not provider:
+            return
+        for row, (mid, _old, _new, status) in enumerate(self.entries):
+            if status != "ambiguous":
+                continue
+            combo = self.table.cellWidget(row, 5).findChild(QComboBox)
+            if combo is None:
+                continue
+            idx = combo.findText(provider)
+            if idx >= 0 and combo.currentIndex() != idx:
+                combo.setCurrentIndex(idx)  # triggers _on_combo_change
+
+    def _on_combo_change(self, row, mid):
+        combo = self.table.cellWidget(row, 5).findChild(QComboBox)
+        fmt = combo.currentData()
+        if fmt is not None:
+            self.resolved_specs[mid] = build_spec_from_format(fmt)
+            self._refresh_new_cell(row, mid)
+            check = self.table.cellWidget(row, 0)
+            if check is not None:
+                check.setChecked(True)
+            self._show_diff()
+
+    def _refresh_new_cell(self, row, mid):
+        spec = self.resolved_specs.get(mid)
+        self.table.setItem(row, 4, QTableWidgetItem(
+            json.dumps(spec, ensure_ascii=False) if spec else "choose a provider"))
+        self.table.setItem(row, 2, QTableWidgetItem("matched" if spec else "ambiguous"))
+        self.table.resizeColumnsToContents()
+
+    @property
+    def selected_entries(self):
+        out = []
+        for row in range(self.table.rowCount()):
+            check = self.table.cellWidget(row, 0)
+            if check is not None and check.isChecked():
+                out.append(self.entries[row])
+        return out
+
+class _ModelFetchWorker(QThread):
+    """Runs fetch_provider_models off the UI thread."""
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, spec):
+        super().__init__()
+        self.spec = spec
+
+    def run(self):
+        try:
+            models = fetch_provider_models(self.spec)
+            self.finished_ok.emit(models)
+        except Exception as e:  # FetchError and anything unexpected
+            self.failed.emit(str(e))
+
+
+class FetchProviderModelsDialog(QDialog):
+    """Fetch a provider's model list from its API and preview the results."""
+
+    def __init__(self, parent, provider_key: str = "new-provider", catalog=None):
+        super().__init__(parent)
+        self.setWindowTitle("Fetch Provider Models from API")
+        self.resize(720, 560)
+        self.fetched_models = {}   # {model_id: spec}
+        self.provider_key = provider_key
+        self._worker = None
+
+        # Silently load the bundled catalog so the Reference combo can be filled.
+        self.catalog = catalog
+        try_load_bundled_catalog(self.catalog)
+
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.key_edit = QLineEdit(provider_key)
+        form.addRow("Provider key:", self.key_edit)
+
+        self.format_combo = QComboBox()
+        for adapter, preset in FETCH_ADAPTERS.items():
+            self.format_combo.addItem(preset["label"], adapter)
+        self.format_combo.currentIndexChanged.connect(self._on_format_change)
+        form.addRow("API format:", self.format_combo)
+
+        # Optional provider used as a fallback source for models not in the catalog.
+        self.reference_combo = QComboBox()
+        self.reference_combo.addItem("Auto (exact match only)", "")
+        if self.catalog is not None and self.catalog.loaded():
+            for pid in sorted(self.catalog.by_provider.keys()):
+                self.reference_combo.addItem(pid, pid)
+        self.reference_combo.setToolTip(
+            "Models not found in the catalog will borrow their format from this "
+            "provider (fill-missing only). Manual 'Map…' overrides still win.")
+        form.addRow("Reference provider:", self.reference_combo)
+
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://api.openai.com/v1")
+        form.addRow("Base URL:", self.url_edit)
+
+        self.apikey_edit = QLineEdit()
+        self.apikey_edit.setEchoMode(QLineEdit.Password)
+        self.apikey_edit.setPlaceholderText("(sent as a header, never saved to config)")
+        form.addRow("API key:", self.apikey_edit)
+
+        layout.addLayout(form)
+
+        # Generic-only advanced fields
+        self.generic_box = QGroupBox("Generic JSON options")
+        gform = QFormLayout(self.generic_box)
+        self.items_path_edit = QLineEdit()
+        self.items_path_edit.setPlaceholderText("data  (dotted path to the array)")
+        self.id_field_edit = QLineEdit()
+        self.id_field_edit.setPlaceholderText("id")
+        self.name_field_edit = QLineEdit()
+        self.name_field_edit.setPlaceholderText("name")
+        gform.addRow("Items path:", self.items_path_edit)
+        gform.addRow("ID field:", self.id_field_edit)
+        gform.addRow("Name field:", self.name_field_edit)
+        layout.addWidget(self.generic_box)
+
+        self.allow_local_check = QCheckBox("Allow local URL (Ollama / LM Studio / localhost)")
+        layout.addWidget(self.allow_local_check)
+
+        # Fetch controls
+        fetch_row = QHBoxLayout()
+        self.fetch_btn = QPushButton("Fetch models")
+        self.fetch_btn.clicked.connect(self._fetch)
+        fetch_row.addWidget(self.fetch_btn)
+        self.status_label = QLabel("")
+        fetch_row.addWidget(self.status_label, 1)
+        layout.addLayout(fetch_row)
+
+        # Results table
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Add", "Model ID", "Name"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.table)
+
+        select_row = QHBoxLayout()
+        all_btn = QPushButton("Select all")
+        all_btn.clicked.connect(lambda: self._set_all(True))
+        none_btn = QPushButton("Select none")
+        none_btn.clicked.connect(lambda: self._set_all(False))
+        select_row.addWidget(all_btn)
+        select_row.addWidget(none_btn)
+        select_row.addStretch()
+        layout.addLayout(select_row)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Add Selected")
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self._on_format_change()
+
+    def _current_adapter(self) -> str:
+        return self.format_combo.currentData()
+
+    @property
+    def reference_provider(self):
+        """Selected fallback provider name, or None for Auto."""
+        data = self.reference_combo.currentData()
+        return data or None
+
+    def _on_format_change(self):
+        adapter = self._current_adapter()
+        self.generic_box.setVisible(adapter == "generic")
+        # Sensible default base URLs per adapter.
+        defaults = {
+            "openai": "https://api.openai.com/v1",
+            "anthropic": "https://api.anthropic.com",
+            "gemini": "https://generativelanguage.googleapis.com",
+            "models_dev": "https://models.dev/api.json",
+            "generic": "",
+        }
+        if not self.url_edit.text().strip() or self.url_edit.text() in defaults.values():
+            self.url_edit.setText(defaults.get(adapter, ""))
+        self.apikey_edit.setEnabled(adapter != "models_dev")
+
+    def _build_spec(self) -> ProviderFetchSpec:
+        return ProviderFetchSpec(
+            base_url=self.url_edit.text().strip(),
+            adapter=self._current_adapter(),
+            api_key=self.apikey_edit.text(),
+            items_path=self.items_path_edit.text().strip(),
+            id_field=self.id_field_edit.text().strip(),
+            name_field=self.name_field_edit.text().strip(),
+            allow_local=self.allow_local_check.isChecked(),
+        )
+
+    def _fetch(self):
+        if not self.url_edit.text().strip():
+            QMessageBox.warning(self, "Fetch", "Please enter a base URL.")
+            return
+        self.fetch_btn.setEnabled(False)
+        self.status_label.setText("Fetching…")
+        self._worker = _ModelFetchWorker(self._build_spec())
+        self._worker.finished_ok.connect(self._on_fetched)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_fetched(self, models: dict):
+        self.fetched_models = models
+        self.fetch_btn.setEnabled(True)
+        self.status_label.setText(f"Fetched {len(models)} models")
+        self._populate(models)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(models))
+
+    def _on_failed(self, msg: str):
+        self.fetch_btn.setEnabled(True)
+        self.status_label.setText("Fetch failed")
+        QMessageBox.warning(self, "Fetch Error", msg)
+
+    def _populate(self, models: dict):
+        self.table.setRowCount(len(models))
+        for row, (mid, spec) in enumerate(sorted(models.items())):
+            check = QCheckBox()
+            check.setChecked(True)
+            self.table.setCellWidget(row, 0, check)
+            self.table.setItem(row, 1, QTableWidgetItem(mid))
+            self.table.setItem(row, 2, QTableWidgetItem(spec.get("name", "")))
+
+    def _set_all(self, checked: bool):
+        for row in range(self.table.rowCount()):
+            w = self.table.cellWidget(row, 0)
+            if w is not None:
+                w.setChecked(checked)
+
+    @property
+    def selected_models(self) -> dict:
+        """Return {model_id: spec} for checked rows."""
+        out = {}
+        for row in range(self.table.rowCount()):
+            w = self.table.cellWidget(row, 0)
+            if w is not None and w.isChecked():
+                mid = self.table.item(row, 1).text()
+                out[mid] = self.fetched_models.get(mid, {})
+        return out
+
+
+
+class ModelFormatCard(QFrame):
+    """Card showing normalized details of a single model format."""
+
+    def __init__(self, fmt: Optional[ModelFormat] = None, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setMinimumWidth(280)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(10, 10, 10, 10)
+
+        self.title_label = QLabel("Select a model")
+        title_font = QFont()
+        title_font.setBold(True)
+        title_font.setPointSize(11)
+        self.title_label.setFont(title_font)
+        self.title_label.setWordWrap(True)
+        self._layout.addWidget(self.title_label)
+
+        self.sub_label = QLabel("")
+        self.sub_label.setStyleSheet("color: gray;")
+        self.sub_label.setWordWrap(True)
+        self._layout.addWidget(self.sub_label)
+
+        self.info_label = QLabel("")
+        self.info_label.setWordWrap(True)
+        self._layout.addWidget(self.info_label)
+
+        self.set_format(fmt)
+
+    def set_format(self, fmt: Optional[ModelFormat]):
+        if fmt is None:
+            self.title_label.setText("No model selected")
+            self.sub_label.setText("")
+            self.info_label.setText("Click a row in the table to see its normalized format.")
+            return
+
+        self.title_label.setText(f"{fmt.provider} · {fmt.model_id}")
+        self.sub_label.setText(fmt.name)
+        lines = [
+            f"Context: {fmt.context_k()}",
+            f"Output: {fmt.output_k()}",
+            f"Modalities: {fmt.modalities.label()}",
+            f"Cost in/out: {fmt.cost_in_label()} / {fmt.cost_out_label()}",
+            f"Cache read/write: {_fmt_cost(fmt.cost_cache_read)} / {_fmt_cost(fmt.cost_cache_write)}",
+        ]
+        caps = []
+        if fmt.attachment:
+            caps.append("attachment")
+        if fmt.reasoning:
+            caps.append("reasoning")
+        if fmt.tools:
+            caps.append("tool_call")
+        if fmt.temperature:
+            caps.append("temperature")
+        if caps:
+            lines.append("Capabilities: " + ", ".join(caps))
+        if fmt.modalities.inferred:
+            lines.append("(modalities inferred)")
+        self.info_label.setText("\n".join(lines))
+
+
+class TierSettingsDialog(QDialog):
+    """Dialog to edit configurable context/output tiers."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Catalog Tier Settings")
+        self.resize(400, 320)
+        self.settings = SettingsManager()
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Enter tier thresholds in thousands of tokens (e.g. 4, 8, 32, 128, 200).\n"
+            "Separate by commas. Used to bucket models by context / output size."
+        ))
+
+        form = QFormLayout()
+        self.context_edit = QLineEdit()
+        self.output_edit = QLineEdit()
+        form.addRow("Context tiers (k):", self.context_edit)
+        form.addRow("Output tiers (k):", self.output_edit)
+        layout.addLayout(form)
+
+        self.context_edit.setText(",".join(str(x // 1000 if x >= 1000 else x)
+                                            for x in self.settings.get_context_tiers()))
+        self.output_edit.setText(",".join(str(x // 1000 if x >= 1000 else x)
+                                          for x in self.settings.get_output_tiers()))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _parse_k(self, text: str, fallback) -> List[int]:
+        vals = []
+        for tok in text.replace(",", " ").split():
+            try:
+                vals.append(int(float(tok) * 1000))
+            except ValueError:
+                continue
+        return vals or list(fallback)
+
+    def _accept(self):
+        self.settings.set_context_tiers(
+            self._parse_k(self.context_edit.text(), SettingsManager.DEFAULT_CONTEXT_TIERS))
+        self.settings.set_output_tiers(
+            self._parse_k(self.output_edit.text(), SettingsManager.DEFAULT_OUTPUT_TIERS))
+        self.accept()
+
+
+class ModelCatalogDialog(QDialog):
+    """Browse the whole model catalog with filters and format detail."""
+
+    COLUMNS = ["Provider", "Model ID", "Name", "Context", "Output", "Modalities", "Cost in/out"]
+
+    def __init__(self, parent, catalog):
+        super().__init__(parent)
+        self.setWindowTitle("Browse Model Catalog")
+        self.resize(960, 600)
+        self.catalog = catalog
+        self.settings = SettingsManager()
+
+        layout = QVBoxLayout(self)
+
+        # Filter bar
+        filters = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search model / name...")
+        self.search_edit.textChanged.connect(self._refresh)
+        filters.addWidget(self.search_edit)
+
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("All providers")
+        for pid in sorted(catalog.by_provider.keys()):
+            self.provider_combo.addItem(pid)
+        self.provider_combo.currentTextChanged.connect(self._refresh)
+        filters.addWidget(self.provider_combo)
+
+        self.context_combo = QComboBox()
+        self._fill_tier_combo(self.context_combo, "context")
+        self.context_combo.currentIndexChanged.connect(self._refresh)
+        filters.addWidget(QLabel("Context ≥"))
+        filters.addWidget(self.context_combo)
+
+        self.output_combo = QComboBox()
+        self._fill_tier_combo(self.output_combo, "output")
+        self.output_combo.currentIndexChanged.connect(self._refresh)
+        filters.addWidget(QLabel("Output ≥"))
+        filters.addWidget(self.output_combo)
+        filters.addStretch()
+        layout.addLayout(filters)
+
+        mod_filters = QHBoxLayout()
+        self.image_check = QCheckBox("Image input")
+        self.pdf_check = QCheckBox("PDF input")
+        self.tools_check = QCheckBox("Tools")
+        self.reasoning_check = QCheckBox("Reasoning")
+        for cb in (self.image_check, self.pdf_check, self.tools_check, self.reasoning_check):
+            cb.stateChanged.connect(self._refresh)
+            mod_filters.addWidget(cb)
+        mod_filters.addStretch()
+        layout.addLayout(mod_filters)
+
+        # Splitter: table + card
+        splitter = QSplitter()
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.itemSelectionChanged.connect(self._on_select)
+        splitter.addWidget(self.table)
+
+        self.card = ModelFormatCard()
+        splitter.addWidget(self.card)
+        splitter.setSizes([680, 280])
+        layout.addWidget(splitter)
+
+        # Status + buttons
+        bottom = QHBoxLayout()
+        self.status_label = QLabel("")
+        bottom.addWidget(self.status_label)
+        bottom.addStretch()
+
+        tiers_btn = QPushButton("Tiers…")
+        tiers_btn.clicked.connect(self._edit_tiers)
+        bottom.addWidget(tiers_btn)
+
+        export_btn = QPushButton("Export…")
+        export_btn.clicked.connect(self._export)
+        bottom.addWidget(export_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+        self._refresh()
+
+    def _fill_tier_combo(self, combo: QComboBox, attr: str):
+        combo.addItem("any")
+        tiers = (self.settings.get_context_tiers() if attr == "context"
+                 else self.settings.get_output_tiers())
+        for t in tiers:
+            combo.addItem(f"{_fmt_tokens(t)}")
+
+    def _refresh(self):
+        search = self.search_edit.text().lower()
+        provider = self.provider_combo.currentText()
+        ctx_min = self._tier_value(self.context_combo)
+        out_min = self._tier_value(self.output_combo)
+
+        rows = []
+        for fmt in self.catalog.all_formats():
+            if provider != "All providers" and fmt.provider != provider:
+                continue
+            if search and search not in fmt.model_id.lower() and search not in fmt.name.lower():
+                continue
+            if ctx_min and (fmt.context is None or fmt.context < ctx_min):
+                continue
+            if out_min and (fmt.output is None or fmt.output < out_min):
+                continue
+            if self.image_check.isChecked() and not fmt.modalities.has_image_input:
+                continue
+            if self.pdf_check.isChecked() and not fmt.modalities.has_pdf_input:
+                continue
+            if self.tools_check.isChecked() and not fmt.tools:
+                continue
+            if self.reasoning_check.isChecked() and not fmt.reasoning:
+                continue
+            rows.append(fmt)
+
+        self.table.setRowCount(len(rows))
+        self._row_formats = []
+        for r, fmt in enumerate(rows):
+            self._row_formats.append(fmt)
+            vals = [
+                fmt.provider, fmt.model_id, fmt.name, fmt.context_k(), fmt.output_k(),
+                fmt.modalities.label(), f"{fmt.cost_in_label()}/{fmt.cost_out_label()}",
+            ]
+            for c, v in enumerate(vals):
+                self.table.setItem(r, c, QTableWidgetItem(v))
+        self.status_label.setText(f"{len(rows)} models")
+
+    def _tier_value(self, combo: QComboBox):
+        txt = combo.currentText()
+        if not txt or txt == "any":
+            return 0
+        if txt.endswith("M"):
+            return int(float(txt[:-1]) * 1000000)
+        if txt.endswith("k"):
+            return int(float(txt[:-1]) * 1000)
+        try:
+            return int(txt)
+        except ValueError:
+            return 0
+
+    def _on_select(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows or not getattr(self, "_row_formats", None):
+            self.card.set_format(None)
+            return
+        idx = rows[0].row()
+        if 0 <= idx < len(self._row_formats):
+            self.card.set_format(self._row_formats[idx])
+
+    def _edit_tiers(self):
+        dlg = TierSettingsDialog(self)
+        dlg.exec()
+        self.context_combo.clear()
+        self.output_combo.clear()
+        self._fill_tier_combo(self.context_combo, "context")
+        self._fill_tier_combo(self.output_combo, "output")
+        self._refresh()
+
+    def _export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Models", "models.csv",
+            "CSV files (*.csv);;JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        rows = [self._row_formats[r] for r in range(self.table.rowCount())
+                if 0 <= r < len(getattr(self, "_row_formats", []))]
+        try:
+            if path.endswith(".json"):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump([build_spec_from_format(f) | {"provider": f.provider,
+                                                            "model_id": f.model_id}
+                               for f in rows], f, indent=2, ensure_ascii=False)
+            else:
+                import csv
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["provider", "model_id", "name", "context",
+                                     "output", "cost_in", "cost_out"])
+                    for fm in rows:
+                        writer.writerow([fm.provider, fm.model_id, fm.name,
+                                         fm.context or "", fm.output or "",
+                                         fm.cost_in or "", fm.cost_out or ""])
+            QMessageBox.information(self, "Export Complete", f"Exported {len(rows)} models")
+        except OSError as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+
+class ApplyCatalogDialog(QDialog):
+    """Match configured models against the catalog and apply normalized format."""
+
+    def __init__(self, parent, catalog, config_providers):
+        super().__init__(parent)
+        self.setWindowTitle("Match & Format Models from Catalog")
+        self.resize(980, 620)
+        self.catalog = catalog
+        self.config_providers = config_providers
+
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            "Matches the models already configured in your config against the model catalog, "
+            "then fills in normalized format (context, output, modalities, cost).\n"
+            "Models with an id present in the catalog but missing from config can also be added."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Controls
+        ctrl = QHBoxLayout()
+        self.overwrite_check = QCheckBox("Overwrite existing values")
+        self.add_new_check = QCheckBox("Add new models from catalog")
+        self.add_new_check.setChecked(True)
+        ctrl.addWidget(self.overwrite_check)
+        ctrl.addWidget(self.add_new_check)
+        ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels([
+            "Model ID", "Provider (config)", "Catalog source", "Status",
+            "Context", "Modalities"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.itemDoubleClicked.connect(self._resolve_ambiguous)
+        layout.addWidget(self.table)
+
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Apply to Config")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.overwrite_check.stateChanged.connect(lambda _: self._scan())
+        self.add_new_check.stateChanged.connect(lambda _: self._scan())
+        self._picks = {}
+        self._scan()
+
+    def _scan(self):
+        self.rows = []
+        self.fmt_cache = self.catalog.formats()
+        overwrite = self.overwrite_check.isChecked()
+
+        for prov_name, prov_cfg in (self.config_providers or {}).items():
+            if not isinstance(prov_cfg, dict):
+                continue
+            models = prov_cfg.get("models")
+            if not isinstance(models, dict):
+                continue
+            for mid in models:
+                matches = self.catalog.find_model(mid)
+                if not matches:
+                    self.rows.append([mid, prov_name, "", "unknown", "", ""])
+                    continue
+                chosen = _resolve_match(matches, prov_name, mid,
+                                        self._pick_provider)
+                if chosen is None:
+                    self.rows.append([mid, prov_name,
+                                      ", ".join(m.provider for m in matches),
+                                      "ambiguous", "", ""])
+                    continue
+                spec = build_spec_from_format(chosen)
+                merged = _merge_model_spec(models[mid], spec, overwrite)
+                status = "matched" if merged != (models[mid] or {}) else "unchanged"
+                self.rows.append([mid, prov_name, chosen.provider, status,
+                                  chosen.context_k(), chosen.modalities.label()])
+
+        if self.add_new_check.isChecked():
+            for prov_name, prov_cfg in (self.config_providers or {}).items():
+                if not isinstance(prov_cfg, dict):
+                    continue
+                existing = set(prov_cfg.get("models", {})) if isinstance(prov_cfg.get("models"), dict) else set()
+                for fmt in self.fmt_cache.get(prov_name, {}).values():
+                    if fmt.model_id not in existing:
+                        self.rows.append([fmt.model_id, prov_name, prov_name, "added",
+                                          fmt.context_k(), fmt.modalities.label()])
+
+        self._populate()
+
+    def _populate(self):
+        self.table.setRowCount(len(self.rows))
+        for r, row in enumerate(self.rows):
+            for c, val in enumerate(row):
+                self.table.setItem(r, c, QTableWidgetItem(val))
+        counts = {"matched": 0, "filled": 0, "unchanged": 0, "unknown": 0,
+                  "ambiguous": 0, "added": 0}
+        for row in self.rows:
+            counts[row[3]] = counts.get(row[3], 0) + 1
+        parts = [f"{k}: {v}" for k, v in counts.items() if v]
+        self.status_label.setText("  ".join(parts))
+
+    def _pick_provider(self, prov_name, mid, matches):
+        """Return the user's chosen provider for an ambiguous match, else None."""
+        key = (prov_name, mid)
+        picked = self._picks.get(key)
+        if picked is not None:
+            return next((m for m in matches if m.provider == picked), matches[0])
+        return None
+
+    def _resolve_ambiguous(self, item):
+        row = item.row()
+        if self.rows[row][3] != "ambiguous":
+            return
+        mid, prov = self.rows[row][0], self.rows[row][1]
+        matches = self.catalog.find_model(mid)
+        providers = [m.provider for m in matches]
+        choice, ok = QInputDialog.getItem(
+            self, "Choose Catalog Source",
+            f"Model '{mid}' matches multiple providers. Choose one:",
+            providers, 0, False
+        )
+        if ok and choice:
+            self._picks[(prov, mid)] = choice
+            fmt = next((m for m in matches if m.provider == choice), matches[0])
+            self.rows[row][2] = choice
+            self.rows[row][3] = "matched"
+            self.rows[row][4] = fmt.context_k()
+            self.rows[row][5] = fmt.modalities.label()
+            self._populate()
+
+    def apply(self) -> ApplyReport:
+        """Apply the current choices to the live config providers."""
+        report = apply_catalog_to_config(
+            self.catalog,
+            self.config_providers,
+            overwrite=self.overwrite_check.isChecked(),
+            add_new=self.add_new_check.isChecked(),
+            resolve_fn=self._pick_provider,
+        )
+        return report
+
+# Providers tab
+class ProvidersTab(QWidget):
+    """Enhanced providers tab with search and bulk operations"""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.rows = []  # (provider_name, npm_edit, name_edit)
+
+        layout = QVBoxLayout(self)
+
+        # Search and buttons
+        top_layout = QHBoxLayout()
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search providers...")
+        self.search_edit.textChanged.connect(self._filter_providers)
+        top_layout.addWidget(self.search_edit)
+
+        for text, slot in [
+            ("+ Add", self._add_provider),
+            ("Import", self._import_providers),
+            ("Fetch from API", self._fetch_provider_models),
+            ("Export", self._export_providers),
+            ("Enable All", lambda: self._set_all_enabled(True)),
+            ("Disable All", lambda: self._set_all_enabled(False))
+        ]:
+            btn = QPushButton(text)
+            btn.clicked.connect(slot)
+            top_layout.addWidget(btn)
+
+        layout.addLayout(top_layout)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels([
+            "Provider", "npm", "Name", "Models / Options", "Actions"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        layout.addWidget(self.table)
+
+        # Status
+        self.status_label = QLabel()
+        layout.addWidget(self.status_label)
+
+    def _filter_providers(self, text: str):
+        """Filter providers by search text"""
+        if not text:
+            self.refresh()
+            return
+
+        text = text.lower()
+        providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
+        filtered = {
+            name: cfg for name, cfg in providers.items()
+            if text in name.lower() or
+               (isinstance(cfg.get("npm"), str) and text in cfg["npm"].lower()) or
+               (isinstance(cfg.get("name"), str) and text in cfg["name"].lower())
+        }
+
+        self._update_table(filtered)
+
+    def _update_table(self, providers: Optional[dict] = None):
+        """Update table with providers"""
+        if providers is None:
+            providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
+
+        self.table.setRowCount(len(providers))
+        self.rows = []
+
+        for row, (name, cfg) in enumerate(sorted(providers.items())):
+            if not isinstance(cfg, dict):
+                cfg = {}
+
+            # Provider name
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+
+            # npm
+            npm_edit = MaskedLineEdit(cfg.get("npm", ""), field_name="npm")
+            npm_edit.edit.editingFinished.connect(self.app.mark_dirty)
+            self.table.setCellWidget(row, 1, npm_edit)
+
+            # Name
+            name_edit = MaskedLineEdit(cfg.get("name", ""), field_name="name")
+            name_edit.edit.editingFinished.connect(self.app.mark_dirty)
+            self.table.setCellWidget(row, 2, name_edit)
+
+            # Models/Options
+            n_models = len(cfg.get("models", {})) if isinstance(cfg.get("models"), dict) else 0
+            base_url = cfg.get("options", {}).get("baseURL", "") if isinstance(cfg.get("options"), dict) else ""
+
+            cell = QWidget()
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(2, 0, 2, 0)
+
+            summary = QLabel(f"{n_models} models  {base_url}")
+            summary.setToolTip(json.dumps(cfg, ensure_ascii=False, indent=2)[:4000])
+            cell_layout.addWidget(summary, 1)
+
+            models_btn = QPushButton("Models...")
+            models_btn.clicked.connect(lambda _, n=name: self._edit_models(n))
+            cell_layout.addWidget(models_btn)
+
+            options_btn = QPushButton("Options...")
+            options_btn.clicked.connect(lambda _, n=name: self._edit_options(n))
+            cell_layout.addWidget(options_btn)
+
+            self.table.setCellWidget(row, 3, cell)
+
+            # Actions
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+
+            edit_btn = QPushButton("Edit")
+            edit_btn.setFixedWidth(60)
+            edit_btn.clicked.connect(lambda _, n=name: self._edit_provider(n))
+            actions_layout.addWidget(edit_btn)
+
+            remove_btn = QPushButton("Remove")
+            remove_btn.setFixedWidth(60)
+            remove_btn.clicked.connect(lambda _, n=name: self._remove_provider(n))
+            actions_layout.addWidget(remove_btn)
+
+            self.table.setCellWidget(row, 4, actions_widget)
+
+            self.rows.append((name, npm_edit, name_edit))
+
+        self.status_label.setText(f"{len(providers)} providers")
+
+    def refresh(self):
+        """Refresh table with current data"""
+        self._update_table()
+
+    def _add_provider(self):
+        """Add new provider"""
+        self.app.snapshot_state()
+        name, ok = QInputDialog.getText(
+            self, "Add Provider", "Provider key:",
+            QLineEdit.Normal, "new-provider"
+        )
+        if not ok or not name.strip():
+            return
+
+        name = name.strip()
+        providers = self.app.cfg.data.setdefault("provider", {})
+
+        if name in providers:
+            QMessageBox.warning(self, "Error", f"Provider '{name}' already exists")
+            return
+
+        providers[name] = {
+            "npm": "@ai-sdk/openai",
+            "name": name,
+            "models": {}
+        }
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _edit_provider(self, name: Optional[str] = None):
+        """Edit provider"""
+        self.app.snapshot_state()
+        if name is None:
+            selected = self.table.selectedItems()
+            if not selected:
+                QMessageBox.information(self, "Edit", "Please select a provider to edit")
+                return
+            name = selected[0].text()
+
+        providers = section(self.app.cfg.data, "provider")
+        if name not in providers:
+            QMessageBox.warning(self, "Error", f"Provider '{name}' not found")
+            return
+
+        new_name, ok = QInputDialog.getText(
+            self, "Edit Provider", "New provider key:",
+            QLineEdit.Normal, name
+        )
+        if not ok:
+            return
+
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "Error", "Provider key cannot be empty")
+            return
+
+        if new_name != name and new_name in providers:
+            QMessageBox.warning(self, "Error", f"Provider '{new_name}' already exists")
+            return
+
+        if new_name != name:
+            providers[new_name] = providers.pop(name)
+
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _remove_provider(self, name: Optional[str] = None):
+        """Remove provider(s)"""
+        self.app.snapshot_state()
+        if name is None:
+            selected = self.table.selectedItems()
+            if not selected:
+                QMessageBox.information(self, "Remove", "Please select providers to remove")
+                return
+
+            names = {selected[i].text() for i in range(0, len(selected), self.table.columnCount())}
+            if not _confirm(self, "Remove Providers", f"Remove {len(names)} selected providers?"):
+                return
+
+            providers = section(self.app.cfg.data, "provider")
+            for name in names:
+                providers.pop(name, None)
+        else:
+            if not _confirm(self, "Remove Provider", f"Remove provider '{name}'?"):
+                return
+
+            section(self.app.cfg.data, "provider").pop(name, None)
+
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _import_providers(self):
+        """Import providers from JSON"""
+        self.app.snapshot_state()
+        dlg = JsonImportDialog(
+            self, "Import Providers",
+            "Paste or load provider JSON. Supported formats:\n"
+            "- Single provider object\n"
+            "- {name: provider} map\n"
+            "- Full config with 'provider' key"
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        try:
+            parsed = parse_provider_import(dlg.result_data)
+        except ValueError as e:
+            QMessageBox.warning(self, "Import Error", str(e))
+            return
+
+        providers = self.app.cfg.data.setdefault("provider", {})
+        added = 0
+        updated = 0
+
+        for name, cfg in parsed.items():
+            if name in providers:
+                if _confirm(
+                    self, "Provider Exists",
+                    f"Provider '{name}' already exists. Merge with existing?"
+                ):
+                    providers[name] = merge_dict(providers[name], cfg)
+                    updated += 1
+            else:
+                providers[name] = cfg
+                added += 1
+
+        self.app.mark_dirty()
+        self.refresh()
+        QMessageBox.information(
+            self, "Import Complete",
+            f"Added {added} new providers, updated {updated} existing providers"
+        )
+
+    def _fetch_provider_models(self):
+        """Fetch a provider's model list from its API, then auto-match the catalog."""
+        self.app.snapshot_state()
+
+        # Fill the dialog's Reference provider combo (silently loads bundled catalog).
+        try_load_bundled_catalog(self.app.model_catalog)
+        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        key = dlg.key_edit.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Fetch", "Provider key cannot be empty.")
+            return
+
+        selected = dlg.selected_models
+        if not selected:
+            QMessageBox.information(self, "Fetch", "No models selected.")
+            return
+
+        reference = dlg.reference_provider
+
+        providers = self.app.cfg.data.setdefault("provider", {})
+        prov = providers.setdefault(key, {"npm": "@ai-sdk/openai", "name": key, "models": {}})
+        if not isinstance(prov.get("models"), dict):
+            prov["models"] = {}
+        for mid, spec in selected.items():
+            prov["models"].setdefault(mid, dict(spec))
+
+        self.app.mark_dirty()
+        self._update_table()
+
+        # Auto-match against the catalog in ONE review dialog (no per-model prompts).
+        if not self.app.model_catalog.loaded():
+            if not self.app._ensure_catalog():
+                QMessageBox.information(
+                    self, "Fetch Complete",
+                    f"Added {len(selected)} models to '{key}'. "
+                    "Catalog not loaded, skipped auto-match.")
+                return
+
+        catalog = self.app.model_catalog
+        settings = SettingsManager()
+        mappings = settings.get_reference_mappings()
+        entries = []       # (model_id, old_spec, new_spec|None, status)
+        ambiguous_data = {}
+        fallback_data = {}  # {model_id: ModelFormat}
+
+        for mid in sorted(prov["models"]):
+            matches = catalog.find_model(mid)
+            if not matches:
+                fmt = None
+                # 1. Previously persisted manual/auto mapping wins.
+                saved = mappings.get(f"{key}/{mid}")
+                if saved:
+                    saved_matches = catalog.find_model(saved)
+                    if saved_matches:
+                        fmt = _sort_matches(saved_matches, reference or key)[0]
+                # 2. Reference provider / normalized-id / prefix fallback.
+                if fmt is None:
+                    fmt = _find_fallback(mid, reference, catalog)
+                if fmt is not None:
+                    merged = _merge_model_spec(
+                        prov["models"][mid], build_spec_from_format(fmt), overwrite=False)
+                    entries.append((mid, dict(prov["models"][mid]), merged,
+                                    f"fallback:{fmt.provider}"))
+                    fallback_data[mid] = fmt
+                else:
+                    entries.append((mid, dict(prov["models"][mid]), None, "unknown"))
+                continue
+            chosen = _resolve_match(matches, key, mid)
+            if chosen is None:
+                entries.append((mid, dict(prov["models"][mid]), None, "ambiguous"))
+                ambiguous_data[mid] = (key, matches)
+                continue
+            merged = _merge_model_spec(
+                prov["models"][mid], build_spec_from_format(chosen), overwrite=False)
+            status = "matched" if merged != (prov["models"][mid] or {}) else "unchanged"
+            entries.append((mid, dict(prov["models"][mid]), merged, status))
+
+        if not any(e[2] is not None or e[3] == "ambiguous" for e in entries):
+            QMessageBox.information(
+                self, "Fetch & Match",
+                f"Added {len(selected)} models to '{key}'. "
+                "None matched the catalog.")
+            return
+
+        preview = MatchFormatPreviewDialog(
+            self, entries, ambiguous_data, fallback_data=fallback_data, catalog=catalog)
+        if preview.exec() != QDialog.Accepted:
+            return
+
+        applied = 0
+        for mid, old_spec, new_spec, status in preview.selected_entries:
+            if status == "ambiguous":
+                new_spec = preview.resolved_specs.get(mid, new_spec)
+            elif status == "mapped":
+                new_spec = preview.mapped_specs.get(mid, new_spec)
+                if mid in preview.mapped_ids:
+                    settings.add_reference_mapping(key, mid, preview.mapped_ids[mid])
+            elif status.startswith("fallback:"):
+                fmt = fallback_data.get(mid)
+                if fmt is not None:
+                    settings.add_reference_mapping(key, mid, fmt.model_id)
+            if new_spec is None:
+                continue
+            prov["models"][mid] = _merge_model_spec(
+                prov["models"][mid], new_spec, overwrite=False)
+            applied += 1
+
+        self.app.mark_dirty()
+        self._update_table()
+        QMessageBox.information(
+            self, "Fetch & Match Complete",
+            f"Added {len(selected)} models to '{key}', normalized {applied} from catalog."
+        )
+
+    def _export_providers(self):
+        """Export providers to JSON file"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Providers", "providers.json",
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+
+        providers = section(self.app.cfg.data, "provider")
+        if not providers:
+            QMessageBox.information(self, "Export", "No providers to export")
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(providers, f, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "Export Complete", f"Exported to {path}")
+        except OSError as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+    def _set_all_enabled(self, enabled: bool):
+        """Enable/disable all providers"""
+        # Providers don't have an enabled flag, but we can add one for UI purposes
+        # This is just a placeholder for potential future functionality
+        QMessageBox.information(self, "Info", "Providers don't have an enabled/disabled state")
+
+    def _edit_models(self, name: str):
+        """Edit models for provider"""
+        self.app.snapshot_state()
+        providers = section(self.app.cfg.data, "provider")
+        if name not in providers:
+            return
+
+        dlg = ModelsManagerDialog(self.app, name, providers[name])
+        if dlg.exec() == QDialog.Accepted:
+            providers[name]["models"] = dlg.result()
+            self.app.mark_dirty()
+            self.refresh()
+
+    def _edit_options(self, name: str):
+        """Edit options for provider"""
+        self.app.snapshot_state()
+        providers = section(self.app.cfg.data, "provider")
+        if name not in providers:
+            return
+
+        current = providers[name].get("options", {})
+        dlg = JsonImportDialog(
+            self, f"Options - {name}",
+            "Edit provider options (baseURL, headers, etc.)"
+        )
+        dlg.editor.setPlainText(json.dumps(current, indent=2, ensure_ascii=False))
+
+        if dlg.exec() == QDialog.Accepted:
+            try:
+                options = json.loads(dlg.editor.toPlainText())
+                if not isinstance(options, dict):
+                    raise ValueError("Options must be a JSON object")
+                providers[name]["options"] = options
+                self.app.mark_dirty()
+                self.refresh()
+            except (json.JSONDecodeError, ValueError) as e:
+                QMessageBox.warning(self, "Error", str(e))
+
+    def collect(self, data: dict):
+        """Collect data from UI"""
+        providers = data.setdefault("provider", {})
+        seen = set()
+
+        for row in range(self.table.rowCount()):
+            old_name = self.rows[row][0]
+            new_name = self.table.item(row, 0).text().strip()
+
+            if not new_name:
+                continue
+
+            if new_name in seen:
+                raise ValueError(f"Duplicate provider key: {new_name!r}")
+            seen.add(new_name)
+
+            npm_edit = self.rows[row][1]
+            name_edit = self.rows[row][2]
+
+            old_cfg = dict(providers.get(old_name, {}))
+            old_cfg["npm"] = npm_edit.value()
+            if name_edit.value():
+                old_cfg["name"] = name_edit.value()
+            else:
+                old_cfg.pop("name", None)
+
+            providers[new_name] = old_cfg
+
+# MCP servers tab
+class MCPHeadersDialog(QDialog):
+    """Edit the `headers` map (name -> value) of a remote MCP server.
+
+    Used for HTTP auth headers such as `Authorization: Bearer <token>`.
+    """
+
+    def __init__(self, parent=None, headers=None):
+        super().__init__(parent)
+        self.setWindowTitle("MCP Headers")
+        self.setMinimumSize(480, 320)
+        headers = headers or {}
+
+        lay = QVBoxLayout(self)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Header", "Value"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        lay.addWidget(self.table)
+
+        btns = QHBoxLayout()
+        add_b = QPushButton("+ Add")
+        add_b.clicked.connect(self._add)
+        rem_b = QPushButton("Remove")
+        rem_b.clicked.connect(self._remove)
+        btns.addWidget(add_b)
+        btns.addWidget(rem_b)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+        self.table.blockSignals(True)
+        for name, value in sorted(headers.items()):
+            self._insert_row(str(name), str(value))
+        self.table.blockSignals(False)
+
+    def _insert_row(self, name, value):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem(name))
+        self.table.setItem(r, 1, QTableWidgetItem(value))
+
+    def _add(self):
+        name, ok = QInputDialog.getText(self, "Header", "Header name:")
+        if ok and name.strip():
+            self._insert_row(name.strip(), "")
+            self.table.setCurrentCell(self.table.rowCount() - 1, 1)
+
+    def _remove(self):
+        rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+
+    def headers(self) -> dict:
+        out = {}
+        for r in range(self.table.rowCount()):
+            name = self.table.item(r, 0)
+            value = self.table.item(r, 1)
+            n = name.text().strip() if name else ""
+            v = value.text() if value else ""
+            if n:
+                out[n] = v
+        return out
+
+
+class McpTab(QWidget):
+    """Enhanced MCP tab with search and bulk operations"""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.cbs = {}  # name -> QCheckBox
+
+        layout = QVBoxLayout(self)
+
+        # Search and buttons
+        top_layout = QHBoxLayout()
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search servers...")
+        self.search_edit.textChanged.connect(self._filter_servers)
+        top_layout.addWidget(self.search_edit)
+
+        for text, slot in [
+            ("+ Add", self._add_server),
+            ("Import", self._import_servers),
+            ("Export", self._export_servers),
+            ("Enable All", lambda: self._set_all_enabled(True)),
+            ("Disable All", lambda: self._set_all_enabled(False))
+        ]:
+            btn = QPushButton(text)
+            btn.clicked.connect(slot)
+            top_layout.addWidget(btn)
+
+        layout.addLayout(top_layout)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels([
+            "Enabled", "Name", "Type", "Command / URL", "Actions"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        layout.addWidget(self.table)
+
+        # Status
+        self.status_label = QLabel()
+        layout.addWidget(self.status_label)
+
+    def _filter_servers(self, text: str):
+        """Filter servers by search text"""
+        if not text:
+            self.refresh()
+            return
+
+        text = text.lower()
+        mcp = self.app.cfg.data.get("mcp", {}) if self.app.cfg else {}
+        filtered = {
+            name: cfg for name, cfg in mcp.items()
+            if text in name.lower() or
+               (isinstance(cfg.get("type"), str) and text in cfg["type"].lower()) or
+               (isinstance(cfg.get("url"), str) and text in cfg["url"].lower()) or
+               (isinstance(cfg.get("command"), list) and any(text in str(c).lower() for c in cfg["command"]))
+        }
+
+        self._update_table(filtered)
+
+    def _update_table(self, servers: Optional[dict] = None):
+        """Update table with servers"""
+        if servers is None:
+            servers = self.app.cfg.data.get("mcp", {}) if self.app.cfg else {}
+
+        self.table.setRowCount(len(servers))
+        self.cbs = {}
+
+        for row, (name, cfg) in enumerate(sorted(servers.items())):
+            if not isinstance(cfg, dict):
+                cfg = {}
+
+            # Enabled checkbox
+            enabled_check = QCheckBox()
+            enabled_check.setChecked(bool(cfg.get("enabled", True)))
+            enabled_check.stateChanged.connect(lambda _, n=name: self._toggle_enabled(n))
+            self.table.setCellWidget(row, 0, enabled_check)
+            self.cbs[name] = enabled_check
+
+            # Name
+            self.table.setItem(row, 1, QTableWidgetItem(name))
+
+            # Type
+            self.table.setItem(row, 2, QTableWidgetItem(str(cfg.get("type", ""))))
+
+            # Command/URL
+            if cfg.get("type") == "local":
+                cmd = " ".join(cfg.get("command", []))
+            else:
+                cmd = cfg.get("url", "")
+            self.table.setItem(row, 3, QTableWidgetItem(cmd))
+
+            # Actions
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+
+            edit_btn = QPushButton("Edit")
+            edit_btn.setFixedWidth(60)
+            edit_btn.clicked.connect(lambda _, n=name: self._edit_server(n))
+            actions_layout.addWidget(edit_btn)
+
+            headers_btn = QPushButton("Headers")
+            headers_btn.setFixedWidth(70)
+            headers_btn.clicked.connect(lambda _, n=name: self._edit_headers(n))
+            actions_layout.addWidget(headers_btn)
+
+            remove_btn = QPushButton("Remove")
+            remove_btn.setFixedWidth(60)
+            remove_btn.clicked.connect(lambda _, n=name: self._remove_server(n))
+            actions_layout.addWidget(remove_btn)
+
+            self.table.setCellWidget(row, 4, actions_widget)
+
+        self.status_label.setText(f"{len(servers)} servers")
+
+    def refresh(self):
+        """Refresh table with current data"""
+        self._update_table()
+
+    def _add_server(self):
+        """Add new MCP server"""
+        self.app.snapshot_state()
+        name, ok = QInputDialog.getText(
+            self, "Add MCP Server", "Server key:",
+            QLineEdit.Normal, "new-server"
+        )
+        if not ok or not name.strip():
+            return
+
+        name = name.strip()
+        mcp = self.app.cfg.data.setdefault("mcp", {})
+
+        if name in mcp:
+            QMessageBox.warning(self, "Error", f"Server '{name}' already exists")
+            return
+
+        mcp[name] = {
+            "type": "remote",
+            "url": "https://",
+            "enabled": True
+        }
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _edit_server(self, name: Optional[str] = None):
+        """Edit MCP server"""
+        self.app.snapshot_state()
+        if name is None:
+            selected = self.table.selectedItems()
+            if not selected:
+                QMessageBox.information(self, "Edit", "Please select a server to edit")
+                return
+            name = selected[0].text()
+
+        mcp = self.app.cfg.data.get("mcp", {})
+        if name not in mcp:
+            QMessageBox.warning(self, "Error", f"Server '{name}' not found")
+            return
+
+        new_name, ok = QInputDialog.getText(
+            self, "Edit MCP Server", "New server key:",
+            QLineEdit.Normal, name
+        )
+        if not ok:
+            return
+
+        new_name = new_name.strip()
+        if not new_name:
+            QMessageBox.warning(self, "Error", "Server key cannot be empty")
+            return
+
+        if new_name != name and new_name in mcp:
+            QMessageBox.warning(self, "Error", f"Server '{new_name}' already exists")
+            return
+
+        if new_name != name:
+            mcp[new_name] = mcp.pop(name)
+
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _edit_headers(self, name: Optional[str] = None):
+        """Edit the `headers` map of a (typically remote) MCP server."""
+        if name is None:
+            selected = self.table.selectedItems()
+            if not selected:
+                QMessageBox.information(self, "Headers", "Please select a server")
+                return
+            name = selected[0].text()
+
+        mcp = self.app.cfg.data.get("mcp", {})
+        cfg = mcp.get(name)
+        if not isinstance(cfg, dict):
+            QMessageBox.warning(self, "Error", f"Server '{name}' not found")
+            return
+
+        if cfg.get("type") == "local":
+            QMessageBox.information(
+                self, "Headers", "Headers apply to remote MCP servers only."
+            )
+            return
+
+        headers = cfg.get("headers") if isinstance(cfg.get("headers"), dict) else {}
+        dlg = MCPHeadersDialog(self, headers=headers)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        new_headers = dlg.headers()
+        self.app.snapshot_state()
+        if new_headers:
+            cfg["headers"] = new_headers
+        else:
+            cfg.pop("headers", None)
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _remove_server(self, name: Optional[str] = None):
+        """Remove MCP server(s)"""
+        self.app.snapshot_state()
+        if name is None:
+            selected = self.table.selectedItems()
+            if not selected:
+                QMessageBox.information(self, "Remove", "Please select servers to remove")
+                return
+
+            names = {selected[i].text() for i in range(0, len(selected), self.table.columnCount())}
+            if not _confirm(self, "Remove Servers", f"Remove {len(names)} selected servers?"):
+                return
+
+            mcp = self.app.cfg.data.get("mcp", {})
+            for name in names:
+                mcp.pop(name, None)
+        else:
+            if not _confirm(self, "Remove Server", f"Remove server '{name}'?"):
+                return
+
+            self.app.cfg.data.get("mcp", {}).pop(name, None)
+
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _import_servers(self):
+        """Import MCP servers from JSON"""
+        self.app.snapshot_state()
+        dlg = JsonImportDialog(
+            self, "Import MCP Servers",
+            "Paste or load MCP server JSON. Supported formats:\n"
+            "- Single server object\n"
+            "- {name: server} map\n"
+            "- Full config with 'mcp' key"
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        try:
+            parsed = parse_mcp_import(dlg.result_data)
+        except ValueError as e:
+            QMessageBox.warning(self, "Import Error", str(e))
+            return
+
+        mcp = self.app.cfg.data.setdefault("mcp", {})
+        added = 0
+        updated = 0
+
+        for name, cfg in parsed.items():
+            if name in mcp:
+                if _confirm(
+                    self, "Server Exists",
+                    f"Server '{name}' already exists. Overwrite?"
+                ):
+                    mcp[name] = cfg
+                    updated += 1
+            else:
+                mcp[name] = cfg
+                added += 1
+
+        self.app.mark_dirty()
+        self.refresh()
+        QMessageBox.information(
+            self, "Import Complete",
+            f"Added {added} new servers, updated {updated} existing servers"
+        )
+
+    def _export_servers(self):
+        """Export MCP servers to JSON file"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export MCP Servers", "mcp-servers.json",
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+
+        mcp = self.app.cfg.data.get("mcp", {})
+        if not mcp:
+            QMessageBox.information(self, "Export", "No MCP servers to export")
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(mcp, f, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "Export Complete", f"Exported to {path}")
+        except OSError as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+    def _set_all_enabled(self, enabled: bool):
+        """Enable/disable all servers"""
+        self.app.snapshot_state()
+        mcp = self.app.cfg.data.get("mcp", {})
+        for name in mcp:
+            mcp[name]["enabled"] = enabled
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _toggle_enabled(self, name: str):
+        """Toggle enabled state for server"""
+        self.app.snapshot_state()
+        mcp = self.app.cfg.data.get("mcp", {})
+        if name in mcp:
+            mcp[name]["enabled"] = self.cbs[name].isChecked()
+            self.app.mark_dirty()
+
+    def collect(self, data: dict):
+        """Collect data from UI"""
+        # Enabled states are already applied live
+        pass
+
+# Plugins tab
+class PluginsTab(QWidget):
+    """Enhanced plugins tab with search and bulk operations"""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.state_store = PluginStateStore()
+        self.cbs = {}  # plugin -> QCheckBox
+
+        layout = QVBoxLayout(self)
+
+        # Search and buttons
+        top_layout = QHBoxLayout()
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search plugins...")
+        self.search_edit.textChanged.connect(self._filter_plugins)
+        top_layout.addWidget(self.search_edit)
+
+        for text, slot in [
+            ("+ Add", self._add_plugin),
+            ("Import", self._import_plugins),
+            ("Export", self._export_plugins),
+            ("Enable All", lambda: self._set_all_enabled(True)),
+            ("Disable All", lambda: self._set_all_enabled(False)),
+            ("Remove Selected", self._remove_selected)
+        ]:
+            btn = QPushButton(text)
+            btn.clicked.connect(slot)
+            top_layout.addWidget(btn)
+
+        layout.addLayout(top_layout)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(2)
+        self.table.setHorizontalHeaderLabels(["Enabled", "Plugin"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        layout.addWidget(self.table)
+
+        # Status
+        self.status_label = QLabel(
+            "Disabled plugins are removed from the saved config but remembered "
+            "so you can re-enable them later."
+        )
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.status_label)
+
+    def _filter_plugins(self, text: str):
+        """Filter plugins by search text"""
+        if not text:
+            self.refresh()
+            return
+
+        text = text.lower()
+        plugins = self._get_plugins()
+        disabled = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+
+        filtered = [
+            (p, p not in disabled) for p in plugins
+            if text in p.lower()
+        ]
+
+        self._update_table(filtered)
+
+    def _update_table(self, plugins: Optional[List[Tuple[str, bool]]] = None):
+        """Update table with plugins"""
+        if plugins is None:
+            plugins = self._get_plugins()
+            disabled = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+            plugins = [(p, p not in disabled) for p in plugins]
+
+        self.table.setRowCount(len(plugins))
+        self.cbs = {}
+
+        for row, (plugin, enabled) in enumerate(plugins):
+            # Enabled checkbox
+            enabled_check = QCheckBox()
+            enabled_check.setChecked(enabled)
+            enabled_check.stateChanged.connect(self.app.mark_dirty)
+            cell = QWidget()
+            cell_layout = QHBoxLayout(cell)
+            cell_layout.setContentsMargins(0, 0, 0, 0)
+            cell_layout.setAlignment(Qt.AlignCenter)
+            cell_layout.addWidget(enabled_check)
+            self.table.setCellWidget(row, 0, cell)
+            self.cbs[plugin] = enabled_check
+
+            # Plugin
+            self.table.setItem(row, 1, QTableWidgetItem(plugin))
+
+    def _get_plugins(self) -> List[str]:
+        """Get all plugins: active (from config) plus remembered-disabled ones,
+        so disabled plugins reappear in the list and can be re-enabled."""
+        plugins = self.app.cfg.data.get("plugin", []) if self.app.cfg else []
+        if not isinstance(plugins, list):
+            plugins = []
+        active = {str(p) for p in plugins}
+        if self.app.cfg is not None:
+            active |= self.state_store.get_disabled(self.app.cfg.path)
+        return sorted(active)
+
+    def refresh(self):
+        """Refresh table with current data"""
+        self._update_table()
+
+    def _add_plugin(self):
+        """Add new plugin"""
+        self.app.snapshot_state()
+        plugin, ok = QInputDialog.getText(
+            self, "Add Plugin", "Plugin (npm spec):",
+            QLineEdit.Normal, "@opencode/plugin-example"
+        )
+        if not ok or not plugin.strip():
+            return
+
+        plugin = plugin.strip()
+        if plugin in self.cbs:
+            QMessageBox.warning(self, "Error", f"Plugin '{plugin}' already exists")
+            return
+
+        self._insert_plugin(plugin, True)
+        self.app.mark_dirty()
+
+    def _insert_plugin(self, plugin: str, enabled: bool):
+        """Insert plugin into table"""
+        self.table.insertRow(self.table.rowCount())
+        row = self.table.rowCount() - 1
+
+        # Enabled checkbox
+        enabled_check = QCheckBox()
+        enabled_check.setChecked(enabled)
+        enabled_check.stateChanged.connect(self.app.mark_dirty)
+        cell = QWidget()
+        cell_layout = QHBoxLayout(cell)
+        cell_layout.setContentsMargins(0, 0, 0, 0)
+        cell_layout.setAlignment(Qt.AlignCenter)
+        cell_layout.addWidget(enabled_check)
+        self.table.setCellWidget(row, 0, cell)
+        self.cbs[plugin] = enabled_check
+
+        # Plugin
+        self.table.setItem(row, 1, QTableWidgetItem(plugin))
+
+    def _import_plugins(self):
+        """Import plugins from JSON"""
+        self.app.snapshot_state()
+        dlg = JsonImportDialog(
+            self, "Import Plugins",
+            "Paste or load plugins JSON. Supported formats:\n"
+            "- Array of plugin strings\n"
+            "- {'plugin': [...]} object"
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        data = dlg.result_data
+        if isinstance(data, dict) and "plugin" in data:
+            data = data["plugin"]
+
+        if not isinstance(data, list):
+            QMessageBox.warning(self, "Import Error", "Expected a JSON array of plugin strings")
+            return
+
+        existing = set(self.cbs.keys())
+        added = 0
+
+        for item in data:
+            if isinstance(item, str) and item not in existing:
+                self._insert_plugin(item, True)
+                added += 1
+
+        self.app.mark_dirty()
+        QMessageBox.information(self, "Import Complete", f"Added {added} new plugins")
+
+    def _export_plugins(self):
+        """Export plugins to JSON file"""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Plugins", "plugins.json",
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+
+        plugins = [p for p, cb in self.cbs.items() if cb.isChecked()]
+        if not plugins:
+            QMessageBox.information(self, "Export", "No plugins to export")
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(plugins, f, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "Export Complete", f"Exported to {path}")
+        except OSError as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
+    def _set_all_enabled(self, enabled: bool):
+        """Enable/disable all plugins"""
+        self.app.snapshot_state()
+        for cb in self.cbs.values():
+            cb.setChecked(enabled)
+        self.app.mark_dirty()
+
+    def _remove_selected(self):
+        """Remove selected plugins"""
+        self.app.snapshot_state()
+        selected = self.table.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "Remove", "Please select plugins to remove")
+            return
+
+        plugins = {selected[i].text() for i in range(0, len(selected), self.table.columnCount())}
+        if not plugins:
+            return
+
+        if not _confirm(self, "Remove Plugins", f"Remove {len(plugins)} selected plugins?"):
+            return
+
+        for plugin in plugins:
+            row = self._find_plugin_row(plugin)
+            if row >= 0:
+                self.table.removeRow(row)
+            self.cbs.pop(plugin, None)
+
+        self.app.mark_dirty()
+
+    def _find_plugin_row(self, plugin: str) -> int:
+        """Find row for plugin"""
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 1).text() == plugin:
+                return row
+        return -1
+
+    def collect(self, data: dict):
+        """Collect data from UI"""
+        active = []
+        disabled = []
+
+        for plugin, cb in self.cbs.items():
+            if cb.isChecked():
+                active.append(plugin)
+            else:
+                disabled.append(plugin)
+
+        data["plugin"] = active
+        if self.app.cfg:
+            self.state_store.set_disabled(self.app.cfg.path, set(disabled))
+
+# Permissions tab
+class PermissionTab(QWidget):
+    """Enhanced permission tab with search"""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+        layout = QVBoxLayout(self)
+
+        # Search
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search permissions...")
+        self.search_edit.textChanged.connect(self._filter_permissions)
+        layout.addWidget(self.search_edit)
+
+        # Tree
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Category", "Path", "Level"])
+        self.tree.setColumnCount(3)
+        self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        layout.addWidget(self.tree)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+        add_btn = QPushButton("+ Add Rule")
+        add_btn.clicked.connect(self._add_rule)
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(self._remove_selected)
+        button_layout.addWidget(add_btn)
+        button_layout.addWidget(remove_btn)
+        layout.addLayout(button_layout)
+
+    def _filter_permissions(self, text: str):
+        """Filter permissions by search text"""
+        if not text:
+            self.refresh()
+            return
+
+        text = text.lower()
+        perm = self.app.cfg.data.get("permission", {}) if self.app.cfg else {}
+        filtered = {}
+
+        for category, rules in perm.items():
+            if not isinstance(rules, dict):
+                continue
+
+            matching_rules = {
+                path: level for path, level in rules.items()
+                if text in category.lower() or text in path.lower() or text in str(level).lower()
+            }
+
+            if matching_rules:
+                filtered[category] = matching_rules
+
+        self._update_tree(filtered)
+
+    def _update_tree(self, permissions: Optional[dict] = None):
+        """Update tree with permissions"""
+        if permissions is None:
+            permissions = self.app.cfg.data.get("permission", {}) if self.app.cfg else {}
+
+        self.tree.clear()
+
+        for category, rules in permissions.items():
+            if not isinstance(rules, dict):
+                continue
+
+            category_item = QTreeWidgetItem(self.tree)
+            category_item.setText(0, category)
+            category_item.setFlags(category_item.flags() | Qt.ItemIsEditable)
+
+            for path, level in rules.items():
+                rule_item = QTreeWidgetItem(category_item)
+                rule_item.setText(1, path)
+                rule_item.setText(2, str(level))
+                rule_item.setFlags(rule_item.flags() | Qt.ItemIsEditable)
+
+        self.tree.expandAll()
+
+    def refresh(self):
+        """Refresh tree with current data"""
+        self._update_tree()
+
+    def _add_rule(self):
+        """Add new permission rule"""
+        self.app.snapshot_state()
+        category, ok = QInputDialog.getText(
+            self, "Add Permission Rule", "Category:",
+            QLineEdit.Normal, "filesystem"
+        )
+        if not ok or not category.strip():
+            return
+
+        path, ok = QInputDialog.getText(
+            self, "Add Permission Rule", "Path:",
+            QLineEdit.Normal, "/tmp/*"
+        )
+        if not ok or not path.strip():
+            return
+
+        level, ok = QInputDialog.getItem(
+            self, "Add Permission Rule", "Level:",
+            ["read", "write", "execute", "none"], 0, False
+        )
+        if not ok:
+            return
+
+        perm = self.app.cfg.data.setdefault("permission", {})
+        if category not in perm:
+            perm[category] = {}
+
+        perm[category][path] = level
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _remove_selected(self):
+        """Remove selected permission rules"""
+        self.app.snapshot_state()
+        selected = self.tree.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "Remove", "Please select rules to remove")
+            return
+
+        perm = self.app.cfg.data.get("permission", {})
+        removed = 0
+
+        for item in selected:
+            if item.parent() is None:
+                # Category
+                category = item.text(0)
+                if category in perm:
+                    removed += len(perm[category])
+                    perm.pop(category)
+            else:
+                # Rule
+                category = item.parent().text(0)
+                path = item.text(1)
+                if category in perm and path in perm[category]:
+                    removed += 1
+                    perm[category].pop(path)
+                    if not perm[category]:
+                        perm.pop(category)
+
+        self.app.mark_dirty()
+        self.refresh()
+        QMessageBox.information(self, "Remove", f"Removed {removed} permission rules")
+
+    def collect(self, data: dict):
+        """Collect data from UI"""
+        # Permissions are edited directly in the config
+        pass
+
+# Runtime tab and its small editor widgets
+class StringListEdit(QWidget):
+    """Editable list of strings backed by a nested key path in the config."""
+
+    def __init__(self, app, data_path, placeholder="item"):
+        super().__init__()
+        self.app = app
+        self.data_path = data_path  # e.g. ["disabled_providers"]
+        self.placeholder = placeholder
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.list = QListWidget()
+        self.list.setMaximumHeight(110)
+        lay.addWidget(self.list)
+
+        btns = QHBoxLayout()
+        add_b = QPushButton("+")
+        add_b.setFixedWidth(28)
+        add_b.clicked.connect(self._add)
+        rem_b = QPushButton("-")
+        rem_b.setFixedWidth(28)
+        rem_b.clicked.connect(self._remove)
+        btns.addWidget(add_b)
+        btns.addWidget(rem_b)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+
+    def _node(self, data):
+        node = data
+        for k in self.data_path:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(k)
+        return node
+
+    def refresh(self):
+        self.list.clear()
+        node = self._node(self.app.cfg.data if self.app.cfg else {})
+        if isinstance(node, list):
+            for item in node:
+                self.list.addItem(str(item))
+
+    def collect(self, data):
+        vals = [self.list.item(i).text().strip()
+                for i in range(self.list.count())
+                if self.list.item(i).text().strip()]
+        node = data
+        for k in self.data_path[:-1]:
+            if not isinstance(node.get(k), dict):
+                node[k] = {}
+            node = node[k]
+        last = self.data_path[-1]
+        if vals:
+            node[last] = vals
+        else:
+            node.pop(last, None)
+
+    def _add(self):
+        text, ok = QInputDialog.getText(self, "Add", f"New {self.placeholder}:")
+        if ok and text.strip():
+            self.list.addItem(text.strip())
+            self.app.mark_dirty()
+
+    def _remove(self):
+        rows = sorted({self.list.row(it) for it in self.list.selectedItems()}, reverse=True)
+        for r in rows:
+            self.list.takeItem(r)
+        if rows:
+            self.app.mark_dirty()
+
+
+class BoolObjectCombo(QWidget):
+    """Tri-state selector for bool|object keys (formatter, lsp).
+    Custom-object values are preserved verbatim (edit via Raw JSON)."""
+
+    def __init__(self, app, key):
+        super().__init__()
+        self.app = app
+        self.key = key
+        self._loading = False
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.combo = QComboBox()
+        self.combo.addItem("Disabled (omit)", "omit")
+        self.combo.addItem("Enable built-ins (true)", "true")
+        self.combo.addItem("Custom object (Raw JSON)", "custom")
+        self.combo.currentIndexChanged.connect(self._changed)
+        lay.addWidget(self.combo, 1)
+        self.note = QLabel("")
+        self.note.setStyleSheet("color: gray;")
+        lay.addWidget(self.note, 2)
+
+    def _changed(self):
+        if not self._loading:
+            self.app.mark_dirty()
+
+    def refresh(self):
+        self._loading = True
+        node = self.app.cfg.data.get(self.key) if self.app.cfg else None
+        if node is True:
+            self.combo.setCurrentIndex(1)
+        elif node is False or node is None:
+            self.combo.setCurrentIndex(0)
+        else:
+            self.combo.setCurrentIndex(2)
+        self.note.setText("preserved as-is; edit shape in Raw JSON" if self.combo.currentIndex() == 2 else "")
+        self._loading = False
+
+    def collect(self, data):
+        idx = self.combo.currentIndex()
+        if idx == 0:
+            data.pop(self.key, None)
+        elif idx == 1:
+            data[self.key] = True
+        # idx == 2 (custom): leave the existing base value untouched
+
+
+class BoolMapEditor(QWidget):
+    """Editable map<string,bool> backed by a nested key path (e.g. tools)."""
+
+    def __init__(self, app, data_path):
+        super().__init__()
+        self.app = app
+        self.data_path = data_path
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Item", "Enabled"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setMaximumHeight(140)
+        lay.addWidget(self.table)
+        btns = QHBoxLayout()
+        addb = QPushButton("+")
+        addb.setFixedWidth(28)
+        addb.clicked.connect(self._add)
+        remb = QPushButton("-")
+        remb.setFixedWidth(28)
+        remb.clicked.connect(self._remove)
+        btns.addWidget(addb)
+        btns.addWidget(remb)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+
+    def _node(self, data):
+        node = data
+        for k in self.data_path:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(k)
+        return node
+
+    def refresh(self):
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        node = self._node(self.app.cfg.data if self.app.cfg else {})
+        if isinstance(node, dict):
+            for name, enabled in sorted(node.items()):
+                r = self.table.rowCount()
+                self.table.insertRow(r)
+                self.table.setItem(r, 0, QTableWidgetItem(str(name)))
+                cb = QCheckBox()
+                cb.setChecked(bool(enabled))
+                self.table.setCellWidget(r, 1, cb)
+                cb.stateChanged.connect(lambda *_: self._changed())
+        self.table.blockSignals(False)
+
+    def collect(self, data):
+        node = data
+        for k in self.data_path[:-1]:
+            if not isinstance(node.get(k), dict):
+                node[k] = {}
+            node = node[k]
+        last = self.data_path[-1]
+        out = {}
+        for r in range(self.table.rowCount()):
+            name = self.table.item(r, 0)
+            if not name or not name.text().strip():
+                continue
+            cb = self.table.cellWidget(r, 1)
+            out[name.text().strip()] = bool(cb.isChecked())
+        if out:
+            node[last] = out
+        else:
+            node.pop(last, None)
+
+    def _changed(self):
+        self.app.mark_dirty()
+
+    def _add(self):
+        text, ok = QInputDialog.getText(self, "Add", "Item name:")
+        if ok and text.strip():
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self.table.setItem(r, 0, QTableWidgetItem(text.strip()))
+            cb = QCheckBox()
+            cb.setChecked(True)
+            self.table.setCellWidget(r, 1, cb)
+            self.app.mark_dirty()
+
+    def _remove(self):
+        rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
+        for r in rows:
+            self.table.removeRow(r)
+        if rows:
+            self.app.mark_dirty()
+
+
+class RuntimeTab(BaseTab):
+    """Server, session, attachment, advanced and experimental settings."""
+
+    def __init__(self, app):
+        super().__init__(app)
+
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        outer.addWidget(scroll)
+        container = QWidget()
+        scroll.setWidget(container)
+        lay = QVBoxLayout(container)
+
+        # ---- Server ----
+        server_box = QGroupBox("Server (opencode serve / web)")
+        sform = QFormLayout(server_box)
+        self.server_port = self._spin(0)
+        sform.addRow("Port", self.server_port)
+        self.server_host = MaskedLineEdit("", field_name="hostname", placeholder="0.0.0.0")
+        self.server_host.edit.editingFinished.connect(self._t("server"))
+        sform.addRow("Hostname", self.server_host)
+        self.server_mdns = QCheckBox("Enable mDNS discovery")
+        self.server_mdns.stateChanged.connect(self._t("server"))
+        sform.addRow("mDNS", self.server_mdns)
+        self.server_mdns_domain = MaskedLineEdit("", field_name="mdnsDomain", placeholder="opencode.local")
+        self.server_mdns_domain.edit.editingFinished.connect(self._t("server"))
+        sform.addRow("mDNS Domain", self.server_mdns_domain)
+        self.server_cors = StringListEdit(app, ["cors"], "origin")
+        sform.addRow("CORS origins", self.server_cors)
+        lay.addWidget(server_box)
+
+        # ---- Session ----
+        session_box = QGroupBox("Session (compaction / tool output)")
+        sform = QFormLayout(session_box)
+        self.comp_auto = QCheckBox("Auto-compact when context is full")
+        self.comp_auto.stateChanged.connect(self._t("compaction"))
+        sform.addRow("Compaction auto", self.comp_auto)
+        self.comp_prune = QCheckBox("Prune old tool outputs")
+        self.comp_prune.stateChanged.connect(self._t("compaction"))
+        sform.addRow("Compaction prune", self.comp_prune)
+        self.comp_reserved = self._spin(0)
+        sform.addRow("Compaction reserved", self.comp_reserved)
+        self.comp_tail = self._spin(0)
+        sform.addRow("Compaction tail turns", self.comp_tail)
+        self.comp_preserve = self._spin(0)
+        sform.addRow("Preserve recent tokens", self.comp_preserve)
+        self.tool_lines = self._spin(0)
+        sform.addRow("Tool output max lines", self.tool_lines)
+        self.tool_bytes = self._spin(0)
+        sform.addRow("Tool output max bytes", self.tool_bytes)
+        lay.addWidget(session_box)
+
+        # ---- Attachment ----
+        att_box = QGroupBox("Image attachments")
+        aform = QFormLayout(att_box)
+        self.att_resize = QCheckBox("Auto-resize oversized images")
+        self.att_resize.stateChanged.connect(self._t("attachment"))
+        aform.addRow("Auto resize", self.att_resize)
+        self.att_w = self._spin(0)
+        aform.addRow("Max width", self.att_w)
+        self.att_h = self._spin(0)
+        aform.addRow("Max height", self.att_h)
+        self.att_bytes = self._spin(0)
+        aform.addRow("Max base64 bytes", self.att_bytes)
+        lay.addWidget(att_box)
+
+        # ---- Advanced ----
+        adv_box = QGroupBox("Advanced")
+        aform = QFormLayout(adv_box)
+        self.formatter = BoolObjectCombo(app, "formatter")
+        self.formatter.combo.currentIndexChanged.connect(self._t("formatter"))
+        aform.addRow("Formatter", self.formatter)
+        self.lsp = BoolObjectCombo(app, "lsp")
+        self.lsp.combo.currentIndexChanged.connect(self._t("lsp"))
+        aform.addRow("LSP", self.lsp)
+        self.watcher_ignore = StringListEdit(app, ["watcher", "ignore"], "glob")
+        aform.addRow("Watcher ignore", self.watcher_ignore)
+        self.instructions = StringListEdit(app, ["instructions"], "path/glob")
+        aform.addRow("Instructions", self.instructions)
+        self.skills_paths = StringListEdit(app, ["skills", "paths"], "path")
+        aform.addRow("Skill paths", self.skills_paths)
+        self.skills_urls = StringListEdit(app, ["skills", "urls"], "url")
+        aform.addRow("Skill URLs", self.skills_urls)
+        self.tools = BoolMapEditor(app, ["tools"])
+        aform.addRow("Tools", self.tools)
+        lay.addWidget(adv_box)
+
+        # ---- Experimental ----
+        exp_box = QGroupBox("Experimental")
+        eform = QFormLayout(exp_box)
+        self.exp_disable_paste = QCheckBox("Disable paste summary")
+        self.exp_disable_paste.stateChanged.connect(self._t("experimental"))
+        eform.addRow("Disable paste summary", self.exp_disable_paste)
+        self.exp_batch = QCheckBox("Enable batch tool")
+        self.exp_batch.stateChanged.connect(self._t("experimental"))
+        eform.addRow("Batch tool", self.exp_batch)
+        self.exp_otel = QCheckBox("Enable OpenTelemetry spans")
+        self.exp_otel.stateChanged.connect(self._t("experimental"))
+        eform.addRow("OpenTelemetry", self.exp_otel)
+        self.exp_loop = QCheckBox("Continue loop on deny")
+        self.exp_loop.stateChanged.connect(self._t("experimental"))
+        eform.addRow("Continue loop on deny", self.exp_loop)
+        self.exp_mcp_timeout = self._spin(0)
+        eform.addRow("MCP timeout (ms)", self.exp_mcp_timeout)
+        self.exp_primary_tools = StringListEdit(app, ["experimental", "primary_tools"], "tool")
+        eform.addRow("Primary-only tools", self.exp_primary_tools)
+        eform.addRow("Policies", self._build_policies_table())
+        lay.addWidget(exp_box)
+        lay.addStretch(1)
+
+    # --- helpers ---
+    def _spin(self, lo=0):
+        s = QSpinBox()
+        s.setRange(lo, 2**31 - 1)
+        s.setSpecialValueText("(unset)")
+        s.valueChanged.connect(lambda *_: self.app.mark_dirty())
+        return s
+
+    def _build_policies_table(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.policies = QTableWidget(0, 3)
+        self.policies.setHorizontalHeaderLabels(["Effect", "Action", "Resource"])
+        self.policies.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.policies.itemChanged.connect(lambda *_: self._t("experimental")())
+        lay.addWidget(self.policies)
+        btns = QHBoxLayout()
+        addb = QPushButton("+")
+        addb.setFixedWidth(28)
+        addb.clicked.connect(self._add_policy)
+        remb = QPushButton("-")
+        remb.setFixedWidth(28)
+        remb.clicked.connect(self._remove_policy)
+        btns.addWidget(addb)
+        btns.addWidget(remb)
+        btns.addStretch(1)
+        lay.addLayout(btns)
+        return w
+
+    def _add_policy(self):
+        r = self.policies.rowCount()
+        self.policies.insertRow(r)
+        self.policies.setItem(r, 0, QTableWidgetItem("allow"))
+        self.policies.setItem(r, 1, QTableWidgetItem("provider.use"))
+        self.policies.setItem(r, 2, QTableWidgetItem(""))
+        self._t("experimental")()
+
+    def _remove_policy(self):
+        rows = sorted({i.row() for i in self.policies.selectedItems()}, reverse=True)
+        for r in rows:
+            self.policies.removeRow(r)
+        if rows:
+            self._t("experimental")()
+
+    # --- refresh ---
+    def refresh(self):
+        data = self.app.cfg.data if self.app.cfg else {}
+        server = data.get("server") if isinstance(data.get("server"), dict) else {}
+        self._set_spin(self.server_port, server.get("port"))
+        self.server_host.set_value(server.get("hostname", ""))
+        self._set_checked(self.server_mdns, server.get("mdns", False))
+        self.server_mdns_domain.set_value(server.get("mdnsDomain", ""))
+        self.server_cors.refresh()
+
+        comp = data.get("compaction") if isinstance(data.get("compaction"), dict) else {}
+        self._set_checked(self.comp_auto, comp.get("auto", True))
+        self._set_checked(self.comp_prune, comp.get("prune", False))
+        self._set_spin(self.comp_reserved, comp.get("reserved"))
+        self._set_spin(self.comp_tail, comp.get("tail_turns"))
+        self._set_spin(self.comp_preserve, comp.get("preserve_recent_tokens"))
+
+        toolo = data.get("tool_output") if isinstance(data.get("tool_output"), dict) else {}
+        self._set_spin(self.tool_lines, toolo.get("max_lines"))
+        self._set_spin(self.tool_bytes, toolo.get("max_bytes"))
+
+        att = data.get("attachment", {}).get("image") if isinstance(data.get("attachment"), dict) else None
+        att = att if isinstance(att, dict) else {}
+        self._set_checked(self.att_resize, att.get("auto_resize", True))
+        self._set_spin(self.att_w, att.get("max_width"))
+        self._set_spin(self.att_h, att.get("max_height"))
+        self._set_spin(self.att_bytes, att.get("max_base64_bytes"))
+
+        self.formatter.refresh()
+        self.lsp.refresh()
+        self.watcher_ignore.refresh()
+        self.instructions.refresh()
+        self.skills_paths.refresh()
+        self.skills_urls.refresh()
+        self.tools.refresh()
+
+        exp = data.get("experimental") if isinstance(data.get("experimental"), dict) else {}
+        self._set_checked(self.exp_disable_paste, exp.get("disable_paste_summary", False))
+        self._set_checked(self.exp_batch, exp.get("batch_tool", False))
+        self._set_checked(self.exp_otel, exp.get("openTelemetry", False))
+        self._set_checked(self.exp_loop, exp.get("continue_loop_on_deny", False))
+        self._set_spin(self.exp_mcp_timeout, exp.get("mcp_timeout"))
+        self.exp_primary_tools.refresh()
+        self.policies.blockSignals(True)
+        self.policies.setRowCount(0)
+        for pol in exp.get("policies", []) if isinstance(exp.get("policies"), list) else []:
+            if not isinstance(pol, dict):
+                continue
+            r = self.policies.rowCount()
+            self.policies.insertRow(r)
+            self.policies.setItem(r, 0, QTableWidgetItem(str(pol.get("effect", ""))))
+            self.policies.setItem(r, 1, QTableWidgetItem(str(pol.get("action", ""))))
+            self.policies.setItem(r, 2, QTableWidgetItem(str(pol.get("resource", ""))))
+        self.policies.blockSignals(False)
+
+    # --- collect ---
+    def collect(self, data):
+        if "server" in self._touched:
+            srv = data.setdefault("server", {})
+            if not isinstance(srv, dict):
+                data["server"] = srv = {}
+            self._put(srv, "port", self.server_port.value() or None, None)
+            self._put(srv, "hostname", self.server_host.value(), "")
+            self._put(srv, "mdns", self.server_mdns.isChecked(), None)
+            self._put(srv, "mdnsDomain", self.server_mdns_domain.value(), "")
+            self.server_cors.collect(srv)
+            if not srv:
+                data.pop("server", None)
+
+        if "compaction" in self._touched:
+            comp = data.setdefault("compaction", {})
+            self._put(comp, "auto", self.comp_auto.isChecked(), True)
+            self._put(comp, "prune", self.comp_prune.isChecked(), False)
+            self._put(comp, "reserved", self.comp_reserved.value() or None, None)
+            self._put(comp, "tail_turns", self.comp_tail.value() or None, None)
+            self._put(comp, "preserve_recent_tokens", self.comp_preserve.value() or None, None)
+            if not comp:
+                data.pop("compaction", None)
+
+        if "tool_output" in self._touched or "compaction" in self._touched:
+            toolo = data.setdefault("tool_output", {})
+            self._put(toolo, "max_lines", self.tool_lines.value() or None, None)
+            self._put(toolo, "max_bytes", self.tool_bytes.value() or None, None)
+            if not toolo:
+                data.pop("tool_output", None)
+
+        if "attachment" in self._touched:
+            att = data.setdefault("attachment", {}).setdefault("image", {})
+            self._put(att, "auto_resize", self.att_resize.isChecked(), True)
+            self._put(att, "max_width", self.att_w.value() or None, None)
+            self._put(att, "max_height", self.att_h.value() or None, None)
+            self._put(att, "max_base64_bytes", self.att_bytes.value() or None, None)
+            if not att:
+                data.get("attachment", {}).pop("image", None)
+            if not data.get("attachment", {}):
+                data.pop("attachment", None)
+
+        if "formatter" in self._touched:
+            self.formatter.collect(data)
+        if "lsp" in self._touched:
+            self.lsp.collect(data)
+
+        if "watcher" in self._touched or "instructions" in self._touched \
+                or "skills" in self._touched or "tools" in self._touched:
+            self.watcher_ignore.collect(data.setdefault("watcher", {}))
+            self.instructions.collect(data)
+            self.skills_paths.collect(data.setdefault("skills", {}))
+            self.skills_urls.collect(data.setdefault("skills", {}))
+            self.tools.collect(data)
+
+        if "experimental" in self._touched:
+            exp = data.setdefault("experimental", {})
+            self._put(exp, "disable_paste_summary", self.exp_disable_paste.isChecked(), False)
+            self._put(exp, "batch_tool", self.exp_batch.isChecked(), False)
+            self._put(exp, "openTelemetry", self.exp_otel.isChecked(), False)
+            self._put(exp, "continue_loop_on_deny", self.exp_loop.isChecked(), False)
+            self._put(exp, "mcp_timeout", self.exp_mcp_timeout.value() or None, None)
+            self.exp_primary_tools.collect(exp)
+            pols = []
+            for r in range(self.policies.rowCount()):
+                eff = self.policies.item(r, 0).text() if self.policies.item(r, 0) else ""
+                act = self.policies.item(r, 1).text() if self.policies.item(r, 1) else ""
+                res = self.policies.item(r, 2).text() if self.policies.item(r, 2) else ""
+                if act and res:
+                    pols.append({"effect": eff, "action": act, "resource": res})
+            self._put(exp, "policies", pols, [])
+            if not exp:
+                data.pop("experimental", None)
+
+        self._touched.clear()
+
+
+# Agents tab
+class AgentEditDialog(QDialog):
+    """Add/edit a custom agent."""
+
+    def __init__(self, parent=None, name="", cfg=None):
+        super().__init__(parent)
+        self.setWindowTitle("Agent")
+        self.setMinimumWidth(460)
+        cfg = cfg or {}
+
+        form = QFormLayout(self)
+        self.name_edit = QLineEdit(name)
+        form.addRow("Name", self.name_edit)
+        self.desc_edit = QLineEdit(cfg.get("description", ""))
+        form.addRow("Description", self.desc_edit)
+        self.model_edit = QLineEdit(cfg.get("model", "") or "")
+        form.addRow("Model", self.model_edit)
+        self.mode_combo = QComboBox()
+        for m in ["", "primary", "subagent", "all"]:
+            self.mode_combo.addItem(m or "(inherit)", m)
+        idx = self.mode_combo.findData(cfg.get("mode", ""))
+        self.mode_combo.setCurrentIndex(max(0, idx))
+        form.addRow("Mode", self.mode_combo)
+        self.prompt_edit = QPlainTextEdit(cfg.get("prompt", "") or "")
+        self.prompt_edit.setMaximumHeight(120)
+        form.addRow("Prompt", self.prompt_edit)
+        self.temp = self._double(-1000)
+        if isinstance(cfg.get("temperature"), (int, float)):
+            self.temp.setValue(cfg["temperature"])
+        form.addRow("Temperature", self.temp)
+        self.top_p = self._double(-1000)
+        if isinstance(cfg.get("top_p"), (int, float)):
+            self.top_p.setValue(cfg["top_p"])
+        form.addRow("Top P", self.top_p)
+        self.steps = QSpinBox()
+        self.steps.setRange(-1, 10**6)
+        self.steps.setSpecialValueText("(inherit)")
+        if isinstance(cfg.get("steps"), int):
+            self.steps.setValue(cfg["steps"])
+        form.addRow("Steps", self.steps)
+        self.hidden = QCheckBox("Hidden from @ menu")
+        self.hidden.setChecked(bool(cfg.get("hidden", False)))
+        form.addRow("Hidden", self.hidden)
+        self.disable = QCheckBox("Disabled")
+        self.disable.setChecked(bool(cfg.get("disable", False)))
+        form.addRow("Disable", self.disable)
+        self.color_edit = QLineEdit(cfg.get("color", "") or "")
+        form.addRow("Color", self.color_edit)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _double(self, sentinel):
+        d = QDoubleSpinBox()
+        d.setRange(-1000, 1000)
+        d.setDecimals(3)
+        d.setValue(sentinel)
+        d.setSpecialValueText("(inherit)")
+        return d
+
+    def values(self) -> dict:
+        out = {
+            "name": self.name_edit.text().strip(),
+            "description": self.desc_edit.text(),
+            "model": self.model_edit.text().strip(),
+            "mode": self.mode_combo.currentData() or "",
+            "prompt": self.prompt_edit.toPlainText(),
+            "hidden": self.hidden.isChecked(),
+            "disable": self.disable.isChecked(),
+            "color": self.color_edit.text().strip(),
+        }
+        if self.temp.value() != -1000:
+            out["temperature"] = self.temp.value()
+        if self.top_p.value() != -1000:
+            out["top_p"] = self.top_p.value()
+        if self.steps.value() != -1:
+            out["steps"] = self.steps.value()
+        return out
+
+
+class AgentsTab(QWidget):
+    """Manage `agent` definitions (custom + overrides of built-ins)."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search agents...")
+        self.search_edit.textChanged.connect(self._filter)
+        top.addWidget(self.search_edit)
+        for text, slot in [("+ Add", self._add), ("Edit", self._edit), ("Remove", self._remove)]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            top.addWidget(b)
+        lay.addLayout(top)
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Name", "Description", "Mode", "Model", "Actions"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        lay.addWidget(self.table)
+        self.status = QLabel()
+        lay.addWidget(self.status)
+
+    def _agents(self):
+        return self.app.cfg.data.get("agent", {}) if self.app.cfg else {}
+
+    def refresh(self):
+        self._update_table(self._agents())
+
+    def _filter(self, t):
+        if not t:
+            self.refresh()
+            return
+        t = t.lower()
+        self._update_table({n: c for n, c in self._agents().items() if t in n.lower()})
+
+    def _update_table(self, agents):
+        self.table.setRowCount(len(agents))
+        for row, (name, cfg) in enumerate(sorted(agents.items())):
+            if not isinstance(cfg, dict):
+                cfg = {}
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+            self.table.setItem(row, 1, QTableWidgetItem(cfg.get("description", "")))
+            self.table.setItem(row, 2, QTableWidgetItem(cfg.get("mode", "")))
+            self.table.setItem(row, 3, QTableWidgetItem(cfg.get("model", "") or ""))
+            w = QWidget()
+            l = QHBoxLayout(w)
+            l.setContentsMargins(0, 0, 0, 0)
+            eb = QPushButton("Edit")
+            eb.setFixedWidth(60)
+            eb.clicked.connect(lambda _, n=name: self._edit(n))
+            rb = QPushButton("Remove")
+            rb.setFixedWidth(70)
+            rb.clicked.connect(lambda _, n=name: self._remove(n))
+            l.addWidget(eb)
+            l.addWidget(rb)
+            self.table.setCellWidget(row, 4, w)
+        self.status.setText(f"{len(agents)} agents")
+
+    def _selected_name(self):
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select", "Select an agent first.")
+            return None
+        return self.table.item(sel[0].row(), 0).text()
+
+    def _add(self):
+        dlg = AgentEditDialog(self)
+        if dlg.exec() and dlg.values()["name"]:
+            v = dlg.values()
+            name = v.pop("name")
+            self.app.snapshot_state()
+            agents = self.app.cfg.data.setdefault("agent", {})
+            agents[name] = {k: val for k, val in v.items() if val not in (None, "")}
+            self.app.mark_dirty()
+            self.refresh()
+
+    def _edit(self, name=None):
+        if name is None:
+            name = self._selected_name()
+            if not name:
+                return
+        cfg = dict(self._agents().get(name, {}))
+        dlg = AgentEditDialog(self, name=name, cfg=cfg)
+        if dlg.exec():
+            v = dlg.values()
+            newname = v.pop("name") or name
+            self.app.snapshot_state()
+            agents = self.app.cfg.data.setdefault("agent", {})
+            merged = dict(cfg)  # preserve unknown keys (permission, options, tools, ...)
+            for k, val in v.items():
+                if val in (None, ""):
+                    merged.pop(k, None)
+                else:
+                    merged[k] = val
+            if newname != name:
+                agents.pop(name, None)
+            agents[newname] = merged
+            self.app.mark_dirty()
+            self.refresh()
+
+    def _remove(self, name=None):
+        if name is None:
+            name = self._selected_name()
+            if not name:
+                return
+        self.app.snapshot_state()
+        agents = self.app.cfg.data.setdefault("agent", {})
+        agents.pop(name, None)
+        if not agents:
+            self.app.cfg.data.pop("agent", None)
+        self.app.mark_dirty()
+        self.refresh()
+
+    def collect(self, data):
+        pass  # mutations applied live to cfg.data
+
+
+# Commands tab
+class CommandEditDialog(QDialog):
+    """Add/edit a custom command."""
+
+    def __init__(self, parent=None, name="", cfg=None):
+        super().__init__(parent)
+        self.setWindowTitle("Command")
+        self.setMinimumWidth(460)
+        cfg = cfg or {}
+        form = QFormLayout(self)
+        self.name_edit = QLineEdit(name)
+        form.addRow("Name", self.name_edit)
+        self.desc_edit = QLineEdit(cfg.get("description", ""))
+        form.addRow("Description", self.desc_edit)
+        self.agent_edit = QLineEdit(cfg.get("agent", ""))
+        form.addRow("Agent", self.agent_edit)
+        self.model_edit = QLineEdit(cfg.get("model", "") or "")
+        form.addRow("Model", self.model_edit)
+        self.variant_edit = QLineEdit(cfg.get("variant", ""))
+        form.addRow("Variant", self.variant_edit)
+        self.subtask = QCheckBox("Run as subtask")
+        self.subtask.setChecked(bool(cfg.get("subtask", False)))
+        form.addRow("Subtask", self.subtask)
+        self.template_edit = QPlainTextEdit(cfg.get("template", "") or "")
+        self.template_edit.setMaximumHeight(150)
+        form.addRow("Template", self.template_edit)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def values(self) -> dict:
+        return {
+            "name": self.name_edit.text().strip(),
+            "description": self.desc_edit.text(),
+            "agent": self.agent_edit.text().strip(),
+            "model": self.model_edit.text().strip(),
+            "variant": self.variant_edit.text().strip(),
+            "subtask": self.subtask.isChecked(),
+            "template": self.template_edit.toPlainText(),
+        }
+
+
+class CommandsTab(QWidget):
+    """Manage `command` definitions (reusable slash commands)."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search commands...")
+        self.search_edit.textChanged.connect(self._filter)
+        top.addWidget(self.search_edit)
+        for text, slot in [("+ Add", self._add), ("Edit", self._edit), ("Remove", self._remove)]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            top.addWidget(b)
+        lay.addLayout(top)
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Name", "Description", "Agent", "Model"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        lay.addWidget(self.table)
+        self.status = QLabel()
+        lay.addWidget(self.status)
+
+    def _commands(self):
+        return self.app.cfg.data.get("command", {}) if self.app.cfg else {}
+
+    def refresh(self):
+        self._update_table(self._commands())
+
+    def _filter(self, t):
+        if not t:
+            self.refresh()
+            return
+        t = t.lower()
+        self._update_table({n: c for n, c in self._commands().items() if t in n.lower()})
+
+    def _update_table(self, commands):
+        self.table.setRowCount(len(commands))
+        for row, (name, cfg) in enumerate(sorted(commands.items())):
+            if not isinstance(cfg, dict):
+                cfg = {}
+            self.table.setItem(row, 0, QTableWidgetItem(name))
+            self.table.setItem(row, 1, QTableWidgetItem(cfg.get("description", "")))
+            self.table.setItem(row, 2, QTableWidgetItem(cfg.get("agent", "")))
+            self.table.setItem(row, 3, QTableWidgetItem(cfg.get("model", "") or ""))
+            w = QWidget()
+            l = QHBoxLayout(w)
+            l.setContentsMargins(0, 0, 0, 0)
+            eb = QPushButton("Edit")
+            eb.setFixedWidth(60)
+            eb.clicked.connect(lambda _, n=name: self._edit(n))
+            rb = QPushButton("Remove")
+            rb.setFixedWidth(70)
+            rb.clicked.connect(lambda _, n=name: self._remove(n))
+            l.addWidget(eb)
+            l.addWidget(rb)
+            self.table.setCellWidget(row, 4, w)
+        self.status.setText(f"{len(commands)} commands")
+
+    def _selected_name(self):
+        sel = self.table.selectionModel().selectedRows()
+        if not sel:
+            QMessageBox.information(self, "Select", "Select a command first.")
+            return None
+        return self.table.item(sel[0].row(), 0).text()
+
+    def _add(self):
+        dlg = CommandEditDialog(self)
+        if dlg.exec() and dlg.values()["name"] and dlg.values()["template"]:
+            v = dlg.values()
+            name = v.pop("name")
+            self.app.snapshot_state()
+            commands = self.app.cfg.data.setdefault("command", {})
+            commands[name] = {k: val for k, val in v.items() if val not in (None, "")}
+            self.app.mark_dirty()
+            self.refresh()
+
+    def _edit(self, name=None):
+        if name is None:
+            name = self._selected_name()
+            if not name:
+                return
+        cfg = dict(self._commands().get(name, {}))
+        dlg = CommandEditDialog(self, name=name, cfg=cfg)
+        if dlg.exec() and dlg.values()["template"]:
+            v = dlg.values()
+            newname = v.pop("name") or name
+            self.app.snapshot_state()
+            commands = self.app.cfg.data.setdefault("command", {})
+            merged = {k: val for k, val in v.items() if val not in (None, "")}
+            if newname != name:
+                commands.pop(name, None)
+            commands[newname] = merged
+            self.app.mark_dirty()
+            self.refresh()
+
+    def _remove(self, name=None):
+        if name is None:
+            name = self._selected_name()
+            if not name:
+                return
+        self.app.snapshot_state()
+        commands = self.app.cfg.data.setdefault("command", {})
+        commands.pop(name, None)
+        if not commands:
+            self.app.cfg.data.pop("command", None)
+        self.app.mark_dirty()
+        self.refresh()
+
+    def collect(self, data):
+        pass  # mutations applied live to cfg.data
+
+
+# TUI tab
+class TuiPluginEditor(QWidget):
+    """Manage the tui.json `plugin` list + `plugin_enabled` state map.
+
+    The `plugin` list entries may be plain strings or `[name, {opts}]` tuples;
+    tuple-form options are preserved verbatim. A plugin is disabled by setting
+    `plugin_enabled[name] = false` (it stays in the `plugin` list, so the
+    disabled state is remembered and can be re-enabled — mirroring the
+    settings.json PluginsTab behaviour).
+    """
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.cbs = {}
+        self.state_store = TuiPluginStateStore()
+        self._entry_map = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        top = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search plugins...")
+        self.search_edit.textChanged.connect(self._filter)
+        top.addWidget(self.search_edit)
+        for text, slot in [("+ Add", self._add), ("Remove", self._remove),
+                           ("Enable All", lambda: self._set_all(True)),
+                           ("Disable All", lambda: self._set_all(False))]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            top.addWidget(b)
+        lay.addLayout(top)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Enabled", "Plugin", "Options"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        lay.addWidget(self.table)
+
+        self.status = QLabel("Disabled plugins stay enabled/disabled via the editor cache "
+                             "(no new attribute is written into tui.json).")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color: gray;")
+        lay.addWidget(self.status)
+
+    @staticmethod
+    def _name_of(entry):
+        if isinstance(entry, str):
+            return entry
+        if isinstance(entry, list) and entry and isinstance(entry[0], str):
+            return entry[0]
+        return ""
+
+    @staticmethod
+    def _opts_of(entry):
+        if isinstance(entry, list) and len(entry) >= 2 and isinstance(entry[1], dict):
+            return entry[1]
+        return None
+
+    @property
+    def _data(self):
+        return self.app.cfg_tui.data if self.app.cfg_tui else {}
+
+    def _entries(self):
+        plugin = self._data.get("plugin", [])
+        return plugin if isinstance(plugin, list) else []
+
+    def _cfg_path(self):
+        return self.app.cfg_tui.path if self.app.cfg_tui else None
+
+    def _active_names(self):
+        return {self._name_of(e) for e in self._entries()}
+
+    def _is_enabled(self, name):
+        return name in self._active_names()
+
+    def _migrate_file_flag(self):
+        data = self._data
+        path = self._cfg_path()
+        if path is None or not isinstance(data.get("plugin_enabled"), dict):
+            return
+        flagged = {n for n, v in data["plugin_enabled"].items() if v is False}
+        plugin = data.get("plugin", [])
+        if flagged:
+            kept = []
+            for entry in plugin:
+                name = self._name_of(entry)
+                if name in flagged:
+                    self.state_store.set_entry(path, name, entry)
+                else:
+                    kept.append(entry)
+            if kept:
+                data["plugin"] = kept
+            else:
+                data.pop("plugin", None)
+        data.pop("plugin_enabled", None)
+
+    def _display_entries(self):
+        path = self._cfg_path()
+        store = self.state_store.get_entries(path) if path else {}
+        active = list(self._entries())
+        active_names = {self._name_of(e) for e in active}
+        for name in sorted(store.keys()):
+            if name not in active_names:
+                active.append(store[name])
+        return active
+
+    def refresh(self):
+        self._migrate_file_flag()
+        path = self._cfg_path()
+        if path is not None:
+            active_names = self._active_names()
+            stale = [n for n in self.state_store.get_entries(path) if n in active_names]
+            if stale:
+                self.state_store.clear(path, stale)
+        self._update_table(self._display_entries())
+
+    def _filter(self, text):
+        if not text:
+            self.refresh()
+            return
+        text = text.lower()
+        entries = [e for e in self._display_entries() if text in self._name_of(e).lower()]
+        self._update_table(entries)
+
+    def _update_table(self, entries):
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(entries))
+        self.cbs = {}
+        self._entry_map = {}
+        for row, entry in enumerate(entries):
+            name = self._name_of(entry)
+            opts = self._opts_of(entry)
+            self._entry_map[name] = entry
+
+            cb = QCheckBox()
+            cb.setChecked(self._is_enabled(name))
+            cb.stateChanged.connect(lambda _, n=name: self._toggle(n))
+            cell = QWidget()
+            cl = QHBoxLayout(cell)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setAlignment(Qt.AlignCenter)
+            cl.addWidget(cb)
+            self.table.setCellWidget(row, 0, cell)
+            self.cbs[name] = cb
+
+            self.table.setItem(row, 1, QTableWidgetItem(name))
+            self.table.setItem(row, 2, QTableWidgetItem(
+                "(custom options)" if opts is not None else ""))
+        self.table.blockSignals(False)
+        self._update_status()
+
+    def _update_status(self):
+        n = self.table.rowCount()
+        en = sum(1 for cb in self.cbs.values() if cb.isChecked())
+        self.status.setText(f"{n} plugins ({en} enabled)")
+
+    def _toggle(self, name: str):
+        path = self._cfg_path()
+        if path is None:
+            return
+        self.app.snapshot_state("tui")
+        entry = self._entry_map.get(name, name)
+        if self.cbs[name].isChecked():
+            plugin = self._data.setdefault("plugin", [])
+            if not isinstance(plugin, list):
+                plugin = self._data["plugin"] = []
+            if all(self._name_of(e) != name for e in plugin):
+                plugin.append(entry)
+            self.state_store.remove_entry(path, name)
+        else:
+            plugin = [e for e in self._data.get("plugin", []) if self._name_of(e) != name]
+            if plugin:
+                self._data["plugin"] = plugin
+            else:
+                self._data.pop("plugin", None)
+            self.state_store.set_entry(path, name, entry)
+        self.app.mark_dirty("tui")
+        self._update_status()
+
+    def _set_all(self, enabled: bool):
+        path = self._cfg_path()
+        if path is None:
+            return
+        self.app.snapshot_state("tui")
+        if enabled:
+            store = self.state_store.get_entries(path)
+            plugin = self._data.setdefault("plugin", [])
+            if not isinstance(plugin, list):
+                plugin = self._data["plugin"] = []
+            active_names = {self._name_of(e) for e in plugin}
+            for name, entry in store.items():
+                if name not in active_names:
+                    plugin.append(entry)
+            self.state_store.clear(path)
+        else:
+            for entry in self._data.get("plugin", []):
+                name = self._name_of(entry)
+                if name:
+                    self.state_store.set_entry(path, name, entry)
+            self._data.pop("plugin", None)
+        for cb in self.cbs.values():
+            cb.blockSignals(True)
+            cb.setChecked(enabled)
+            cb.blockSignals(False)
+        self.app.mark_dirty("tui")
+        self._update_status()
+
+    def _add(self):
+        name, ok = QInputDialog.getText(self, "Add Plugin", "Plugin (npm spec):",
+                                        QLineEdit.Normal, "@opencode/plugin-example")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        all_names = {self._name_of(e) for e in self._display_entries()}
+        if name in all_names:
+            QMessageBox.warning(self, "Error", f"Plugin '{name}' already exists")
+            return
+        self.app.snapshot_state("tui")
+        path = self._cfg_path()
+        if path is not None:
+            self.state_store.remove_entry(path, name)
+        plugin = self._data.setdefault("plugin", [])
+        if not isinstance(plugin, list):
+            plugin = self._data["plugin"] = []
+        plugin.append(name)
+        self.app.mark_dirty("tui")
+        self.refresh()
+
+    def _remove(self):
+        rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
+        if not rows:
+            QMessageBox.information(self, "Remove", "Select plugins to remove first.")
+            return
+        if not _confirm(self, "Remove Plugins", f"Remove {len(rows)} selected plugins?"):
+            return
+        self.app.snapshot_state("tui")
+        names = {self.table.item(r, 1).text() if self.table.item(r, 1) else "" for r in rows}
+        plugin = [e for e in self._data.get("plugin", []) if self._name_of(e) not in names]
+        if plugin:
+            self._data["plugin"] = plugin
+        else:
+            self._data.pop("plugin", None)
+        path = self._cfg_path()
+        if path is not None:
+            self.state_store.clear(path, names)
+        self.app.mark_dirty("tui")
+        self.refresh()
+
+    def collect(self, data):
+        data.pop("plugin_enabled", None)
+
+
+class TuiTab(BaseTab):
+    """Editor for the tui.json schema."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        form = QFormLayout(self)
+
+        self.schema_edit = MaskedLineEdit("", field_name="schema")
+        self.schema_edit.edit.editingFinished.connect(self._t("schema"))
+        form.addRow("$schema", self.schema_edit)
+
+        self.theme_edit = MaskedLineEdit("", field_name="theme")
+        self.theme_edit.edit.editingFinished.connect(self._t("theme"))
+        form.addRow("Theme", self.theme_edit)
+
+        self.diff_combo = QComboBox()
+        for x in ["", "auto", "stacked"]:
+            self.diff_combo.addItem(x or "(auto)", x)
+        self.diff_combo.currentIndexChanged.connect(self._t("diff"))
+        form.addRow("Diff style", self.diff_combo)
+
+        self.mouse = QCheckBox("Enable mouse capture")
+        self.mouse.stateChanged.connect(self._t("mouse"))
+        form.addRow("Mouse", self.mouse)
+
+        self.scroll_speed = QDoubleSpinBox()
+        self.scroll_speed.setRange(0.001, 1000)
+        self.scroll_speed.setDecimals(3)
+        self.scroll_speed.setValue(1.0)
+        self.scroll_speed.valueChanged.connect(self._t("scroll"))
+        form.addRow("Scroll speed", self.scroll_speed)
+
+        self.scroll_acc = QCheckBox("Enable scroll acceleration")
+        self.scroll_acc.stateChanged.connect(self._t("scroll"))
+        form.addRow("Scroll acceleration", self.scroll_acc)
+
+        self.cursor_style = QComboBox()
+        for x in ["", "block", "underline", "line", "default"]:
+            self.cursor_style.addItem(x or "(inherit)", x)
+        self.cursor_style.currentIndexChanged.connect(self._t("cursor"))
+        form.addRow("Cursor style", self.cursor_style)
+
+        self.cursor_blink = QCheckBox("Blinking cursor")
+        self.cursor_blink.stateChanged.connect(self._t("cursor"))
+        form.addRow("Cursor blinking", self.cursor_blink)
+
+        self.leader_timeout = QSpinBox()
+        self.leader_timeout.setRange(0, 10**6)
+        self.leader_timeout.setSpecialValueText("(unset)")
+        self.leader_timeout.valueChanged.connect(self._t("leader"))
+        form.addRow("Leader timeout (ms)", self.leader_timeout)
+
+        att = QGroupBox("Attention")
+        aform = QFormLayout(att)
+        self.att_enabled = QCheckBox("Enabled")
+        self.att_enabled.stateChanged.connect(self._t("attention"))
+        aform.addRow("Enabled", self.att_enabled)
+        self.att_notif = QCheckBox("Notifications")
+        self.att_notif.stateChanged.connect(self._t("attention"))
+        aform.addRow("Notifications", self.att_notif)
+        self.att_sound = QCheckBox("Sound")
+        self.att_sound.stateChanged.connect(self._t("attention"))
+        aform.addRow("Sound", self.att_sound)
+        self.att_volume = QDoubleSpinBox()
+        self.att_volume.setRange(0, 1)
+        self.att_volume.setDecimals(2)
+        self.att_volume.setValue(0.4)
+        self.att_volume.valueChanged.connect(self._t("attention"))
+        aform.addRow("Volume", self.att_volume)
+        form.addRow(att)
+
+        self.prompt_h = QSpinBox()
+        self.prompt_h.setRange(0, 10**6)
+        self.prompt_h.setSpecialValueText("(unset)")
+        self.prompt_h.valueChanged.connect(self._t("prompt"))
+        form.addRow("Prompt max height", self.prompt_h)
+
+        self.prompt_w = QSpinBox()
+        self.prompt_w.setRange(0, 10**6)
+        self.prompt_w.setSpecialValueText("(auto)")
+        self.prompt_w.valueChanged.connect(self._t("prompt"))
+        form.addRow("Prompt max width", self.prompt_w)
+
+        self.plugins = TuiPluginEditor(app)
+        form.addRow("Plugins", self.plugins)
+
+        info = QLabel("The `keybinds` map is edited in the Raw JSON tab.")
+        info.setWordWrap(True)
+        form.addRow(info)
+
+    def _t(self, group):
+        def _h(*_):
+            self._touched.add(group)
+            self.app.mark_dirty("tui")
+        return _h
+
+    def refresh(self):
+        data = self.app.cfg_tui.data if self.app.cfg_tui else {}
+        self.schema_edit.set_value(data.get("$schema", ""))
+        self.theme_edit.set_value(data.get("theme", ""))
+        self._set_combo(self.diff_combo, data.get("diff_style", ""), 0)
+        self._set_checked(self.mouse, data.get("mouse", True))
+        self._set_double(self.scroll_speed, data.get("scroll_speed", 1.0))
+        acc = data.get("scroll_acceleration") if isinstance(data.get("scroll_acceleration"), dict) else {}
+        self._set_checked(self.scroll_acc, acc.get("enabled", False))
+        cursor = data.get("cursor") if isinstance(data.get("cursor"), dict) else {}
+        self._set_combo(self.cursor_style, cursor.get("style", ""), 0)
+        self._set_checked(self.cursor_blink, cursor.get("blinking", False))
+        self._set_spin(self.leader_timeout, data.get("leader_timeout"))
+        att = data.get("attention") if isinstance(data.get("attention"), dict) else {}
+        self._set_checked(self.att_enabled, att.get("enabled", False))
+        self._set_checked(self.att_notif, att.get("notifications", False))
+        self._set_checked(self.att_sound, att.get("sound", False))
+        self._set_double(self.att_volume, att.get("volume", 0.4))
+        prompt = data.get("prompt") if isinstance(data.get("prompt"), dict) else {}
+        self._set_spin(self.prompt_h, prompt.get("max_height"))
+        self._set_spin(self.prompt_w, prompt.get("max_width"))
+        self.plugins.refresh()
+
+    def collect(self, data):
+        if "schema" in self._touched:
+            v = self.schema_edit.value()
+            data["$schema"] = v if v else None
+            if not v:
+                data.pop("$schema", None)
+        if "theme" in self._touched:
+            self._put(data, "theme", self.theme_edit.value(), "")
+        if "diff" in self._touched:
+            self._put(data, "diff_style", self.diff_combo.currentData() or "", "")
+        if "mouse" in self._touched:
+            data["mouse"] = self.mouse.isChecked()
+        if "scroll" in self._touched:
+            self._put(data, "scroll_speed", self.scroll_speed.value(), 1.0)
+            self._put(data, "scroll_acceleration",
+                      {"enabled": self.scroll_acc.isChecked()} if self.scroll_acc.isChecked() else None, None)
+        if "cursor" in self._touched:
+            cursor = data.setdefault("cursor", {})
+            self._put(cursor, "style", self.cursor_style.currentData() or "", "")
+            self._put(cursor, "blinking", self.cursor_blink.isChecked(), False)
+            if not cursor:
+                data.pop("cursor", None)
+        if "leader" in self._touched:
+            self._put(data, "leader_timeout", self.leader_timeout.value() or None, None)
+        if "attention" in self._touched:
+            att = data.setdefault("attention", {})
+            self._put(att, "enabled", self.att_enabled.isChecked(), False)
+            self._put(att, "notifications", self.att_notif.isChecked(), False)
+            self._put(att, "sound", self.att_sound.isChecked(), False)
+            self._put(att, "volume", self.att_volume.value(), 0.4)
+            if not att:
+                data.pop("attention", None)
+        if "prompt" in self._touched:
+            prompt = data.setdefault("prompt", {})
+            self._put(prompt, "max_height", self.prompt_h.value() or None, None)
+            self._put(prompt, "max_width", self.prompt_w.value() or None, None)
+            if not prompt:
+                data.pop("prompt", None)
+        self.plugins.collect(data)
+        self._touched.clear()
+
+
+# General tab
+class GeneralTab(QWidget):
+    """Enhanced general tab with validation"""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+        layout = QFormLayout(self)
+
+        # Schema
+        self.schema_edit = MaskedLineEdit("", field_name="schema")
+        self.schema_edit.edit.editingFinished.connect(self.app.mark_dirty)
+        layout.addRow("$schema", self.schema_edit)
+
+        # Autoupdate: true | false | "notify"
+        self.autoupdate_combo = QComboBox()
+        for label, val in [("Off (false)", False), ("On (true)", True), ("Notify (\"notify\")", "notify")]:
+            self.autoupdate_combo.addItem(label, val)
+        self.autoupdate_combo.currentIndexChanged.connect(self.app.mark_dirty)
+        layout.addRow("Autoupdate", self.autoupdate_combo)
+
+        # Default model
+        self.model_edit = MaskedLineEdit("", field_name="model")
+        self.model_edit.edit.editingFinished.connect(self.app.mark_dirty)
+        layout.addRow("Default Model", self.model_edit)
+
+        # Small model
+        self.small_model_edit = MaskedLineEdit("", field_name="small_model")
+        self.small_model_edit.edit.editingFinished.connect(self.app.mark_dirty)
+        layout.addRow("Small Model", self.small_model_edit)
+
+        # Default agent
+        self.default_agent_edit = MaskedLineEdit("", field_name="default_agent")
+        self.default_agent_edit.edit.editingFinished.connect(self.app.mark_dirty)
+        layout.addRow("Default Agent", self.default_agent_edit)
+
+        # Subagent depth
+        self.subagent_depth = QSpinBox()
+        self.subagent_depth.setRange(0, 100)
+        self.subagent_depth.setSpecialValueText("(default)")
+        self.subagent_depth.valueChanged.connect(self._depth_changed)
+        layout.addRow("Subagent Depth", self.subagent_depth)
+        self._depth_touched = False
+
+        # Username
+        self.username_edit = MaskedLineEdit("", field_name="username")
+        self.username_edit.edit.editingFinished.connect(self.app.mark_dirty)
+        layout.addRow("Username", self.username_edit)
+
+        # Shell
+        self.shell_edit = MaskedLineEdit("", field_name="shell")
+        self.shell_edit.edit.editingFinished.connect(self.app.mark_dirty)
+        layout.addRow("Shell", self.shell_edit)
+
+        # Log level
+        self.loglevel_combo = QComboBox()
+        for label, val in [("(default)", ""), ("DEBUG", "DEBUG"), ("INFO", "INFO"),
+                           ("WARN", "WARN"), ("ERROR", "ERROR")]:
+            self.loglevel_combo.addItem(label, val)
+        self.loglevel_combo.currentIndexChanged.connect(self.app.mark_dirty)
+        layout.addRow("Log Level", self.loglevel_combo)
+
+        # Share
+        self.share_combo = QComboBox()
+        for label, val in [("(default)", ""), ("true", "true"), ("false", "false")]:
+            self.share_combo.addItem(label, val)
+        self.share_combo.currentIndexChanged.connect(self.app.mark_dirty)
+        layout.addRow("Share", self.share_combo)
+
+        # Snapshot (experimental)
+        self.snapshot_check = QCheckBox("Enable snapshot caching")
+        self.snapshot_check.stateChanged.connect(self._snapshot_changed)
+        layout.addRow("Snapshot", self.snapshot_check)
+        self._snapshot_touched = False
+
+        # Disabled providers
+        self.disabled_providers = StringListEdit(app, ["disabled_providers"], "provider")
+        layout.addRow("Disabled Providers", self.disabled_providers)
+
+        # Enabled providers
+        self.enabled_providers = StringListEdit(app, ["enabled_providers"], "provider")
+        layout.addRow("Enabled Providers", self.enabled_providers)
+
+        # Info
+        info_label = QLabel(
+            "Runtime, agents, commands, providers, MCP, plugins, permission and "
+            "TUI settings have their own tabs. Remaining options are editable in "
+            "the Raw JSON tab."
+        )
+        info_label.setWordWrap(True)
+        layout.addRow(info_label)
+
+    def _depth_changed(self):
+        self._depth_touched = True
+        self.app.mark_dirty()
+
+    def _snapshot_changed(self):
+        self._snapshot_touched = True
+        self.app.mark_dirty()
+
+    def refresh(self):
+        """Refresh fields with current data (signals blocked so programmatic
+        population does not mark the document dirty)."""
+        data = self.app.cfg.data if self.app.cfg else {}
+        self.schema_edit.set_value(data.get("$schema", ""))
+        au = data.get("autoupdate")
+        idx = 0 if au is False or au is None else (1 if au is True else 2)
+        self.autoupdate_combo.blockSignals(True)
+        self.autoupdate_combo.setCurrentIndex(idx)
+        self.autoupdate_combo.blockSignals(False)
+        self.model_edit.set_value(data.get("model", ""))
+        self.small_model_edit.set_value(data.get("small_model", ""))
+        self.default_agent_edit.set_value(data.get("default_agent", ""))
+        self._depth_touched = False
+        self.subagent_depth.blockSignals(True)
+        self.subagent_depth.setValue(int(data["subagent_depth"]) if isinstance(data.get("subagent_depth"), int) else 0)
+        self.subagent_depth.blockSignals(False)
+        self.username_edit.set_value(data.get("username", ""))
+        self.shell_edit.set_value(data.get("shell", ""))
+        ll = data.get("logLevel", "")
+        ll_idx = self.loglevel_combo.findData(ll)
+        self.loglevel_combo.blockSignals(True)
+        self.loglevel_combo.setCurrentIndex(ll_idx if ll_idx >= 0 else 0)
+        self.loglevel_combo.blockSignals(False)
+        sh = data.get("share")
+        sh_idx = self.share_combo.findData("true" if sh is True else ("false" if sh is False else ""))
+        self.share_combo.blockSignals(True)
+        self.share_combo.setCurrentIndex(sh_idx if sh_idx >= 0 else 0)
+        self.share_combo.blockSignals(False)
+        self._snapshot_touched = False
+        self.snapshot_check.blockSignals(True)
+        self.snapshot_check.setChecked(bool(data.get("snapshot", False)))
+        self.snapshot_check.blockSignals(False)
+        self.disabled_providers.refresh()
+        self.enabled_providers.refresh()
+
+    def collect(self, data: dict):
+        """Collect data from UI (struct-tab, so combos always round-trip)."""
+        if self.schema_edit.value():
+            data["$schema"] = self.schema_edit.value()
+
+        au = self.autoupdate_combo.currentData()
+        if au is False:
+            data.pop("autoupdate", None)
+        else:
+            data["autoupdate"] = au
+
+        for key, edit in [
+            ("model", self.model_edit),
+            ("small_model", self.small_model_edit),
+            ("default_agent", self.default_agent_edit),
+            ("username", self.username_edit),
+            ("shell", self.shell_edit),
+        ]:
+            value = edit.value()
+            if value:
+                data[key] = value
+            else:
+                data.pop(key, None)
+
+        if self._depth_touched:
+            data["subagent_depth"] = self.subagent_depth.value()
+
+        ll = self.loglevel_combo.currentData()
+        if ll:
+            data["logLevel"] = ll
+        else:
+            data.pop("logLevel", None)
+
+        sh = self.share_combo.currentData()
+        if sh == "true":
+            data["share"] = True
+        elif sh == "false":
+            data["share"] = False
+        else:
+            data.pop("share", None)
+
+        if self._snapshot_touched:
+            if self.snapshot_check.isChecked():
+                data["snapshot"] = True
+            else:
+                data.pop("snapshot", None)
+
+        self.disabled_providers.collect(data)
+        self.enabled_providers.collect(data)
+
+# Raw JSON tab and shared confirm helper
+class RawJsonTab(QWidget):
+    """Enhanced raw JSON editor with validation and formatting"""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self._raw_kind = "opencode"
+
+        layout = QVBoxLayout(self)
+
+        toolbar = QHBoxLayout()
+        self.file_combo = QComboBox()
+        self.file_combo.addItem("opencode.json", "opencode")
+        self.file_combo.addItem("tui.json", "tui")
+        self.file_combo.currentIndexChanged.connect(self._switch_file)
+        toolbar.addWidget(QLabel(" Raw: "))
+        toolbar.addWidget(self.file_combo)
+
+        format_btn = QPushButton("Pretty Print")
+        format_btn.clicked.connect(self._format_json)
+        toolbar.addWidget(format_btn)
+
+        validate_btn = QPushButton("Validate")
+        validate_btn.clicked.connect(self._validate)
+        toolbar.addWidget(validate_btn)
+
+        toolbar.addStretch()
+
+        self.status_label = QLabel()
+        toolbar.addWidget(self.status_label)
+
+        layout.addLayout(toolbar)
+
+        self.editor = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = JSONHighlighter(self.editor.document())
+        self.editor.textChanged.connect(self._debounced_validate)
+        self._modified = False
+        layout.addWidget(self.editor)
+
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._validate)
+
+    @property
+    def _modified(self):
+        return self.__modified
+
+    @_modified.setter
+    def _modified(self, val):
+        self.__modified = val
+
+    def _switch_file(self):
+        self.app._raw_kind = self.file_combo.currentData()
+        self.refresh()
+
+    def _debounced_validate(self):
+        self._modified = True
+        self.app.mark_dirty(self.app._raw_kind)
+        self._timer.start()
+
+    def _format_json(self):
+        """Format JSON with pretty printing"""
+        try:
+            data = json.loads(self.editor.toPlainText())
+            self.editor.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+            self._validate()
+        except json.JSONDecodeError as e:
+            self._set_status(f"Invalid JSON: {e}", "red")
+
+    def _validate(self):
+        text = self.editor.toPlainText()
+        if not text.strip():
+            self._set_status("Empty document", "gray")
+            return
+        kind = self.app._raw_kind
+        cfg = self.app.cfg_tui if kind == "tui" else self.app.cfg_oc
+        if cfg is None:
+            self._set_status("No file loaded", "gray")
+            return
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as e:
+            self._set_status(f"Invalid JSON: {e}", "red")
+            return
+        hard_ok, hard, warnings = self.app.validate(text, kind)
+        if not hard_ok:
+            self._set_status(f"{len(hard)} issue(s)", "red")
+            self.editor.setToolTip("\n".join(hard[:10]))
+        elif warnings:
+            self._set_status(f"Valid ✓ ({len(warnings)} schema notes)", "orange")
+            self.editor.setToolTip("\n".join(warnings[:10]))
+        else:
+            self._set_status("Valid ✓", "green")
+            self.editor.setToolTip("")
+
+    def _set_status(self, text: str, color: str):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def refresh(self):
+        kind = self.app._raw_kind
+        cfg = self.app.cfg_tui if kind == "tui" else self.app.cfg_oc
+        if cfg is None:
+            self.editor.blockSignals(True)
+            self.editor.setPlainText("")
+            self.editor.blockSignals(False)
+            self._modified = False
+            return
+        self.file_combo.blockSignals(True)
+        idx = self.file_combo.findData(kind)
+        self.file_combo.setCurrentIndex(max(0, idx))
+        self.file_combo.blockSignals(False)
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(json.dumps(cfg.data, indent=2, ensure_ascii=False))
+        self.editor.blockSignals(False)
+        self._modified = False
+        self._validate()
+
+    def collect(self, data: dict):
+        try:
+            parsed = json.loads(self.editor.toPlainText())
+            data.clear()
+            data.update(parsed)
+        except json.JSONDecodeError:
+            pass
+
+def _confirm(parent, title: str, text: str) -> bool:
+    """Show confirmation dialog"""
+    return QMessageBox.question(
+        parent, title, text,
+        QMessageBox.Yes | QMessageBox.No
+    ) == QMessageBox.Yes
+
+# opencode adapter: registers the built-in opencode/tui config surface with the
+# adapter registry. Kept as a distinct module so a second agent (openclaude, …)
+# lives in its own sibling adapter module without touching this one or core.
+
+def _opencode_targets(cwd):
+    home = Path.home()
+    proj_dir = cwd / ".opencode"
+    return [
+        ("Global opencode.json", home / ".config" / "opencode" / "opencode.json", "opencode"),
+        ("Project opencode.json",
+         (proj_dir / "opencode.json") if (proj_dir / "opencode.json").exists() else (cwd / "opencode.json"),
+         "opencode"),
+        ("Global tui.json", home / ".config" / "opencode" / "tui.json", "tui"),
+        ("Project tui.json",
+         (proj_dir / "tui.json") if (proj_dir / "tui.json").exists() else (cwd / "tui.json"),
+         "tui"),
+    ]
+
+
+def _opencode_make_tabs(win):
+    """Instantiate the opencode tabs on `win` and return [(tab, title, kind)].
+
+    Named attributes (win.tab_providers, …) are kept because the menu wiring
+    references them directly; win._oc_tabs lists the tabs that feed opencode.json.
+    """
+    win.tab_general = GeneralTab(win)
+    win.tab_runtime = RuntimeTab(win)
+    win.tab_agents = AgentsTab(win)
+    win.tab_commands = CommandsTab(win)
+    win.tab_providers = ProvidersTab(win)
+    win.tab_mcp = McpTab(win)
+    win.tab_plugins = PluginsTab(win)
+    win.tab_permission = PermissionTab(win)
+    win.tab_tui = TuiTab(win)
+    win.tab_raw = RawJsonTab(win)
+    win._oc_tabs = [win.tab_general, win.tab_runtime, win.tab_agents,
+                    win.tab_commands, win.tab_providers, win.tab_mcp,
+                    win.tab_plugins, win.tab_permission]
+    return [
+        (win.tab_general, "General", "opencode"),
+        (win.tab_runtime, "Runtime", "opencode"),
+        (win.tab_agents, "Agents", "opencode"),
+        (win.tab_commands, "Commands", "opencode"),
+        (win.tab_providers, "Providers", "opencode"),
+        (win.tab_mcp, "MCP Servers", "opencode"),
+        (win.tab_plugins, "Plugins", "opencode"),
+        (win.tab_permission, "Permissions", "opencode"),
+        (win.tab_tui, "TUI", "tui"),
+        (win.tab_raw, "Raw JSON", None),
+    ]
+
+
+OPENCODE_ADAPTER = register_adapter(AdapterSpec(
+    name="opencode",
+    app_title=APP_NAME,
+    version=APP_VERSION,
+    kinds=["opencode", "tui"],
+    known_keys={"opencode": OPENCODE_KEYS, "generic": OPENCODE_KEYS, "tui": TUI_KEYS},
+    raw_files=[("opencode.json", "opencode"), ("tui.json", "tui")],
+    targets_fn=_opencode_targets,
+    make_tabs_fn=_opencode_make_tabs,
+    capabilities={"providers", "mcp", "plugins", "catalog", "tui", "runtime"},
+))
+# openclaude config constants: top-level keys for settings.json and the global
+# ~/.openclaude.json. Derived from openclaude docs (see
+# .planning/openclaude-config-notes.md); no official JSON Schema confirmed yet.
+
+APP_NAME_OPENCLAUDE = "openclaude-config-editor"
+
+# Keys allowed in the layered settings.json files (user/project/local).
+OPENCLAUDE_SETTINGS_KEYS = {
+    "$schema", "model", "effortLevel", "agent", "permissions", "env", "hooks",
+    "smartRouting", "modelLimits", "providerFallbackChain", "agentModels",
+    "agentRouting", "advisorModel", "subscriptionType",
+}
+
+# Keys that live in the global ~/.openclaude.json (not settings.json).
+OPENCLAUDE_GLOBAL_KEYS = {
+    "$schema", "theme", "verbose", "autoUpdates",
+}
+
+# Value-bearing fields that hold secrets and must be masked in any UI / raw view.
+OPENCLAUDE_SECRET_FIELDS = {"api_key", "apiKey", "token", "authToken"}
+
+# Env dir override precedence (first set wins), default ~/.openclaude.
+OPENCLAUDE_CONFIG_ENV = ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR")
+# openclaude layered config model.
+#
+# Unlike opencode (a single file per kind), openclaude merges three settings
+# layers (user -> project -> local, later wins) plus a separate global file.
+# LayeredConfigFile reads each layer independently, exposes the deep-merged
+# effective view for display, and writes edits back to ONE chosen layer.
+
+class LayeredConfigFile:
+    """openclaude settings across user/project/local layers + global file."""
+
+    LAYER_ORDER = ("user", "project", "local")
+
+    def __init__(self, cwd, config_dir=None):
+        self.cwd = Path(cwd)
+        self.config_dir = Path(config_dir).expanduser() if config_dir else config_home(
+            "~/.openclaude", OPENCLAUDE_CONFIG_ENV)
+        dot = self.cwd / ".openclaude"
+        self.layer_files = {
+            "user": self.config_dir / "settings.json",
+            "project": dot / "settings.json",
+            "local": dot / "settings.local.json",
+        }
+        self.global_file = self.config_dir / ".." / ".openclaude.json"
+        # Prefer the canonical ~/.openclaude.json when config_dir is the default.
+        home_global = Path("~/.openclaude.json").expanduser()
+        if not self.global_file.exists() and home_global.exists():
+            self.global_file = home_global
+        self.layers = {name: {} for name in self.LAYER_ORDER}
+        self.global_data = {}
+        self.error = None
+
+    @staticmethod
+    def _read(path) -> dict:
+        try:
+            if Path(path).exists():
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return {}
+
+    def load(self) -> bool:
+        for name, path in self.layer_files.items():
+            self.layers[name] = self._read(path)
+        self.global_data = self._read(self.global_file)
+        return True
+
+    def effective(self) -> dict:
+        """Deep-merged settings across layers (later layer wins)."""
+        return merge_layers(self.layers[name] for name in self.LAYER_ORDER)
+
+    def layer(self, name: str) -> dict:
+        return self.layers.get(name, {})
+
+    def save_layer(self, name: str, data: dict) -> Tuple[bool, str]:
+        """Atomically write one layer's settings.json."""
+        if name not in self.layer_files:
+            return False, f"Unknown layer: {name}"
+        if not isinstance(data, dict):
+            return False, "Root must be a JSON object."
+        path = self.layer_files[name]
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp, path)
+            self.layers[name] = data
+            return True, f"Saved to {path}"
+        except OSError as e:
+            return False, f"Save error: {e}"
+
+
+def _openclaude_targets(cwd, config_dir=None):
+    """Return [(label, Path, kind)] for the openclaude layers + global file."""
+    cf = LayeredConfigFile(cwd, config_dir=config_dir)
+    return [
+        ("User settings.json", cf.layer_files["user"], "user"),
+        ("Project settings.json", cf.layer_files["project"], "project"),
+        ("Local settings.local.json", cf.layer_files["local"], "local"),
+        ("Global ~/.openclaude.json", cf.global_file, "global"),
+    ]
+# openclaude editor tabs. Minimal but functional: a Settings form (scalar keys)
+# and a per-layer Raw JSON editor. Both operate on the layer currently selected
+# on the window (win.oc_layer) via win.oc_layered (a LayeredConfigFile).
+
+class OpenclaudeSettingsTab(BaseTab):
+    """Form for common scalar settings of the selected layer."""
+
+    EFFORTS = ["", "low", "medium", "high", "xhigh", "max"]
+    LAYERS = ["user", "project", "local"]
+
+    def __init__(self, app):
+        super().__init__(app)
+        form = QFormLayout(self)
+
+        self.layer_combo = QComboBox()
+        for lk in self.LAYERS:
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        form.addRow("Edit layer:", self.layer_combo)
+
+        self.model_edit = QLineEdit()
+        self.effort_combo = QComboBox()
+        for e in self.EFFORTS:
+            self.effort_combo.addItem(e or "(default)", e)
+        self.agent_edit = QLineEdit()
+        self.advisor_edit = QLineEdit()
+        for w in (self.model_edit, self.agent_edit, self.advisor_edit):
+            w.textChanged.connect(self._edited)
+        self.effort_combo.currentIndexChanged.connect(self._edited)
+
+        form.addRow("model:", self.model_edit)
+        form.addRow("effortLevel:", self.effort_combo)
+        form.addRow("agent:", self.agent_edit)
+        form.addRow("advisorModel:", self.advisor_edit)
+
+        info = QLabel("Values shown are for the selected layer only. The effective "
+                      "config is the deep-merge user → project → local.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: gray;")
+        form.addRow(info)
+
+    def _on_layer_change(self, *_):
+        self.app.oc_layer = self.layer_combo.currentData()
+        self.app.refresh_tabs()
+
+    def _edited(self, *_):
+        self.app.status_bar.showMessage("Unsaved changes…")
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        data = layered.layer(self.app.oc_layer) if layered else {}
+        idx = self.layer_combo.findData(self.app.oc_layer)
+        self.layer_combo.blockSignals(True)
+        self.layer_combo.setCurrentIndex(max(0, idx))
+        self.layer_combo.blockSignals(False)
+        for w in (self.model_edit, self.agent_edit, self.advisor_edit, self.effort_combo):
+            w.blockSignals(True)
+        self.model_edit.setText(str(data.get("model", "")))
+        self.agent_edit.setText(str(data.get("agent", "")))
+        self.advisor_edit.setText(str(data.get("advisorModel", "")))
+        eidx = self.effort_combo.findData(data.get("effortLevel", ""))
+        self.effort_combo.setCurrentIndex(eidx if eidx >= 0 else 0)
+        for w in (self.model_edit, self.agent_edit, self.advisor_edit, self.effort_combo):
+            w.blockSignals(False)
+
+    def collect(self, data):
+        self._put(data, "model", self.model_edit.text().strip(), "")
+        self._put(data, "effortLevel", self.effort_combo.currentData() or "", "")
+        self._put(data, "agent", self.agent_edit.text().strip(), "")
+        self._put(data, "advisorModel", self.advisor_edit.text().strip(), "")
+
+
+class OpenclaudeRawTab(BaseTab):
+    """Raw JSON editor for the selected layer (full fidelity, incl. secrets)."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        layout = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel(" Layer: "))
+        self.layer_combo = QComboBox()
+        for lk in ("user", "project", "local", "global"):
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        bar.addWidget(self.layer_combo)
+        bar.addStretch()
+        layout.addLayout(bar)
+
+        self.editor = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = JSONHighlighter(self.editor.document())
+        self.editor.textChanged.connect(self._on_text)
+        self._modified = False
+        layout.addWidget(self.editor)
+
+    def _on_layer_change(self, *_):
+        self._raw_layer = self.layer_combo.currentData()
+        self.refresh()
+
+    def _on_text(self, *_):
+        self._modified = True
+        self.app.status_bar.showMessage("Unsaved changes…")
+
+    def _current_raw_layer(self):
+        return getattr(self, "_raw_layer", None) or self.layer_combo.currentData() or "project"
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        layer = self._current_raw_layer()
+        if layered is None:
+            return
+        data = layered.global_data if layer == "global" else layered.layer(layer)
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+        self.editor.blockSignals(False)
+        self._modified = False
+
+    def parsed(self):
+        """Return (layer, dict) from the editor, or (layer, None) if invalid."""
+        try:
+            return self._current_raw_layer(), json.loads(self.editor.toPlainText())
+        except json.JSONDecodeError:
+            return self._current_raw_layer(), None
+
+
+class OpenclaudeAgentModelsTab(BaseTab):
+    """Editor for agentModels (with masked api_key), agentRouting and
+    providerFallbackChain of the selected layer."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        layout = QVBoxLayout(self)
+
+        # --- agentModels ---
+        layout.addWidget(QLabel("Agent models — provider connections (api_key is masked):"))
+        self.models_table = QTableWidget(0, 4)
+        self.models_table.setHorizontalHeaderLabels(["key", "base_url", "model", "api_key"])
+        self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.models_table)
+        mbtn = QHBoxLayout()
+        add_m = QPushButton("Add model")
+        add_m.clicked.connect(lambda: self._add_model_row())
+        del_m = QPushButton("Remove selected")
+        del_m.clicked.connect(self._remove_model_row)
+        mbtn.addWidget(add_m)
+        mbtn.addWidget(del_m)
+        mbtn.addStretch()
+        layout.addLayout(mbtn)
+
+        # --- providerFallbackChain ---
+        fbar = QHBoxLayout()
+        fbar.addWidget(QLabel("providerFallbackChain (comma-separated):"))
+        self.fallback_edit = QLineEdit()
+        self.fallback_edit.textChanged.connect(self._edited)
+        fbar.addWidget(self.fallback_edit)
+        layout.addLayout(fbar)
+
+        # --- agentRouting ---
+        layout.addWidget(QLabel("Agent routing — agent → agentModels key ('default' = fallback):"))
+        self.routing_table = QTableWidget(0, 2)
+        self.routing_table.setHorizontalHeaderLabels(["agent", "modelKey"])
+        self.routing_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.routing_table)
+        rbtn = QHBoxLayout()
+        add_r = QPushButton("Add route")
+        add_r.clicked.connect(lambda: self._add_route_row())
+        del_r = QPushButton("Remove selected")
+        del_r.clicked.connect(self._remove_route_row)
+        rbtn.addWidget(add_r)
+        rbtn.addWidget(del_r)
+        rbtn.addStretch()
+        layout.addLayout(rbtn)
+
+    def _edited(self, *_):
+        self.app.status_bar.showMessage("Unsaved changes…")
+
+    # --- agentModels rows ---
+    def _add_model_row(self, key="", base_url="", model="", api_key=""):
+        r = self.models_table.rowCount()
+        self.models_table.insertRow(r)
+        self.models_table.setItem(r, 0, QTableWidgetItem(key))
+        self.models_table.setItem(r, 1, QTableWidgetItem(base_url))
+        self.models_table.setItem(r, 2, QTableWidgetItem(model))
+        masked = MaskedLineEdit(api_key, field_name="api_key")
+        self.models_table.setCellWidget(r, 3, masked)
+        self._edited()
+
+    def _remove_model_row(self):
+        r = self.models_table.currentRow()
+        if r >= 0:
+            self.models_table.removeRow(r)
+            self._edited()
+
+    # --- agentRouting rows ---
+    def _add_route_row(self, agent="", key=""):
+        r = self.routing_table.rowCount()
+        self.routing_table.insertRow(r)
+        self.routing_table.setItem(r, 0, QTableWidgetItem(agent))
+        self.routing_table.setItem(r, 1, QTableWidgetItem(key))
+        self._edited()
+
+    def _remove_route_row(self):
+        r = self.routing_table.currentRow()
+        if r >= 0:
+            self.routing_table.removeRow(r)
+            self._edited()
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        data = layered.layer(self.app.oc_layer) if layered else {}
+
+        self.models_table.setRowCount(0)
+        agent_models = data.get("agentModels") if isinstance(data.get("agentModels"), dict) else {}
+        for key, spec in agent_models.items():
+            spec = spec if isinstance(spec, dict) else {}
+            self._add_model_row(key, spec.get("base_url", ""), spec.get("model", ""),
+                                spec.get("api_key", ""))
+
+        chain = data.get("providerFallbackChain")
+        self.fallback_edit.blockSignals(True)
+        self.fallback_edit.setText(", ".join(chain) if isinstance(chain, list) else "")
+        self.fallback_edit.blockSignals(False)
+
+        self.routing_table.setRowCount(0)
+        routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
+        for agent, key in routing.items():
+            self._add_route_row(str(agent), str(key))
+
+    def collect(self, data):
+        models = {}
+        for r in range(self.models_table.rowCount()):
+            key_item = self.models_table.item(r, 0)
+            key = key_item.text().strip() if key_item else ""
+            if not key:
+                continue
+            spec = {}
+            base_item = self.models_table.item(r, 1)
+            model_item = self.models_table.item(r, 2)
+            widget = self.models_table.cellWidget(r, 3)
+            base_url = base_item.text().strip() if base_item else ""
+            model = model_item.text().strip() if model_item else ""
+            api_key = widget.value().strip() if widget else ""
+            if base_url:
+                spec["base_url"] = base_url
+            if model:
+                spec["model"] = model
+            if api_key:
+                spec["api_key"] = api_key
+            models[key] = spec
+        self._put(data, "agentModels", models, {})
+
+        chain = [c.strip() for c in self.fallback_edit.text().split(",") if c.strip()]
+        self._put(data, "providerFallbackChain", chain, [])
+
+        routing = {}
+        for r in range(self.routing_table.rowCount()):
+            agent_item = self.routing_table.item(r, 0)
+            key_item = self.routing_table.item(r, 1)
+            agent = agent_item.text().strip() if agent_item else ""
+            key = key_item.text().strip() if key_item else ""
+            if agent and key:
+                routing[agent] = key
+        self._put(data, "agentRouting", routing, {})
+# openclaude adapter registration + session hooks.
+#
+# openclaude's config topology (layered settings.json + a global file) differs
+# from opencode's fixed pair, so this adapter supplies the initial_load/refresh/
+# save session hooks that MainWindow calls instead of its built-in opencode path.
+
+def _openclaude_make_tabs(win):
+    win.oc_layer = "project"          # layer currently edited by the form
+    win.oc_layered = None             # set by initial_load hook
+    settings_tab = OpenclaudeSettingsTab(win)
+    models_tab = OpenclaudeAgentModelsTab(win)
+    raw_tab = OpenclaudeRawTab(win)
+    win._agent_tabs = [settings_tab, models_tab, raw_tab]
+    win._agent_raw_tab = raw_tab
+    return [
+        (settings_tab, "Settings", "settings"),
+        (models_tab, "Agent Models", "settings"),
+        (raw_tab, "Raw (per layer)", None),
+    ]
+
+
+def _openclaude_initial_load(win):
+    win.oc_layer = getattr(win, "oc_layer", "project")
+    win.oc_layered = LayeredConfigFile(win.cwd)
+    win.oc_layered.load()
+    win.refresh_tabs()
+
+
+def _openclaude_refresh(win):
+    for tab in win._agent_tabs:
+        tab.refresh()
+
+
+def _openclaude_save(win):
+    layered = win.oc_layered
+    raw = win._agent_raw_tab
+    # If the raw editor was edited, it is the source of truth for its layer.
+    if raw._modified:
+        layer, parsed = raw.parsed()
+        if parsed is None:
+            win.status_bar.showMessage("Raw JSON invalid — not saved")
+            return
+        if layer == "global":
+            win.status_bar.showMessage("Editing the global file is not supported yet")
+            return
+        ok, msg = layered.save_layer(layer, parsed)
+    else:
+        layer = win.oc_layer
+        base = dict(layered.layer(layer))
+        for tab in win._agent_tabs:
+            if hasattr(tab, "collect"):
+                tab.collect(base)
+        ok, msg = layered.save_layer(layer, base)
+    win.status_bar.showMessage(msg if ok else f"Save error: {msg}")
+    win.refresh_tabs()
+
+
+OPENCLAUDE_ADAPTER = register_adapter(AdapterSpec(
+    name="openclaude",
+    app_title=APP_NAME_OPENCLAUDE,
+    version=APP_VERSION,
+    kinds=["user", "project", "local", "global"],
+    known_keys={
+        "user": OPENCLAUDE_SETTINGS_KEYS,
+        "project": OPENCLAUDE_SETTINGS_KEYS,
+        "local": OPENCLAUDE_SETTINGS_KEYS,
+        "global": OPENCLAUDE_GLOBAL_KEYS,
+    },
+    raw_files=[("settings.json", "project")],
+    targets_fn=_openclaude_targets,
+    make_tabs_fn=_openclaude_make_tabs,
+    capabilities={"layered", "agent_routing"},
+    initial_load_fn=_openclaude_initial_load,
+    refresh_fn=_openclaude_refresh,
+    save_fn=_openclaude_save,
+))
+class MainWindow(QMainWindow):
+    """Enhanced main window with undo/redo, themes, and better UX"""
+
+    def __init__(self, cwd: Path, adapter=None):
+        super().__init__()
+        self.cwd = Path(cwd)
+        self.adapter = adapter or default_adapter()
+        # Per-kind config state, keyed by adapter kind. The opencode-named
+        # attributes below (cfg_oc, dirty_oc, ...) are backward-compat
+        # properties over these dicts, so a future adapter can drive N kinds
+        # generically via self._configs while opencode code stays unchanged.
+        self._kinds = list(self.adapter.kinds) if self.adapter else ["opencode", "tui"]
+        self._configs = {k: None for k in self._kinds}
+        self._dirty = {k: False for k in self._kinds}
+        self._undo_mgrs = {k: UndoManager() for k in self._kinds}
+        self._snap = {k: False for k in self._kinds}
+        self.validator = Validator()
+        self.model_catalog = ModelCatalog()
+        self.settings = SettingsManager()
+        self.theme_manager = None
+        self.recent_files = []
+        self.mode = None
+        self.project_path = None
+        self._raw_kind = "opencode"
+
+        self._restore_window_state()
+
+        _title = self.adapter.app_title if self.adapter else APP_NAME
+        self.setWindowTitle(f"{_title} v{APP_VERSION}")
+        self.resize(1200, 800)
+
+        self._setup_theme()
+
+        self._build_tabs()
+        self._setup_recent_files()
+        self._build_menu()
+        self._build_toolbar()
+        self._build_status_bar()
+
+        self._do_initial_load()
+
+    def _do_initial_load(self):
+        """Initial config load — adapter hook if provided, else opencode global."""
+        if self.adapter and self.adapter.initial_load_fn:
+            self.adapter.initial_load_fn(self)
+        else:
+            self._load_global()
+
+    # --- backward-compat properties over per-kind state dicts ---
+    # Keep opencode call sites (self.cfg_oc, self.dirty_tui, ...) working while
+    # state is stored generically by kind in self._configs / _dirty / _undo / _snap.
+    @property
+    def cfg_oc(self):
+        return self._configs.get("opencode")
+
+    @cfg_oc.setter
+    def cfg_oc(self, v):
+        self._configs["opencode"] = v
+
+    @property
+    def cfg_tui(self):
+        return self._configs.get("tui")
+
+    @cfg_tui.setter
+    def cfg_tui(self, v):
+        self._configs["tui"] = v
+
+    @property
+    def dirty_oc(self):
+        return self._dirty.get("opencode", False)
+
+    @dirty_oc.setter
+    def dirty_oc(self, v):
+        self._dirty["opencode"] = v
+
+    @property
+    def dirty_tui(self):
+        return self._dirty.get("tui", False)
+
+    @dirty_tui.setter
+    def dirty_tui(self, v):
+        self._dirty["tui"] = v
+
+    @property
+    def undo_oc(self):
+        return self._undo_mgrs.get("opencode")
+
+    @undo_oc.setter
+    def undo_oc(self, v):
+        self._undo_mgrs["opencode"] = v
+
+    @property
+    def undo_tui(self):
+        return self._undo_mgrs.get("tui")
+
+    @undo_tui.setter
+    def undo_tui(self, v):
+        self._undo_mgrs["tui"] = v
+
+    @property
+    def _snap_oc(self):
+        return self._snap.get("opencode", False)
+
+    @_snap_oc.setter
+    def _snap_oc(self, v):
+        self._snap["opencode"] = v
+
+    @property
+    def _snap_tui(self):
+        return self._snap.get("tui", False)
+
+    @_snap_tui.setter
+    def _snap_tui(self, v):
+        self._snap["tui"] = v
+
+    def _setup_theme(self):
+        """Setup application theme"""
+        self.theme_manager = ThemeManager(QApplication.instance())
+        self._apply_theme()
+
+    def _apply_theme(self):
+        """Apply current theme"""
+        theme = self.settings.get_theme()
+        if theme == "dark":
+            self.setStyleSheet("""
+                QToolTip {
+                    background-color: #353535;
+                    color: white;
+                    border: 1px solid #555555;
+                }
+            """)
+        else:
+            self.setStyleSheet("")
+
+    def _restore_window_state(self):
+        """Restore window geometry and state"""
+        geometry = self.settings.get_window_geometry()
+        if geometry:
+            self.restoreGeometry(geometry)
+
+        state = self.settings.get_window_state()
+        if state:
+            self.restoreState(state)
+
+    def _save_window_state(self):
+        """Save window geometry and state"""
+        self.settings.set_window_geometry(self.saveGeometry())
+        self.settings.set_window_state(self.saveState())
+
+    def _build_menu(self):
+        """Build application menu"""
+        mb = self.menuBar()
+
+        # File menu
+        mfile = mb.addMenu("&File")
+
+        self.act_open = QAction("&Open...", self)
+        self.act_open.setShortcut(QKeySequence.Open)
+        self.act_open.triggered.connect(self._browse)
+        mfile.addAction(self.act_open)
+
+        self.act_recent = mfile.addMenu("Open &Recent")
+        self._update_recent_files_menu()
+
+        self.act_save = QAction("&Save", self)
+        self.act_save.setShortcut(QKeySequence.Save)
+        self.act_save.triggered.connect(self._save)
+        mfile.addAction(self.act_save)
+
+        self.act_save_as = QAction("Save &As...", self)
+        self.act_save_as.triggered.connect(self._save_as)
+        mfile.addAction(self.act_save_as)
+
+        self.act_export = QAction("&Export...", self)
+        self.act_export.triggered.connect(self._export)
+        mfile.addAction(self.act_export)
+
+        mfile.addSeparator()
+
+        self.act_reload = QAction("&Reload", self)
+        self.act_reload.setShortcut(QKeySequence.Refresh)
+        self.act_reload.triggered.connect(self._reload)
+        mfile.addAction(self.act_reload)
+
+        mfile.addSeparator()
+
+        self.act_close = QAction("&Close", self)
+        self.act_close.setShortcut(QKeySequence.Close)
+        self.act_close.triggered.connect(self.close)
+        mfile.addAction(self.act_close)
+
+        # Edit menu
+        medit = mb.addMenu("&Edit")
+
+        self.act_undo = QAction("&Undo", self)
+        self.act_undo.setShortcut(QKeySequence.Undo)
+        self.act_undo.triggered.connect(self._undo)
+        self.act_undo.setEnabled(False)
+        medit.addAction(self.act_undo)
+
+        self.act_redo = QAction("&Redo", self)
+        self.act_redo.setShortcut(QKeySequence.Redo)
+        self.act_redo.triggered.connect(self._redo)
+        self.act_redo.setEnabled(False)
+        medit.addAction(self.act_redo)
+
+        medit.addSeparator()
+
+        self.act_cut = QAction("Cu&t", self)
+        self.act_cut.setShortcut(QKeySequence.Cut)
+        self.act_cut.triggered.connect(self._cut)
+        medit.addAction(self.act_cut)
+
+        self.act_copy = QAction("&Copy", self)
+        self.act_copy.setShortcut(QKeySequence.Copy)
+        self.act_copy.triggered.connect(self._copy)
+        medit.addAction(self.act_copy)
+
+        self.act_paste = QAction("&Paste", self)
+        self.act_paste.setShortcut(QKeySequence.Paste)
+        self.act_paste.triggered.connect(self._paste)
+        medit.addAction(self.act_paste)
+
+        self.act_select_all = QAction("Select &All", self)
+        self.act_select_all.setShortcut(QKeySequence.SelectAll)
+        self.act_select_all.triggered.connect(self._select_all)
+        medit.addAction(self.act_select_all)
+
+        # Tools menu — catalog + import actions are opencode-specific; only
+        # wire them when the active adapter declares the matching capability.
+        caps = self.adapter.capabilities if self.adapter else set()
+        mtools = mb.addMenu("&Tools")
+
+        if "catalog" in caps:
+            self.act_catalog = QAction("Load Model &Catalog...", self)
+            self.act_catalog.triggered.connect(self.load_model_catalog)
+            mtools.addAction(self.act_catalog)
+
+            self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
+            self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
+            mtools.addAction(self.act_browse_catalog)
+
+            self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
+            self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
+            mtools.addAction(self.act_apply_catalog)
+
+            mtools.addSeparator()
+
+        if "providers" in caps:
+            self.act_imp_provider = QAction("Import &Providers...", self)
+            self.act_imp_provider.triggered.connect(self.tab_providers._import_providers)
+            mtools.addAction(self.act_imp_provider)
+
+        if "mcp" in caps:
+            self.act_imp_mcp = QAction("Import &MCP Servers...", self)
+            self.act_imp_mcp.triggered.connect(self.tab_mcp._import_servers)
+            mtools.addAction(self.act_imp_mcp)
+
+        if "plugins" in caps:
+            self.act_imp_plugin = QAction("Import &Plugins...", self)
+            self.act_imp_plugin.triggered.connect(self.tab_plugins._import_plugins)
+            mtools.addAction(self.act_imp_plugin)
+
+        mtools.menuAction().setVisible(not mtools.isEmpty())
+
+        # View menu
+        mview = mb.addMenu("&View")
+
+        self.act_toggle_theme = QAction("Toggle &Theme", self)
+        self.act_toggle_theme.setShortcut("Ctrl+T")
+        self.act_toggle_theme.triggered.connect(self._toggle_theme)
+        mview.addAction(self.act_toggle_theme)
+
+        self.act_increase_font = QAction("&Increase Font Size", self)
+        self.act_increase_font.setShortcut("Ctrl++")
+        self.act_increase_font.triggered.connect(self._increase_font_size)
+        mview.addAction(self.act_increase_font)
+
+        self.act_decrease_font = QAction("&Decrease Font Size", self)
+        self.act_decrease_font.setShortcut("Ctrl+-")
+        self.act_decrease_font.triggered.connect(self._decrease_font_size)
+        mview.addAction(self.act_decrease_font)
+
+        # Help menu
+        mhelp = mb.addMenu("&Help")
+
+        self.act_about = QAction("&About", self)
+        self.act_about.triggered.connect(self._show_about)
+        mhelp.addAction(self.act_about)
+
+        self.act_about_qt = QAction("About &Qt", self)
+        self.act_about_qt.triggered.connect(QApplication.aboutQt)
+        mhelp.addAction(self.act_about_qt)
+
+    def _build_toolbar(self):
+        """Build application toolbar"""
+        toolbar = QToolBar("Main Toolbar")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        toolbar.addWidget(QLabel(" Mode: "))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Global")
+        self.mode_combo.addItem("Local project…")
+        self.mode_combo.setMinimumWidth(180)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        toolbar.addWidget(self.mode_combo)
+
+        self.project_btn = QPushButton("Browse…")
+        self.project_btn.clicked.connect(self._browse_project)
+        toolbar.addWidget(self.project_btn)
+        self.project_label = QLabel("(no project)")
+        self.project_label.setStyleSheet("color: gray;")
+        toolbar.addWidget(self.project_label)
+
+        toolbar.addSeparator()
+
+        for action in [self.act_save, self.act_reload, self.act_undo, self.act_redo]:
+            toolbar.addAction(action)
+
+        toolbar.addSeparator()
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search...")
+        self.search_edit.setMaximumWidth(200)
+        self.search_edit.textChanged.connect(self._search)
+        toolbar.addWidget(self.search_edit)
+
+    def _build_tabs(self):
+        """Build main tabs from the active adapter."""
+        self.tabs = QTabWidget()
+        self.tabs.setTabPosition(QTabWidget.North)
+        self.tabs.setMovable(True)
+
+        for tab, title, _kind in self.adapter.make_tabs(self):
+            self.tabs.addTab(tab, title)
+
+        self.setCentralWidget(self.tabs)
+
+    def _build_status_bar(self):
+        """Build status bar"""
+        self.status_bar = self.statusBar()
+        self.status_bar.showMessage("Ready")
+
+        # Add permanent widgets
+        self.catalog_status = QLabel()
+        self.status_bar.addPermanentWidget(self.catalog_status)
+        self._update_catalog_status()
+
+    def _setup_recent_files(self):
+        """Setup recent files menu"""
+        self.recent_files = self.settings.get_recent_files()
+
+    def _update_recent_files_menu(self):
+        """Update recent files menu"""
+        if not hasattr(self, "act_recent"):
+            return
+        self.act_recent.clear()
+        for path in self.recent_files:
+            action = QAction(path, self)
+            action.triggered.connect(lambda _, p=path: self._open_recent(Path(p)))
+            self.act_recent.addAction(action)
+
+        self.act_recent.setEnabled(bool(self.recent_files))
+
+    def _on_mode_changed(self, idx: int):
+        # Global/Local project switching is opencode-specific; adapters with
+        # their own initial_load own their loading and ignore this.
+        if self.adapter and self.adapter.initial_load_fn:
+            return
+        if idx == 0:
+            self._load_global()
+        elif idx == 1:
+            if self.project_path is None:
+                self._browse_project()
+            else:
+                self._load_local(self.project_path)
+
+    def _browse_project(self):
+        start = self.project_path or self.cwd or Path.home()
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Project Folder", str(start))
+        if path:
+            self.project_path = Path(path)
+            self.project_label.setText(str(self.project_path))
+            self._load_local(self.project_path)
+
+    def _paths_for_mode(self, mode: str, project: Path = None) -> tuple:
+        home = Path.home()
+        if mode == "global":
+            oc = home / ".config" / "opencode" / "opencode.json"
+            tui = home / ".config" / "opencode" / "tui.json"
+        else:
+            proj = project or self.cwd
+            dot_oc = proj / ".opencode"
+            oc = (dot_oc / "opencode.json") if (dot_oc / "opencode.json").exists() else (proj / "opencode.json")
+            tui = (dot_oc / "tui.json") if (dot_oc / "tui.json").exists() else (proj / "tui.json")
+        return oc, tui
+
+    def _load_global(self):
+        self.mode = "global"
+        self.project_label.setText("(global)")
+        oc_path, tui_path = self._paths_for_mode("global")
+        self._load_pair(oc_path, tui_path)
+
+    def _load_local(self, project: Path):
+        self.mode = "local"
+        self.project_path = project
+        oc_path, tui_path = self._paths_for_mode("local", project)
+        self._load_pair(oc_path, tui_path)
+
+    def _load_pair(self, oc_path: Path, tui_path: Path):
+        if self.dirty_oc or self.dirty_tui:
+            if not _confirm(self, "Unsaved Changes",
+                            "You have unsaved changes. Discard and switch?"):
+                self.mode_combo.blockSignals(True)
+                self.mode_combo.setCurrentIndex(0 if self.mode == "global" else 1)
+                self.mode_combo.blockSignals(False)
+                return
+
+        self.cfg_oc = ConfigFile(oc_path, "opencode")
+        self.cfg_tui = ConfigFile(tui_path, "tui")
+        self.cfg_oc.load()
+        self.cfg_tui.load()
+
+        self.dirty_oc = False
+        self.dirty_tui = False
+        self._snap_oc = False
+        self._snap_tui = False
+        self.undo_oc = UndoManager()
+        self.undo_tui = UndoManager()
+
+        oc_exists = oc_path.exists()
+        tui_exists = tui_path.exists()
+        self.status_bar.showMessage(
+            f"opencode.json [{'✓' if oc_exists else '✗'}]  "
+            f"tui.json [{'✓' if tui_exists else '✗'}]"
+        )
+        self.refresh_tabs()
+
+    def _update_catalog_status(self):
+        """Update model catalog status"""
+        if self.model_catalog.loaded():
+            self.catalog_status.setText(
+                f"Catalog: {self.model_catalog.source} "
+                f"({len(self.model_catalog.flat)} models)"
+            )
+        else:
+            self.catalog_status.setText("No model catalog loaded")
+
+    def _search(self, text: str):
+        """Search across all tabs"""
+        current_tab = self.tabs.currentWidget()
+
+        if current_tab is self.tab_providers:
+            self.tab_providers.search_edit.setText(text)
+        elif current_tab is self.tab_mcp:
+            self.tab_mcp.search_edit.setText(text)
+        elif current_tab is self.tab_plugins:
+            self.tab_plugins.search_edit.setText(text)
+        elif current_tab is self.tab_permission:
+            self.tab_permission.search_edit.setText(text)
+        elif current_tab is self.tab_agents:
+            self.tab_agents.search_edit.setText(text)
+        elif current_tab is self.tab_commands:
+            self.tab_commands.search_edit.setText(text)
+
+    def _browse(self):
+        """Browse for a single config file (loads it into the matching slot)"""
+        start = self.cwd if self.cwd.exists() else Path.home()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Config File", str(start),
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        kind = ConfigFile.kind_for(Path(path))
+        if kind == "opencode":
+            self.cfg_oc = ConfigFile(Path(path), kind)
+            self.cfg_oc.load()
+            self.dirty_oc = False
+            self._snap_oc = False
+            self.undo_oc = UndoManager()
+        elif kind == "tui":
+            self.cfg_tui = ConfigFile(Path(path), kind)
+            self.cfg_tui.load()
+            self.dirty_tui = False
+            self._snap_tui = False
+            self.undo_tui = UndoManager()
+        else:
+            QMessageBox.information(self, "Open", f"File kind '{kind}' opened as opencode.json")
+            self.cfg_oc = ConfigFile(Path(path), "opencode")
+            self.cfg_oc.load()
+            self.dirty_oc = False
+            self._snap_oc = False
+            self.undo_oc = UndoManager()
+        self.refresh_tabs()
+
+    def refresh_tabs(self):
+        """Refresh all tabs. Adapter hook if provided, else opencode behavior."""
+        if self.adapter and self.adapter.refresh_fn:
+            self.adapter.refresh_fn(self)
+            return
+        if self.cfg_oc:
+            for tab in self._oc_tabs:
+                tab.refresh()
+        if self.cfg_tui:
+            self.tab_tui.refresh()
+        self.tab_raw.refresh()
+        self.act_undo.setEnabled(self.undo_oc.can_undo() or self.undo_tui.can_undo())
+        self.act_redo.setEnabled(self.undo_oc.can_redo() or self.undo_tui.can_redo())
+
+    @property
+    def cfg(self):
+        return self.cfg_oc
+
+    @property
+    def dirty(self):
+        return self.dirty_oc or self.dirty_tui
+
+    def mark_dirty(self, kind="auto"):
+        """Mark the given config (or the active-tab kind) as dirty."""
+        k = kind
+        if k == "auto":
+            k = self._kind_of_active_tab()
+        if k == "tui":
+            if self.cfg_tui is not None and not self._snap_tui:
+                self.undo_tui.push(copy.deepcopy(self.cfg_tui.data))
+                self._snap_tui = True
+            self.dirty_tui = True
+        else:
+            if self.cfg_oc is not None and not self._snap_oc:
+                self.undo_oc.push(copy.deepcopy(self.cfg_oc.data))
+                self._snap_oc = True
+            self.dirty_oc = True
+        self.status_bar.showMessage("Unsaved changes…")
+
+    def _kind_of_active_tab(self):
+        w = self.tabs.currentWidget()
+        if w is self.tab_tui:
+            return "tui"
+        return "opencode"
+
+    def _collect_oc(self) -> dict:
+        if self.tab_raw._modified and self._raw_kind == "opencode":
+            try:
+                base = json.loads(self.tab_raw.editor.toPlainText())
+                if isinstance(base, dict):
+                    data = base
+                else:
+                    data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
+            except json.JSONDecodeError:
+                data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
+        else:
+            data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
+        for tab in self._oc_tabs:
+            try:
+                tab.collect(data)
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"{type(tab).__name__}: {e}")
+        return data
+
+    def _collect_tui(self) -> dict:
+        if self.tab_raw._modified and self._raw_kind == "tui":
+            try:
+                base = json.loads(self.tab_raw.editor.toPlainText())
+                if isinstance(base, dict):
+                    data = base
+                else:
+                    data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
+            except json.JSONDecodeError:
+                data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
+        else:
+            data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
+        self.tab_tui.collect(data)
+        return data
+
+    def validate(self, text: str, kind: str = "opencode") -> Tuple[bool, List[str], List[str]]:
+        """Validate JSON text. Returns (hard_ok, hard_errors, schema_warnings)."""
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            return False, [f"Line {e.lineno}: {e.msg}"], []
+        known = self.adapter.known_keys_for(kind) if self.adapter else None
+        return self.validator.validate(data, kind, known_keys=known)
+
+    def _save_state(self, kind="auto"):
+        k = kind
+        if k == "auto":
+            k = self._kind_of_active_tab()
+        if k == "tui":
+            if self.cfg_tui:
+                self.undo_tui.push(copy.deepcopy(self.cfg_tui.data))
+                self._snap_tui = True
+        else:
+            if self.cfg_oc:
+                self.undo_oc.push(copy.deepcopy(self.cfg_oc.data))
+                self._snap_oc = True
+
+    def snapshot_state(self, kind="auto"):
+        k = kind
+        if k == "auto":
+            k = self._kind_of_active_tab()
+        if k == "tui":
+            if self.cfg_tui is not None:
+                self.undo_tui.push(copy.deepcopy(self.cfg_tui.data))
+                self._snap_tui = True
+        else:
+            if self.cfg_oc is not None:
+                self.undo_oc.push(copy.deepcopy(self.cfg_oc.data))
+                self._snap_oc = True
+
+    def _undo(self):
+        w = self.tabs.currentWidget()
+        if w is self.tab_tui:
+            if self.cfg_tui and self.undo_tui.can_undo():
+                state = self.undo_tui.undo(self.cfg_tui.data)
+                if state is not None:
+                    self.cfg_tui.data = state
+                    self.dirty_tui = True
+                    self._snap_tui = False
+                    self.refresh_tabs()
+                    self.status_bar.showMessage("Undo (tui)")
+        else:
+            if self.cfg_oc and self.undo_oc.can_undo():
+                state = self.undo_oc.undo(self.cfg_oc.data)
+                if state is not None:
+                    self.cfg_oc.data = state
+                    self.dirty_oc = True
+                    self._snap_oc = False
+                    self.refresh_tabs()
+                    self.status_bar.showMessage("Undo (opencode)")
+
+    def _redo(self):
+        w = self.tabs.currentWidget()
+        if w is self.tab_tui:
+            if self.cfg_tui and self.undo_tui.can_redo():
+                state = self.undo_tui.redo(self.cfg_tui.data)
+                if state is not None:
+                    self.cfg_tui.data = state
+                    self.dirty_tui = True
+                    self._snap_tui = False
+                    self.refresh_tabs()
+                    self.status_bar.showMessage("Redo (tui)")
+        else:
+            if self.cfg_oc and self.undo_oc.can_redo():
+                state = self.undo_oc.redo(self.cfg_oc.data)
+                if state is not None:
+                    self.cfg_oc.data = state
+                    self.dirty_oc = True
+                    self._snap_oc = False
+                    self.refresh_tabs()
+                    self.status_bar.showMessage("Redo (opencode)")
+
+    def _cut(self):
+        """Cut text"""
+        current_tab = self.tabs.currentWidget()
+        if current_tab is self.tab_raw:
+            self.tab_raw.editor.cut()
+
+    def _copy(self):
+        """Copy text"""
+        current_tab = self.tabs.currentWidget()
+        if current_tab is self.tab_raw:
+            self.tab_raw.editor.copy()
+        elif hasattr(current_tab, "table"):
+            selected = current_tab.table.selectedItems()
+            if selected:
+                text = "\n".join(item.text() for item in selected)
+                QApplication.clipboard().setText(text)
+
+    def _paste(self):
+        """Paste text"""
+        current_tab = self.tabs.currentWidget()
+        if current_tab is self.tab_raw:
+            self.tab_raw.editor.paste()
+
+    def _select_all(self):
+        """Select all text"""
+        current_tab = self.tabs.currentWidget()
+        if current_tab is self.tab_raw:
+            self.tab_raw.editor.selectAll()
+        elif hasattr(current_tab, "table"):
+            current_tab.table.selectAll()
+
+    def _save(self):
+        if self.adapter and self.adapter.save_fn:
+            self.adapter.save_fn(self)
+            return
+        if self.cfg_oc is None and self.cfg_tui is None:
+            QMessageBox.information(self, "Save", "No file is currently open")
+            return
+
+        oc_data = self._collect_oc() if self.cfg_oc else None
+        tui_data = self._collect_tui() if self.cfg_tui else None
+
+        for label, cfg, data, kind in [
+            ("opencode.json", self.cfg_oc, oc_data, "opencode"),
+            ("tui.json", self.cfg_tui, tui_data, "tui"),
+        ]:
+            if cfg is None or data is None:
+                continue
+            hard_ok, hard, warnings = self.validator.validate(data, kind)
+            if not hard_ok and not _confirm(
+                self, f"Validation: {label}",
+                "\n".join(hard[:10]) + "\n\nSave anyway?"
+            ):
+                return
+
+        if self.cfg_oc and oc_data is not None:
+            self._save_state("opencode")
+            ok, msg = self.cfg_oc.save(oc_data)
+            if ok:
+                self.dirty_oc = False
+                self._snap_oc = False
+                self.status_bar.showMessage(f"opencode.json: {msg}")
+            else:
+                QMessageBox.critical(self, "Save Error (opencode.json)", msg)
+                return
+
+        if self.cfg_tui and tui_data is not None:
+            self._save_state("tui")
+            ok, msg = self.cfg_tui.save(tui_data)
+            if ok:
+                self.dirty_tui = False
+                self._snap_tui = False
+                self.status_bar.showMessage(f"tui.json: {msg}")
+            else:
+                QMessageBox.critical(self, "Save Error (tui.json)", msg)
+                return
+
+        self.refresh_tabs()
+
+    def _save_as(self):
+        if self.cfg_oc is None and self.cfg_tui is None:
+            QMessageBox.information(self, "Save As", "No file is currently open")
+            return
+
+        for label, cfg, kind in [("opencode.json", self.cfg_oc, "opencode"),
+                                 ("tui.json", self.cfg_tui, "tui")]:
+            if cfg is None:
+                continue
+            path, _ = QFileDialog.getSaveFileName(
+                self, f"Save {label} As…", str(cfg.path),
+                "JSON files (*.json);;All files (*)"
+            )
+            if not path:
+                continue
+            new_cfg = ConfigFile(Path(path), kind)
+            data = self._collect_oc() if kind == "opencode" else self._collect_tui()
+            ok, msg = new_cfg.save(data)
+            if ok:
+                if kind == "opencode":
+                    self.cfg_oc = new_cfg
+                    self.dirty_oc = False
+                    self._snap_oc = False
+                else:
+                    self.cfg_tui = new_cfg
+                    self.dirty_tui = False
+                    self._snap_tui = False
+                self.settings.add_recent_file(str(path))
+                self._update_recent_files_menu()
+            else:
+                QMessageBox.critical(self, f"Save As Error ({label})", msg)
+        self.refresh_tabs()
+
+    def _export(self):
+        if self.cfg_oc is None and self.cfg_tui is None:
+            QMessageBox.information(self, "Export", "No file is currently open")
+            return
+        for label, cfg in [("opencode", self.cfg_oc), ("tui", self.cfg_tui)]:
+            if cfg is None:
+                continue
+            path, _ = QFileDialog.getSaveFileName(
+                self, f"Export {label}", f"{label}-export.json",
+                "JSON files (*.json);;All files (*)"
+            )
+            if not path:
+                continue
+            ok, msg = cfg.export(Path(path))
+            if ok:
+                QMessageBox.information(self, "Export Complete", msg)
+            else:
+                QMessageBox.warning(self, "Export Error", msg)
+
+    def _reload(self):
+        if self.cfg_oc is None and self.cfg_tui is None:
+            return
+        if (self.dirty_oc or self.dirty_tui) and not _confirm(
+            self, "Reload", "Discard unsaved changes and reload?"
+        ):
+            return
+        if self.cfg_oc and not self.cfg_oc.load():
+            QMessageBox.warning(self, "Reload Error", self.cfg_oc.error or "Failed to reload opencode.json")
+        if self.cfg_tui and not self.cfg_tui.load():
+            QMessageBox.warning(self, "Reload Error", self.cfg_tui.error or "Failed to reload tui.json")
+        self.dirty_oc = False
+        self.dirty_tui = False
+        self._snap_oc = False
+        self._snap_tui = False
+        self.undo_oc = UndoManager()
+        self.undo_tui = UndoManager()
+        self.refresh_tabs()
+        self.status_bar.showMessage("Reloaded both files")
+
+    def load_model_catalog(self) -> bool:
+        """Load model catalog from file or clipboard"""
+        ret = QMessageBox.question(
+            self, "Load Model Catalog",
+            "Load catalog from a file? (No = paste JSON instead)",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+        )
+
+        if ret == QMessageBox.Cancel:
+            return False
+
+        try:
+            if ret == QMessageBox.Yes:
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "Load Model Catalog", str(Path.home()),
+                    "JSON files (*.json);;All files (*)"
+                )
+                if not path:
+                    return False
+                self.model_catalog.load(Path(path))
+            else:
+                dlg = JsonImportDialog(
+                    self, "Paste Model Catalog",
+                    "Paste model catalog JSON. Supported formats:\n"
+                    "- models.dev-style dump ({provider: {models: {...}}})\n"
+                    "- Single provider dump ({'models': {...}})\n"
+                    "- Flat map ({modelId: spec})"
+                )
+                if dlg.exec() != QDialog.Accepted:
+                    return False
+                self.model_catalog.load_text(json.dumps(dlg.result_data))
+
+            self._update_catalog_status()
+            self.status_bar.showMessage(
+                f"Model catalog loaded: {self.model_catalog.source}"
+            )
+            return True
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            QMessageBox.warning(self, "Load Error", f"Failed to load catalog: {e}")
+            return False
+
+    def _ensure_catalog(self) -> bool:
+        """Load the bundled models.dev catalog if present, else ask the user."""
+        bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
+        if bundled.exists():
+            try:
+                self.model_catalog.load(bundled)
+                self._update_catalog_status()
+                self.status_bar.showMessage(f"Loaded bundled catalog: {bundled.name}")
+                return True
+            except (OSError, ValueError) as e:
+                QMessageBox.warning(self, "Catalog Error", f"Failed to load bundled catalog: {e}")
+        return self.load_model_catalog()
+
+    def _browse_model_catalog(self):
+        """Open the full-catalog browse dialog."""
+        if not self.model_catalog.loaded():
+            if not self._ensure_catalog():
+                return
+        dlg = ModelCatalogDialog(self, self.model_catalog)
+        dlg.exec()
+
+    def _apply_model_catalog(self):
+        """Match configured models against the catalog and apply normalized format."""
+        if not self.model_catalog.loaded():
+            if not self._ensure_catalog():
+                return
+        if not self.cfg_oc:
+            QMessageBox.information(self, "Match & Format", "Open a config file first.")
+            return
+
+        providers = section(self.cfg_oc.data, "provider")
+        if not providers:
+            QMessageBox.information(
+                self, "Match & Format", "No providers found in the current config."
+            )
+            return
+
+        self.snapshot_state("opencode")
+        dlg = ApplyCatalogDialog(self, self.model_catalog, providers)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        report = dlg.apply()
+        if report.any_changes():
+            self.mark_dirty("opencode")
+            self.refresh_tabs()
+            self.status_bar.showMessage(
+                f"Catalog apply: {len(report.filled)} filled, "
+                f"{len(report.added)} added, {len(report.unknown)} unknown"
+            )
+            QMessageBox.information(
+                self, "Apply Complete",
+                f"Filled/updated: {len(report.filled)}\n"
+                f"Added: {len(report.added)}\n"
+                f"Unchanged: {len(report.unchanged)}\n"
+                f"Unknown: {len(report.unknown)}\n"
+                f"Ambiguous: {len(report.ambiguous)}"
+            )
+        else:
+            QMessageBox.information(self, "Apply", "No changes were applied.")
+
+    def _toggle_theme(self):
+        """Toggle between light/dark/system theme"""
+        self.theme_manager.toggle_theme()
+        self._apply_theme()
+
+    def _increase_font_size(self):
+        """Increase font size"""
+        current = self.settings.get_font_size()
+        self.settings.set_font_size(current + 1)
+        self._update_font_size()
+
+    def _decrease_font_size(self):
+        """Decrease font size"""
+        current = self.settings.get_font_size()
+        if current > 6:
+            self.settings.set_font_size(current - 1)
+            self._update_font_size()
+
+    def _update_font_size(self):
+        """Update font size for all components"""
+        size = self.settings.get_font_size()
+        font = QApplication.font()
+        font.setPointSize(size)
+        QApplication.setFont(font)
+
+    def _show_about(self):
+        """Show about dialog"""
+        QMessageBox.about(
+            self, "About opencode-config-editor",
+            f"""<h2>{APP_NAME} v{APP_VERSION}</h2>
+            <p>A GUI editor for opencode configuration files.</p>
+            <p>Features:
+            <ul>
+                <li>Edit providers, MCP servers, plugins, and permissions</li>
+                <li>Import/export functionality</li>
+                <li>Model catalog support</li>
+                <li>Undo/redo support</li>
+                <li>Dark/light theme support</li>
+                <li>Schema validation</li>
+            </ul>
+            </p>
+            <p>Copyright © 2023 opencode.ai</p>"""
+        )
+
+    def closeEvent(self, event):
+        if self.dirty_oc or self.dirty_tui:
+            ret = QMessageBox.question(
+                self, "Unsaved Changes",
+                "You have unsaved changes. Save before closing?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel
+            )
+            if ret == QMessageBox.Save:
+                self._save()
+                if self.dirty:
+                    event.ignore()
+                    return
+            elif ret == QMessageBox.Cancel:
+                event.ignore()
+                return
+        self._save_window_state()
+        event.accept()
+
+# Overridden by build.py when generating a per-adapter single-file artifact
+# (e.g. openclaude-config-editor.py sets this to "openclaude").
+_BUILD_DEFAULT_ADAPTER = "openclaude"
+
+
+def main():
+    """Main application entry point"""
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+
+    # Set application style
+    app.setStyle("Fusion")
+
+    # Set default font size
+    settings = SettingsManager()
+    font = QApplication.font()
+    font.setPointSize(settings.get_font_size())
+    QApplication.setFont(font)
+
+    # Select the agent adapter: --adapter=<name> or CONFIG_EDITOR_ADAPTER env,
+    # then the build-time default, else the first registered (opencode).
+    adapter_name = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("--adapter="):
+            adapter_name = arg.split("=", 1)[1]
+    adapter_name = adapter_name or os.environ.get("CONFIG_EDITOR_ADAPTER") or _BUILD_DEFAULT_ADAPTER
+    adapter = get_adapter(adapter_name) if adapter_name else None
+
+    # Create and show main window
+    cwd = Path(os.getcwd())
+    win = MainWindow(cwd, adapter=adapter)
+    win.show()
+
+    # Run application
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

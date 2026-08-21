@@ -50,13 +50,19 @@ jobs:
           cp opencode-config-editor.py "$asset"
           echo "asset_path=$asset" >> "$GITHUB_OUTPUT"
           echo "Generated $asset ($(wc -l < "$asset") lines)"
+          asset_ocl="openclaude-config-editor-${{ steps.meta.outputs.version }}.py"
+          cp openclaude-config-editor.py "$asset_ocl"
+          echo "asset_openclaude=$asset_ocl" >> "$GITHUB_OUTPUT"
+          echo "Generated $asset_ocl ($(wc -l < "$asset_ocl") lines)"
 
       - name: Upload artifact (workflow_dispatch)
         uses: actions/upload-artifact@v4
         if: github.ref_type != 'tag'
         with:
-          name: opencode-config-editor
-          path: ${{ steps.build.outputs.asset_path }}
+          name: config-editors
+          path: |
+            ${{ steps.build.outputs.asset_path }}
+            ${{ steps.build.outputs.asset_openclaude }}
 
       - name: Upload asset to GitHub Release (tagged)
         uses: softprops/action-gh-release@v2
@@ -67,5 +73,6 @@ jobs:
           generate_release_notes: true
           files: |
             ${{ steps.build.outputs.asset_path }}
+            ${{ steps.build.outputs.asset_openclaude }}
             CHANGELOG.md
             CHANGELOG_EN.md
