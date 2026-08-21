@@ -6654,21 +6654,44 @@ OPENCODE_ADAPTER = register_adapter(AdapterSpec(
     capabilities={"providers", "mcp", "plugins", "catalog", "tui", "runtime"},
 ))
 # openclaude config constants: top-level keys for settings.json and the global
-# ~/.openclaude.json. Derived from openclaude docs (see
-# .planning/openclaude-config-notes.md); no official JSON Schema confirmed yet.
+# ~/.openclaude.json.
+#
+# Verified against openclaude v0.28.0 (@gitlawb/openclaude) and a live install:
+#   - settings.json (user/project) real keys: model, env, hooks, statusLine,
+#     modelLimits, permissions, skipDangerousModePermissionPrompt,
+#     skipFullAccessModePermissionPrompt, plus common Claude-Code-compatible
+#     keys (outputStyle, cleanupPeriodDays, includeCoAuthoredBy,
+#     autoCompactEnabled, apiKeyHelper, enableAllProjectMcpServers).
+#   - settings.local.json commonly holds `permissions`.
+#   - A 4th, highest-precedence policy layer `managed-settings.json` exists
+#     (enterprise/MDM) — read-only, not edited here.
+#   - Global ~/.openclaude.json is mostly app STATE; the user-meaningful keys
+#     are providerProfiles, activeProviderProfileId, mcpServers.
+#   - `agentModels`/`agentRouting` appear once in the README but are absent from
+#     the shipped binary and live config; kept only for lenient back-compat.
+#   - `effortLevel`, `advisorModel`, `smartRouting`, `providerFallbackChain`,
+#     `subscriptionType` could NOT be confirmed in v0.28.0 (absent from binary,
+#     README, and live config) — treat as unverified/legacy.
 
 APP_NAME_OPENCLAUDE = "openclaude-config-editor"
 
 # Keys allowed in the layered settings.json files (user/project/local).
 OPENCLAUDE_SETTINGS_KEYS = {
-    "$schema", "model", "effortLevel", "agent", "permissions", "env", "hooks",
-    "smartRouting", "modelLimits", "providerFallbackChain", "agentModels",
-    "agentRouting", "advisorModel", "subscriptionType",
+    "$schema", "model", "agent", "permissions", "env", "hooks",
+    "statusLine", "modelLimits",
+    "skipDangerousModePermissionPrompt", "skipFullAccessModePermissionPrompt",
+    "outputStyle", "cleanupPeriodDays", "includeCoAuthoredBy",
+    "autoCompactEnabled", "apiKeyHelper", "enableAllProjectMcpServers",
+    # Unverified against v0.28.0 but tolerated for back-compat:
+    "effortLevel", "advisorModel", "smartRouting", "providerFallbackChain",
+    "agentModels", "agentRouting", "subscriptionType",
 }
 
-# Keys that live in the global ~/.openclaude.json (not settings.json).
+# Keys that live in the global ~/.openclaude.json (user-meaningful subset;
+# the file also stores app state like numStartups/tipsHistory which we preserve
+# verbatim but do not treat as config).
 OPENCLAUDE_GLOBAL_KEYS = {
-    "$schema", "theme", "verbose", "autoUpdates",
+    "$schema", "providerProfiles", "activeProviderProfileId", "mcpServers",
 }
 
 # Value-bearing fields that hold secrets and must be masked in any UI / raw view.
@@ -6921,6 +6944,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         self._extra_profiles = []   # non-dict providerProfiles entries, kept verbatim
         self._had_profiles = False  # global file already had a providerProfiles key
         self._had_agent_models = False
+        self._had_active = False    # global file already had activeProviderProfileId
         layout = QVBoxLayout(self)
 
         layout.addWidget(QLabel("Providers — providerProfiles in ~/.openclaude.json "
@@ -6938,6 +6962,15 @@ class OpenclaudeAgentModelsTab(BaseTab):
         mbtn.addWidget(del_m)
         mbtn.addStretch()
         layout.addLayout(mbtn)
+
+        # activeProviderProfileId — openclaude uses this global key to select
+        # which providerProfile is active. Editable here instead of Raw-only.
+        abar = QHBoxLayout()
+        abar.addWidget(QLabel("Active provider (activeProviderProfileId):"))
+        self.active_combo = QComboBox()
+        self.active_combo.currentIndexChanged.connect(self._edited)
+        abar.addWidget(self.active_combo, 1)
+        layout.addLayout(abar)
 
         fbar = QHBoxLayout()
         fbar.addWidget(QLabel("providerFallbackChain (comma-separated):"))
@@ -7037,6 +7070,21 @@ class OpenclaudeAgentModelsTab(BaseTab):
             self.fallback_edit.setText(", ".join(chain) if isinstance(chain, list) else "")
             self.fallback_edit.blockSignals(False)
 
+            # Populate active-provider picker from the saved profiles (stable ids).
+            self.active_combo.blockSignals(True)
+            self.active_combo.clear()
+            self.active_combo.addItem("(none / default)", "")
+            if isinstance(profiles, list):
+                for prof in profiles:
+                    if isinstance(prof, dict) and prof.get("id"):
+                        label = prof.get("name") or prof.get("id")
+                        self.active_combo.addItem(str(label), str(prof["id"]))
+            active_id = data.get("activeProviderProfileId")
+            self._had_active = "activeProviderProfileId" in data
+            aidx = self.active_combo.findData(str(active_id) if active_id else "")
+            self.active_combo.setCurrentIndex(aidx if aidx >= 0 else 0)
+            self.active_combo.blockSignals(False)
+
             self.routing_table.setRowCount(0)
             routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
             for agent, key in routing.items():
@@ -7089,6 +7137,10 @@ class OpenclaudeAgentModelsTab(BaseTab):
             data["providerProfiles"] = profiles
         if legacy_models or self._had_agent_models:
             self._put(data, "agentModels", legacy_models, {})
+
+        active = self.active_combo.currentData() or ""
+        if self._had_active or active:
+            self._put(data, "activeProviderProfileId", active, "")
 
         chain = [c.strip() for c in self.fallback_edit.text().split(",") if c.strip()]
         self._put(data, "providerFallbackChain", chain, [])

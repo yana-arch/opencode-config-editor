@@ -74,6 +74,13 @@ def test_targets_shape(tmp_path):
 
 
 def test_settings_keys_defined():
+    # Verified-real settings keys present.
+    assert "model" in app.OPENCLAUDE_SETTINGS_KEYS
+    assert "statusLine" in app.OPENCLAUDE_SETTINGS_KEYS
+    assert "skipDangerousModePermissionPrompt" in app.OPENCLAUDE_SETTINGS_KEYS
+    # Legacy/back-compat key still tolerated.
     assert "agentModels" in app.OPENCLAUDE_SETTINGS_KEYS
-    assert "theme" in app.OPENCLAUDE_GLOBAL_KEYS
+    # Global file real user-meaningful keys.
+    assert "providerProfiles" in app.OPENCLAUDE_GLOBAL_KEYS
+    assert "activeProviderProfileId" in app.OPENCLAUDE_GLOBAL_KEYS
     assert "api_key" in app.OPENCLAUDE_SECRET_FIELDS

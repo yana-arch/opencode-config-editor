@@ -155,6 +155,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         self._extra_profiles = []   # non-dict providerProfiles entries, kept verbatim
         self._had_profiles = False  # global file already had a providerProfiles key
         self._had_agent_models = False
+        self._had_active = False    # global file already had activeProviderProfileId
         layout = QVBoxLayout(self)
 
         layout.addWidget(QLabel("Providers — providerProfiles in ~/.openclaude.json "
@@ -172,6 +173,15 @@ class OpenclaudeAgentModelsTab(BaseTab):
         mbtn.addWidget(del_m)
         mbtn.addStretch()
         layout.addLayout(mbtn)
+
+        # activeProviderProfileId — openclaude uses this global key to select
+        # which providerProfile is active. Editable here instead of Raw-only.
+        abar = QHBoxLayout()
+        abar.addWidget(QLabel("Active provider (activeProviderProfileId):"))
+        self.active_combo = QComboBox()
+        self.active_combo.currentIndexChanged.connect(self._edited)
+        abar.addWidget(self.active_combo, 1)
+        layout.addLayout(abar)
 
         fbar = QHBoxLayout()
         fbar.addWidget(QLabel("providerFallbackChain (comma-separated):"))
@@ -271,6 +281,21 @@ class OpenclaudeAgentModelsTab(BaseTab):
             self.fallback_edit.setText(", ".join(chain) if isinstance(chain, list) else "")
             self.fallback_edit.blockSignals(False)
 
+            # Populate active-provider picker from the saved profiles (stable ids).
+            self.active_combo.blockSignals(True)
+            self.active_combo.clear()
+            self.active_combo.addItem("(none / default)", "")
+            if isinstance(profiles, list):
+                for prof in profiles:
+                    if isinstance(prof, dict) and prof.get("id"):
+                        label = prof.get("name") or prof.get("id")
+                        self.active_combo.addItem(str(label), str(prof["id"]))
+            active_id = data.get("activeProviderProfileId")
+            self._had_active = "activeProviderProfileId" in data
+            aidx = self.active_combo.findData(str(active_id) if active_id else "")
+            self.active_combo.setCurrentIndex(aidx if aidx >= 0 else 0)
+            self.active_combo.blockSignals(False)
+
             self.routing_table.setRowCount(0)
             routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
             for agent, key in routing.items():
@@ -323,6 +348,10 @@ class OpenclaudeAgentModelsTab(BaseTab):
             data["providerProfiles"] = profiles
         if legacy_models or self._had_agent_models:
             self._put(data, "agentModels", legacy_models, {})
+
+        active = self.active_combo.currentData() or ""
+        if self._had_active or active:
+            self._put(data, "activeProviderProfileId", active, "")
 
         chain = [c.strip() for c in self.fallback_edit.text().split(",") if c.strip()]
         self._put(data, "providerFallbackChain", chain, [])

@@ -78,3 +78,43 @@ Plan: derive known-keys set from the list above until a schema is confirmed.
 
 `agentModels[*].api_key` is stored in **plaintext** in settings.json. The editor MUST mask
 these fields and must never commit them. Same for any token-bearing values.
+
+## VERIFIED against a live install (openclaude @gitlawb v0.28.0)
+
+Inspected the shipped binary (`dist/cli.mjs`) and a real config on disk.
+This supersedes the doc-derived guesses above where they conflict.
+
+### Settings layers (confirmed)
+- `~/.openclaude/settings.json` (user), `.openclaude/settings.json` (project),
+  `.openclaude/settings.local.json` (local) — later wins. CONFIRMED.
+- **NEW: `managed-settings.json`** is a 4th, HIGHEST-precedence policy layer
+  (enterprise/MDM, read via `getManagedFilePath()`; ~130 `policySettings` refs,
+  `strictPluginOnlyCustomization`, etc.). Read-only; the editor does not write
+  it but the effective-merge view is technically incomplete without it.
+
+### Real `settings.json` keys (from a live file)
+`model`, `env`, `hooks`, `statusLine`, `modelLimits`,
+`skipDangerousModePermissionPrompt`, `skipFullAccessModePermissionPrompt`;
+`permissions` typically in `settings.local.json`. Common CC-compatible keys
+also honored: `outputStyle`, `cleanupPeriodDays`, `includeCoAuthoredBy`,
+`autoCompactEnabled`, `apiKeyHelper`, `enableAllProjectMcpServers`.
+
+### Global `~/.openclaude.json` (CORRECTION)
+It is NOT `{theme, verbose, autoUpdates}`. It is mostly **app state**
+(`numStartups`, `tipsHistory`, `projects`, `skillUsage`, `firstStartTime`, …).
+User-meaningful keys: **`providerProfiles`** (list of
+`{id,name,provider,baseUrl,model[,apiKey]}`), **`activeProviderProfileId`**
+(selects the active profile; default = ANTHROPIC_DEFAULT_PROFILE), and
+**`mcpServers`**. => The editor must NOT rewrite this file unless a provider
+field actually changed (implemented: per-tab `_dirty` guard).
+
+### Keys that could NOT be confirmed in v0.28.0 (treat as legacy/unverified)
+`effortLevel`, `advisorModel`, `smartRouting`, `providerFallbackChain`,
+`subscriptionType` — absent from binary, README, and live config.
+`agentModels`/`agentRouting` appear ONCE in the README but are absent from the
+binary and live config. Kept only for lenient round-trip/back-compat.
+
+### Editor gaps still open
+- No `managed-settings.json` in the effective/inherited view.
+- `mcpServers` (global) not editable via form (Raw only).
+- Form still lacks `statusLine`/`modelLimits`/permission-mode/env/hooks editors.

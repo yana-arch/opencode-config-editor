@@ -210,3 +210,25 @@ def test_effort_level_not_baked_from_inherited(oc_win, tmp_path):
     oc_win._save()
     proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
     assert "effortLevel" not in proj      # inherited 'high' NOT written to project
+
+
+def test_active_provider_profile_roundtrip(oc_win, tmp_path):
+    """The Active provider picker reads/writes activeProviderProfileId without
+    clobbering the profiles list."""
+    gpath = tmp_path / "cfghome.json"
+    gpath.write_text(json.dumps({
+        "activeProviderProfileId": "p2",
+        "providerProfiles": [
+            {"id": "p1", "name": "First", "model": "m1"},
+            {"id": "p2", "name": "Second", "model": "m2"},
+        ],
+    }), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+    tab = oc_win._agent_models_tab
+    assert tab.active_combo.currentData() == "p2"       # loaded correctly
+    tab.active_combo.setCurrentIndex(tab.active_combo.findData("p1"))
+    oc_win._save()
+    saved = json.loads(gpath.read_text())
+    assert saved["activeProviderProfileId"] == "p1"
+    assert len(saved["providerProfiles"]) == 2
