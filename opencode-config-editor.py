@@ -1804,6 +1804,55 @@ class JsonImportDialog(QDialog):
             QMessageBox.warning(self, "Invalid JSON", str(e))
 
 
+# Shared base for form-style tabs.
+#
+# A BaseTab bundles the small helpers that config tabs repeat: "touched"-group
+# tracking (only serialize sections the user actually edited) and the
+# widget<->value setters. New tabs (opencode or a future agent adapter) inherit
+# this instead of copy-pasting _t/_put/_set_* into every tab.
+
+class BaseTab(QWidget):
+    """Base class for form tabs with touched-tracking and value helpers."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self._touched = set()
+
+    def _t(self, group):
+        """Return a slot that marks `group` touched and flags the doc dirty."""
+        def _h(*_):
+            self._touched.add(group)
+            self.app.mark_dirty()
+        return _h
+
+    def _put(self, d, k, val, empty):
+        """Set d[k]=val, or remove the key when val equals the 'empty' sentinel."""
+        if val != empty:
+            d[k] = val
+        else:
+            d.pop(k, None)
+
+    def _set_checked(self, cb, val):
+        cb.blockSignals(True)
+        cb.setChecked(bool(val))
+        cb.blockSignals(False)
+
+    def _set_spin(self, spin, val):
+        spin.blockSignals(True)
+        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
+        spin.blockSignals(False)
+
+    def _set_double(self, spin, val):
+        spin.blockSignals(True)
+        spin.setValue(float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else spin.minimum())
+        spin.blockSignals(False)
+
+    def _set_combo(self, combo, val, fallback):
+        combo.blockSignals(True)
+        idx = combo.findData(val)
+        combo.setCurrentIndex(idx if idx >= 0 else fallback)
+        combo.blockSignals(False)
 # Model editing and management dialogs (Models Manager and friends)
 class ModelEditDialog(QDialog):
     """Enhanced model edit dialog with validation"""
@@ -5100,13 +5149,11 @@ class BoolMapEditor(QWidget):
             self.app.mark_dirty()
 
 
-class RuntimeTab(QWidget):
+class RuntimeTab(BaseTab):
     """Server, session, attachment, advanced and experimental settings."""
 
     def __init__(self, app):
-        super().__init__()
-        self.app = app
-        self._touched = set()
+        super().__init__(app)
 
         outer = QVBoxLayout(self)
         scroll = QScrollArea()
@@ -5220,28 +5267,6 @@ class RuntimeTab(QWidget):
         s.setSpecialValueText("(unset)")
         s.valueChanged.connect(lambda *_: self.app.mark_dirty())
         return s
-
-    def _t(self, group):
-        def _h(*_):
-            self._touched.add(group)
-            self.app.mark_dirty()
-        return _h
-
-    def _set_checked(self, cb, val):
-        cb.blockSignals(True)
-        cb.setChecked(bool(val))
-        cb.blockSignals(False)
-
-    def _set_spin(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
-        spin.blockSignals(False)
-
-    def _put(self, d, k, val, empty):
-        if val != empty:
-            d[k] = val
-        else:
-            d.pop(k, None)
 
     def _build_policies_table(self):
         w = QWidget()
@@ -6031,13 +6056,11 @@ class TuiPluginEditor(QWidget):
         data.pop("plugin_enabled", None)
 
 
-class TuiTab(QWidget):
+class TuiTab(BaseTab):
     """Editor for the tui.json schema."""
 
     def __init__(self, app):
-        super().__init__()
-        self.app = app
-        self._touched = set()
+        super().__init__(app)
         form = QFormLayout(self)
 
         self.schema_edit = MaskedLineEdit("", field_name="schema")
@@ -6128,33 +6151,6 @@ class TuiTab(QWidget):
             self._touched.add(group)
             self.app.mark_dirty("tui")
         return _h
-
-    def _set_checked(self, cb, val):
-        cb.blockSignals(True)
-        cb.setChecked(bool(val))
-        cb.blockSignals(False)
-
-    def _set_combo(self, combo, val, fallback):
-        combo.blockSignals(True)
-        idx = combo.findData(val)
-        combo.setCurrentIndex(idx if idx >= 0 else fallback)
-        combo.blockSignals(False)
-
-    def _set_spin(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
-        spin.blockSignals(False)
-
-    def _set_double(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else spin.minimum())
-        spin.blockSignals(False)
-
-    def _put(self, d, k, val, empty):
-        if val != empty:
-            d[k] = val
-        else:
-            d.pop(k, None)
 
     def refresh(self):
         data = self.app.cfg_tui.data if self.app.cfg_tui else {}

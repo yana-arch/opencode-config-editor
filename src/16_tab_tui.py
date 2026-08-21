@@ -255,13 +255,11 @@ class TuiPluginEditor(QWidget):
         data.pop("plugin_enabled", None)
 
 
-class TuiTab(QWidget):
+class TuiTab(BaseTab):
     """Editor for the tui.json schema."""
 
     def __init__(self, app):
-        super().__init__()
-        self.app = app
-        self._touched = set()
+        super().__init__(app)
         form = QFormLayout(self)
 
         self.schema_edit = MaskedLineEdit("", field_name="schema")
@@ -352,33 +350,6 @@ class TuiTab(QWidget):
             self._touched.add(group)
             self.app.mark_dirty("tui")
         return _h
-
-    def _set_checked(self, cb, val):
-        cb.blockSignals(True)
-        cb.setChecked(bool(val))
-        cb.blockSignals(False)
-
-    def _set_combo(self, combo, val, fallback):
-        combo.blockSignals(True)
-        idx = combo.findData(val)
-        combo.setCurrentIndex(idx if idx >= 0 else fallback)
-        combo.blockSignals(False)
-
-    def _set_spin(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
-        spin.blockSignals(False)
-
-    def _set_double(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else spin.minimum())
-        spin.blockSignals(False)
-
-    def _put(self, d, k, val, empty):
-        if val != empty:
-            d[k] = val
-        else:
-            d.pop(k, None)
 
     def refresh(self):
         data = self.app.cfg_tui.data if self.app.cfg_tui else {}

@@ -20,6 +20,7 @@ ORDER = [
     "05_provider_fetch.py",
     "05b_adapter.py",
     "06_widgets_common.py",
+    "06b_tab_base.py",
     "07_widgets_models.py",
     "08_widgets_catalog.py",
     "09_tab_providers.py",
