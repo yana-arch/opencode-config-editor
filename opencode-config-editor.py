@@ -355,6 +355,44 @@ def section(cfg_data, key: str) -> dict:
     v = cfg_data.get(key) if isinstance(cfg_data, dict) else None
     return v if isinstance(v, dict) else {}
 
+
+def deep_merge(base: dict, incoming: dict) -> dict:
+    """Recursively merge `incoming` into a copy of `base` (later wins).
+
+    Nested dicts are merged key-by-key; any non-dict value replaces wholesale.
+    Generic building block for layered configs (e.g. openclaude's
+    user -> project -> local settings.json chain).
+    """
+    out = dict(base) if isinstance(base, dict) else {}
+    for k, v in (incoming or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def merge_layers(layers) -> dict:
+    """Merge an ordered iterable of config dicts; later layers override earlier."""
+    result: dict = {}
+    for layer in layers:
+        if isinstance(layer, dict):
+            result = deep_merge(result, layer)
+    return result
+
+
+def config_home(default_dir, env_vars=()) -> Path:
+    """Resolve a config directory, honoring env overrides (first set wins).
+
+    e.g. config_home("~/.openclaude", ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR")).
+    """
+    for name in env_vars:
+        val = os.environ.get(name)
+        if val:
+            return Path(val).expanduser()
+    return Path(default_dir).expanduser()
+
+
 class ConfigFile:
     """Enhanced config file handler with backup and validation"""
 

@@ -174,3 +174,52 @@ def test_config_file_rejects_invalid_json(tmp_path):
     cf = app.ConfigFile(p, "opencode")
     assert cf.load() is False
     assert cf.error
+
+
+# --- layered config helpers (for multi-layer adapters like openclaude) -----
+
+def test_deep_merge_later_wins_and_recurses():
+    base = {"a": {"x": 1, "y": 2}, "keep": 1}
+    inc = {"a": {"y": 3, "z": 4}, "new": 5}
+    out = app.deep_merge(base, inc)
+    assert out == {"a": {"x": 1, "y": 3, "z": 4}, "keep": 1, "new": 5}
+
+
+def test_deep_merge_non_dict_replaces_wholesale():
+    assert app.deep_merge({"a": {"x": 1}}, {"a": 5}) == {"a": 5}
+    assert app.deep_merge({"a": [1, 2]}, {"a": [3]}) == {"a": [3]}
+
+
+def test_merge_layers_user_project_local_order():
+    user = {"model": "sonnet", "env": {"A": "1"}}
+    project = {"model": "gpt-4o", "env": {"B": "2"}}
+    local = {"env": {"A": "override"}}
+    out = app.merge_layers([user, project, local])
+    assert out["model"] == "gpt-4o"                      # project overrides user
+    assert out["env"] == {"A": "override", "B": "2"}     # deep-merged, local wins A
+
+
+def test_merge_layers_skips_non_dicts():
+    assert app.merge_layers([{"a": 1}, None, "nope", {"b": 2}]) == {"a": 1, "b": 2}
+
+
+def test_config_home_default_when_no_env(monkeypatch):
+    monkeypatch.delenv("OPENCLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    home = app.config_home("~/.openclaude", ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"))
+    from pathlib import Path
+    assert home == Path("~/.openclaude").expanduser()
+
+
+def test_config_home_first_env_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENCLAUDE_CONFIG_DIR", str(tmp_path / "primary"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "legacy"))
+    home = app.config_home("~/.openclaude", ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"))
+    assert home == (tmp_path / "primary")
+
+
+def test_config_home_falls_back_to_legacy_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENCLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "legacy"))
+    home = app.config_home("~/.openclaude", ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"))
+    assert home == (tmp_path / "legacy")
