@@ -17,6 +17,12 @@ class AdapterSpec:
     targets_fn: Callable                       # (cwd) -> [(label, Path, kind)]
     make_tabs_fn: Callable                     # (window) -> [(tab_widget, title, kind|None)]
     capabilities: set = field(default_factory=set)
+    # Optional session hooks. When None, MainWindow uses its built-in opencode
+    # behavior; an adapter with a different config topology (e.g. openclaude's
+    # layered settings) provides these to take over load/refresh/save.
+    initial_load_fn: Optional[Callable] = None   # (window) -> None
+    refresh_fn: Optional[Callable] = None        # (window) -> None
+    save_fn: Optional[Callable] = None           # (window) -> None
 
     def targets(self, cwd):
         return self.targets_fn(cwd)

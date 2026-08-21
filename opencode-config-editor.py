@@ -1622,6 +1622,12 @@ class AdapterSpec:
     targets_fn: Callable                       # (cwd) -> [(label, Path, kind)]
     make_tabs_fn: Callable                     # (window) -> [(tab_widget, title, kind|None)]
     capabilities: set = field(default_factory=set)
+    # Optional session hooks. When None, MainWindow uses its built-in opencode
+    # behavior; an adapter with a different config topology (e.g. openclaude's
+    # layered settings) provides these to take over load/refresh/save.
+    initial_load_fn: Optional[Callable] = None   # (window) -> None
+    refresh_fn: Optional[Callable] = None        # (window) -> None
+    save_fn: Optional[Callable] = None           # (window) -> None
 
     def targets(self, cwd):
         return self.targets_fn(cwd)
@@ -6749,6 +6755,205 @@ def _openclaude_targets(cwd, config_dir=None):
         ("Local settings.local.json", cf.layer_files["local"], "local"),
         ("Global ~/.openclaude.json", cf.global_file, "global"),
     ]
+# openclaude editor tabs. Minimal but functional: a Settings form (scalar keys)
+# and a per-layer Raw JSON editor. Both operate on the layer currently selected
+# on the window (win.oc_layer) via win.oc_layered (a LayeredConfigFile).
+
+class OpenclaudeSettingsTab(BaseTab):
+    """Form for common scalar settings of the selected layer."""
+
+    EFFORTS = ["", "low", "medium", "high", "xhigh", "max"]
+    LAYERS = ["user", "project", "local"]
+
+    def __init__(self, app):
+        super().__init__(app)
+        form = QFormLayout(self)
+
+        self.layer_combo = QComboBox()
+        for lk in self.LAYERS:
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        form.addRow("Edit layer:", self.layer_combo)
+
+        self.model_edit = QLineEdit()
+        self.effort_combo = QComboBox()
+        for e in self.EFFORTS:
+            self.effort_combo.addItem(e or "(default)", e)
+        self.agent_edit = QLineEdit()
+        self.advisor_edit = QLineEdit()
+        for w in (self.model_edit, self.agent_edit, self.advisor_edit):
+            w.textChanged.connect(self._edited)
+        self.effort_combo.currentIndexChanged.connect(self._edited)
+
+        form.addRow("model:", self.model_edit)
+        form.addRow("effortLevel:", self.effort_combo)
+        form.addRow("agent:", self.agent_edit)
+        form.addRow("advisorModel:", self.advisor_edit)
+
+        info = QLabel("Values shown are for the selected layer only. The effective "
+                      "config is the deep-merge user → project → local.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: gray;")
+        form.addRow(info)
+
+    def _on_layer_change(self, *_):
+        self.app.oc_layer = self.layer_combo.currentData()
+        self.app.refresh_tabs()
+
+    def _edited(self, *_):
+        self.app.status_bar.showMessage("Unsaved changes…")
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        data = layered.layer(self.app.oc_layer) if layered else {}
+        idx = self.layer_combo.findData(self.app.oc_layer)
+        self.layer_combo.blockSignals(True)
+        self.layer_combo.setCurrentIndex(max(0, idx))
+        self.layer_combo.blockSignals(False)
+        for w in (self.model_edit, self.agent_edit, self.advisor_edit, self.effort_combo):
+            w.blockSignals(True)
+        self.model_edit.setText(str(data.get("model", "")))
+        self.agent_edit.setText(str(data.get("agent", "")))
+        self.advisor_edit.setText(str(data.get("advisorModel", "")))
+        eidx = self.effort_combo.findData(data.get("effortLevel", ""))
+        self.effort_combo.setCurrentIndex(eidx if eidx >= 0 else 0)
+        for w in (self.model_edit, self.agent_edit, self.advisor_edit, self.effort_combo):
+            w.blockSignals(False)
+
+    def collect(self, data):
+        self._put(data, "model", self.model_edit.text().strip(), "")
+        self._put(data, "effortLevel", self.effort_combo.currentData() or "", "")
+        self._put(data, "agent", self.agent_edit.text().strip(), "")
+        self._put(data, "advisorModel", self.advisor_edit.text().strip(), "")
+
+
+class OpenclaudeRawTab(BaseTab):
+    """Raw JSON editor for the selected layer (full fidelity, incl. secrets)."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        layout = QVBoxLayout(self)
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel(" Layer: "))
+        self.layer_combo = QComboBox()
+        for lk in ("user", "project", "local", "global"):
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        bar.addWidget(self.layer_combo)
+        bar.addStretch()
+        layout.addLayout(bar)
+
+        self.editor = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = JSONHighlighter(self.editor.document())
+        self.editor.textChanged.connect(self._on_text)
+        self._modified = False
+        layout.addWidget(self.editor)
+
+    def _on_layer_change(self, *_):
+        self._raw_layer = self.layer_combo.currentData()
+        self.refresh()
+
+    def _on_text(self, *_):
+        self._modified = True
+        self.app.status_bar.showMessage("Unsaved changes…")
+
+    def _current_raw_layer(self):
+        return getattr(self, "_raw_layer", None) or self.layer_combo.currentData() or "project"
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        layer = self._current_raw_layer()
+        if layered is None:
+            return
+        data = layered.global_data if layer == "global" else layered.layer(layer)
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+        self.editor.blockSignals(False)
+        self._modified = False
+
+    def parsed(self):
+        """Return (layer, dict) from the editor, or (layer, None) if invalid."""
+        try:
+            return self._current_raw_layer(), json.loads(self.editor.toPlainText())
+        except json.JSONDecodeError:
+            return self._current_raw_layer(), None
+# openclaude adapter registration + session hooks.
+#
+# openclaude's config topology (layered settings.json + a global file) differs
+# from opencode's fixed pair, so this adapter supplies the initial_load/refresh/
+# save session hooks that MainWindow calls instead of its built-in opencode path.
+
+def _openclaude_make_tabs(win):
+    win.oc_layer = "project"          # layer currently edited by the form
+    win.oc_layered = None             # set by initial_load hook
+    settings_tab = OpenclaudeSettingsTab(win)
+    raw_tab = OpenclaudeRawTab(win)
+    win._agent_tabs = [settings_tab, raw_tab]
+    win._agent_raw_tab = raw_tab
+    return [
+        (settings_tab, "Settings", "settings"),
+        (raw_tab, "Raw (per layer)", None),
+    ]
+
+
+def _openclaude_initial_load(win):
+    win.oc_layer = getattr(win, "oc_layer", "project")
+    win.oc_layered = LayeredConfigFile(win.cwd)
+    win.oc_layered.load()
+    win.refresh_tabs()
+
+
+def _openclaude_refresh(win):
+    for tab in win._agent_tabs:
+        tab.refresh()
+
+
+def _openclaude_save(win):
+    layered = win.oc_layered
+    raw = win._agent_raw_tab
+    # If the raw editor was edited, it is the source of truth for its layer.
+    if raw._modified:
+        layer, parsed = raw.parsed()
+        if parsed is None:
+            win.status_bar.showMessage("Raw JSON invalid — not saved")
+            return
+        if layer == "global":
+            win.status_bar.showMessage("Editing the global file is not supported yet")
+            return
+        ok, msg = layered.save_layer(layer, parsed)
+    else:
+        layer = win.oc_layer
+        base = dict(layered.layer(layer))
+        for tab in win._agent_tabs:
+            if hasattr(tab, "collect"):
+                tab.collect(base)
+        ok, msg = layered.save_layer(layer, base)
+    win.status_bar.showMessage(msg if ok else f"Save error: {msg}")
+    win.refresh_tabs()
+
+
+OPENCLAUDE_ADAPTER = register_adapter(AdapterSpec(
+    name="openclaude",
+    app_title=APP_NAME_OPENCLAUDE,
+    version=APP_VERSION,
+    kinds=["user", "project", "local", "global"],
+    known_keys={
+        "user": OPENCLAUDE_SETTINGS_KEYS,
+        "project": OPENCLAUDE_SETTINGS_KEYS,
+        "local": OPENCLAUDE_SETTINGS_KEYS,
+        "global": OPENCLAUDE_GLOBAL_KEYS,
+    },
+    raw_files=[("settings.json", "project")],
+    targets_fn=_openclaude_targets,
+    make_tabs_fn=_openclaude_make_tabs,
+    capabilities={"layered", "agent_routing"},
+    initial_load_fn=_openclaude_initial_load,
+    refresh_fn=_openclaude_refresh,
+    save_fn=_openclaude_save,
+))
 class MainWindow(QMainWindow):
     """Enhanced main window with undo/redo, themes, and better UX"""
 
@@ -6787,7 +6992,14 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_status_bar()
 
-        self._load_global()
+        self._do_initial_load()
+
+    def _do_initial_load(self):
+        """Initial config load — adapter hook if provided, else opencode global."""
+        if self.adapter and self.adapter.initial_load_fn:
+            self.adapter.initial_load_fn(self)
+        else:
+            self._load_global()
 
     # --- backward-compat properties over per-kind state dicts ---
     # Keep opencode call sites (self.cfg_oc, self.dirty_tui, ...) working while
@@ -6969,34 +7181,42 @@ class MainWindow(QMainWindow):
         self.act_select_all.triggered.connect(self._select_all)
         medit.addAction(self.act_select_all)
 
-        # Tools menu
+        # Tools menu — catalog + import actions are opencode-specific; only
+        # wire them when the active adapter declares the matching capability.
+        caps = self.adapter.capabilities if self.adapter else set()
         mtools = mb.addMenu("&Tools")
 
-        self.act_catalog = QAction("Load Model &Catalog...", self)
-        self.act_catalog.triggered.connect(self.load_model_catalog)
-        mtools.addAction(self.act_catalog)
+        if "catalog" in caps:
+            self.act_catalog = QAction("Load Model &Catalog...", self)
+            self.act_catalog.triggered.connect(self.load_model_catalog)
+            mtools.addAction(self.act_catalog)
 
-        self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
-        self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
-        mtools.addAction(self.act_browse_catalog)
+            self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
+            self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
+            mtools.addAction(self.act_browse_catalog)
 
-        self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
-        self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
-        mtools.addAction(self.act_apply_catalog)
+            self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
+            self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
+            mtools.addAction(self.act_apply_catalog)
 
-        mtools.addSeparator()
+            mtools.addSeparator()
 
-        self.act_imp_provider = QAction("Import &Providers...", self)
-        self.act_imp_provider.triggered.connect(self.tab_providers._import_providers)
-        mtools.addAction(self.act_imp_provider)
+        if "providers" in caps:
+            self.act_imp_provider = QAction("Import &Providers...", self)
+            self.act_imp_provider.triggered.connect(self.tab_providers._import_providers)
+            mtools.addAction(self.act_imp_provider)
 
-        self.act_imp_mcp = QAction("Import &MCP Servers...", self)
-        self.act_imp_mcp.triggered.connect(self.tab_mcp._import_servers)
-        mtools.addAction(self.act_imp_mcp)
+        if "mcp" in caps:
+            self.act_imp_mcp = QAction("Import &MCP Servers...", self)
+            self.act_imp_mcp.triggered.connect(self.tab_mcp._import_servers)
+            mtools.addAction(self.act_imp_mcp)
 
-        self.act_imp_plugin = QAction("Import &Plugins...", self)
-        self.act_imp_plugin.triggered.connect(self.tab_plugins._import_plugins)
-        mtools.addAction(self.act_imp_plugin)
+        if "plugins" in caps:
+            self.act_imp_plugin = QAction("Import &Plugins...", self)
+            self.act_imp_plugin.triggered.connect(self.tab_plugins._import_plugins)
+            mtools.addAction(self.act_imp_plugin)
+
+        mtools.menuAction().setVisible(not mtools.isEmpty())
 
         # View menu
         mview = mb.addMenu("&View")
@@ -7099,6 +7319,10 @@ class MainWindow(QMainWindow):
         self.act_recent.setEnabled(bool(self.recent_files))
 
     def _on_mode_changed(self, idx: int):
+        # Global/Local project switching is opencode-specific; adapters with
+        # their own initial_load own their loading and ignore this.
+        if self.adapter and self.adapter.initial_load_fn:
+            return
         if idx == 0:
             self._load_global()
         elif idx == 1:
@@ -7228,7 +7452,10 @@ class MainWindow(QMainWindow):
         self.refresh_tabs()
 
     def refresh_tabs(self):
-        """Refresh all tabs — opencode tabs from cfg_oc, tui tab from cfg_tui."""
+        """Refresh all tabs. Adapter hook if provided, else opencode behavior."""
+        if self.adapter and self.adapter.refresh_fn:
+            self.adapter.refresh_fn(self)
+            return
         if self.cfg_oc:
             for tab in self._oc_tabs:
                 tab.refresh()
@@ -7412,6 +7639,9 @@ class MainWindow(QMainWindow):
             current_tab.table.selectAll()
 
     def _save(self):
+        if self.adapter and self.adapter.save_fn:
+            self.adapter.save_fn(self)
+            return
         if self.cfg_oc is None and self.cfg_tui is None:
             QMessageBox.information(self, "Save", "No file is currently open")
             return
@@ -7707,9 +7937,18 @@ def main():
     font.setPointSize(settings.get_font_size())
     QApplication.setFont(font)
 
+    # Select the agent adapter: --adapter=<name> or CONFIG_EDITOR_ADAPTER env,
+    # defaulting to the first registered (opencode).
+    adapter_name = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("--adapter="):
+            adapter_name = arg.split("=", 1)[1]
+    adapter_name = adapter_name or os.environ.get("CONFIG_EDITOR_ADAPTER")
+    adapter = get_adapter(adapter_name) if adapter_name else None
+
     # Create and show main window
     cwd = Path(os.getcwd())
-    win = MainWindow(cwd)
+    win = MainWindow(cwd, adapter=adapter)
     win.show()
 
     # Run application

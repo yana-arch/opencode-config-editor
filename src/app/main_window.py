@@ -36,7 +36,14 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_status_bar()
 
-        self._load_global()
+        self._do_initial_load()
+
+    def _do_initial_load(self):
+        """Initial config load — adapter hook if provided, else opencode global."""
+        if self.adapter and self.adapter.initial_load_fn:
+            self.adapter.initial_load_fn(self)
+        else:
+            self._load_global()
 
     # --- backward-compat properties over per-kind state dicts ---
     # Keep opencode call sites (self.cfg_oc, self.dirty_tui, ...) working while
@@ -218,34 +225,42 @@ class MainWindow(QMainWindow):
         self.act_select_all.triggered.connect(self._select_all)
         medit.addAction(self.act_select_all)
 
-        # Tools menu
+        # Tools menu — catalog + import actions are opencode-specific; only
+        # wire them when the active adapter declares the matching capability.
+        caps = self.adapter.capabilities if self.adapter else set()
         mtools = mb.addMenu("&Tools")
 
-        self.act_catalog = QAction("Load Model &Catalog...", self)
-        self.act_catalog.triggered.connect(self.load_model_catalog)
-        mtools.addAction(self.act_catalog)
+        if "catalog" in caps:
+            self.act_catalog = QAction("Load Model &Catalog...", self)
+            self.act_catalog.triggered.connect(self.load_model_catalog)
+            mtools.addAction(self.act_catalog)
 
-        self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
-        self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
-        mtools.addAction(self.act_browse_catalog)
+            self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
+            self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
+            mtools.addAction(self.act_browse_catalog)
 
-        self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
-        self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
-        mtools.addAction(self.act_apply_catalog)
+            self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
+            self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
+            mtools.addAction(self.act_apply_catalog)
 
-        mtools.addSeparator()
+            mtools.addSeparator()
 
-        self.act_imp_provider = QAction("Import &Providers...", self)
-        self.act_imp_provider.triggered.connect(self.tab_providers._import_providers)
-        mtools.addAction(self.act_imp_provider)
+        if "providers" in caps:
+            self.act_imp_provider = QAction("Import &Providers...", self)
+            self.act_imp_provider.triggered.connect(self.tab_providers._import_providers)
+            mtools.addAction(self.act_imp_provider)
 
-        self.act_imp_mcp = QAction("Import &MCP Servers...", self)
-        self.act_imp_mcp.triggered.connect(self.tab_mcp._import_servers)
-        mtools.addAction(self.act_imp_mcp)
+        if "mcp" in caps:
+            self.act_imp_mcp = QAction("Import &MCP Servers...", self)
+            self.act_imp_mcp.triggered.connect(self.tab_mcp._import_servers)
+            mtools.addAction(self.act_imp_mcp)
 
-        self.act_imp_plugin = QAction("Import &Plugins...", self)
-        self.act_imp_plugin.triggered.connect(self.tab_plugins._import_plugins)
-        mtools.addAction(self.act_imp_plugin)
+        if "plugins" in caps:
+            self.act_imp_plugin = QAction("Import &Plugins...", self)
+            self.act_imp_plugin.triggered.connect(self.tab_plugins._import_plugins)
+            mtools.addAction(self.act_imp_plugin)
+
+        mtools.menuAction().setVisible(not mtools.isEmpty())
 
         # View menu
         mview = mb.addMenu("&View")
@@ -348,6 +363,10 @@ class MainWindow(QMainWindow):
         self.act_recent.setEnabled(bool(self.recent_files))
 
     def _on_mode_changed(self, idx: int):
+        # Global/Local project switching is opencode-specific; adapters with
+        # their own initial_load own their loading and ignore this.
+        if self.adapter and self.adapter.initial_load_fn:
+            return
         if idx == 0:
             self._load_global()
         elif idx == 1:
@@ -477,7 +496,10 @@ class MainWindow(QMainWindow):
         self.refresh_tabs()
 
     def refresh_tabs(self):
-        """Refresh all tabs — opencode tabs from cfg_oc, tui tab from cfg_tui."""
+        """Refresh all tabs. Adapter hook if provided, else opencode behavior."""
+        if self.adapter and self.adapter.refresh_fn:
+            self.adapter.refresh_fn(self)
+            return
         if self.cfg_oc:
             for tab in self._oc_tabs:
                 tab.refresh()
@@ -661,6 +683,9 @@ class MainWindow(QMainWindow):
             current_tab.table.selectAll()
 
     def _save(self):
+        if self.adapter and self.adapter.save_fn:
+            self.adapter.save_fn(self)
+            return
         if self.cfg_oc is None and self.cfg_tui is None:
             QMessageBox.information(self, "Save", "No file is currently open")
             return

@@ -36,9 +36,11 @@ ORDER = [
     "adapters/opencode/tab_general.py",
     "adapters/opencode/tab_raw.py",
     "adapters/opencode/adapter.py",
-    # --- adapters/openclaude: layered settings.json (config layer only, WIP) ---
+    # --- adapters/openclaude: layered settings.json ---
     "adapters/openclaude/constants.py",
     "adapters/openclaude/config.py",
+    "adapters/openclaude/tabs.py",
+    "adapters/openclaude/adapter.py",
     # --- app: window + entrypoint ---
     "app/main_window.py",
     "app/main.py",

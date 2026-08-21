@@ -13,9 +13,18 @@ def main():
     font.setPointSize(settings.get_font_size())
     QApplication.setFont(font)
 
+    # Select the agent adapter: --adapter=<name> or CONFIG_EDITOR_ADAPTER env,
+    # defaulting to the first registered (opencode).
+    adapter_name = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("--adapter="):
+            adapter_name = arg.split("=", 1)[1]
+    adapter_name = adapter_name or os.environ.get("CONFIG_EDITOR_ADAPTER")
+    adapter = get_adapter(adapter_name) if adapter_name else None
+
     # Create and show main window
     cwd = Path(os.getcwd())
-    win = MainWindow(cwd)
+    win = MainWindow(cwd, adapter=adapter)
     win.show()
 
     # Run application
