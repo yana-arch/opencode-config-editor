@@ -215,7 +215,7 @@ class Validator:
             self.last_schema_fetch = current_time
             return None
 
-    def validate(self, data: dict, kind: str) -> Tuple[bool, List[str], List[str]]:
+    def validate(self, data: dict, kind: str, known_keys: set = None) -> Tuple[bool, List[str], List[str]]:
         """Validate config.
 
         Returns (hard_ok, hard_errors, schema_warnings).
@@ -225,12 +225,16 @@ class Validator:
         official opencode schema is stricter/incomplete (e.g. it rejects the
         `local` MCP type that opencode actually supports), so a valid config
         would otherwise always be flagged.
+
+        `known_keys` may be injected by the active adapter; when omitted we fall
+        back to the built-in opencode/tui key sets.
         """
         if not isinstance(data, dict):
             return False, ["Root must be a JSON object."], []
 
-        known = OPENCODE_KEYS if kind in ("opencode", "generic") else TUI_KEYS
-        hard_ok, hard = self._basic_checks(data, known)
+        if known_keys is None:
+            known_keys = OPENCODE_KEYS if kind in ("opencode", "generic") else TUI_KEYS
+        hard_ok, hard = self._basic_checks(data, known_keys)
         if not hard_ok:
             return False, hard, []
 

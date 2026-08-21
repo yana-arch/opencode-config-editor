@@ -18,6 +18,7 @@ ORDER = [
     "03_parsing.py",
     "04_catalog.py",
     "05_provider_fetch.py",
+    "05b_adapter.py",
     "06_widgets_common.py",
     "07_widgets_models.py",
     "08_widgets_catalog.py",
@@ -31,6 +32,7 @@ ORDER = [
     "16_tab_tui.py",
     "17_tab_general.py",
     "18_tab_raw.py",
+    "18b_adapter_opencode.py",
     "19_main_window.py",
     "20_main.py",
 ]
