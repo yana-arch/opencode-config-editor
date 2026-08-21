@@ -33,39 +33,67 @@ def test_openclaude_window_builds_with_adapter(oc_win):
 
 def test_openclaude_agent_models_save_with_masked_key(oc_win, tmp_path):
     models_tab = oc_win._agent_tabs[1]
-    models_tab._add_model_row("gpt", "https://api.openai.com/v1", "gpt-4o", "sk-secret-123")
+    models_tab._add_model_row({"name": "gpt", "provider": "openai",
+                               "baseUrl": "https://api.openai.com/v1", "model": "gpt-4o",
+                               "apiKey": "sk-secret-123"})
     models_tab._add_route_row("build", "gpt")
     models_tab.fallback_edit.setText("gpt, backup")
     oc_win._save()
 
-    # Providers/routing are written to the global ~/.openclaude.json (here the
-    # config dir is tmp/cfghome, so its sibling file is tmp/cfghome.json).
+    # Providers are written to the global ~/.openclaude.json as providerProfiles
+    # (here config dir is tmp/cfghome, so its sibling file is tmp/cfghome.json).
     saved = json.loads((tmp_path / "cfghome.json").read_text())
-    assert saved["agentModels"]["gpt"] == {
-        "base_url": "https://api.openai.com/v1", "model": "gpt-4o", "api_key": "sk-secret-123",
-    }
+    prof = next(p for p in saved["providerProfiles"] if p["name"] == "gpt")
+    assert prof == {"id": prof["id"], "name": "gpt", "provider": "openai",
+                    "baseUrl": "https://api.openai.com/v1", "model": "gpt-4o",
+                    "apiKey": "sk-secret-123"}
+    assert prof["id"].startswith("provider_")     # id auto-assigned for new profiles
     assert saved["agentRouting"] == {"build": "gpt"}
     assert saved["providerFallbackChain"] == ["gpt", "backup"]
 
 
+def test_openclaude_provider_profile_unknown_fields_preserved(oc_win, tmp_path):
+    """Existing fields like authHeader/authScheme must survive load -> save."""
+    models_tab = oc_win._agent_tabs[1]
+    models_tab._add_model_row({"id": "provider_abc123", "name": "Gcli",
+                               "provider": "custom",
+                               "baseUrl": "https://gcli.example/v1beta",
+                               "model": "gemini-3-flash-preview",
+                               "apiKey": "kkk", "authHeader": "X-Goog-Api-Key",
+                               "authScheme": "raw"})
+    models_tab._cell(0, 3)  # touch nothing; just save
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    prof = next(p for p in saved["providerProfiles"] if p["name"] == "Gcli")
+    assert prof["id"] == "provider_abc123"        # original id kept, not regenerated
+    assert prof["authHeader"] == "X-Goog-Api-Key"
+    assert prof["authScheme"] == "raw"
+    # editing a field works
+    assert prof["baseUrl"] == "https://gcli.example/v1beta"
+
+
 def test_openclaude_global_providers_separate_from_settings_layer(oc_win, tmp_path):
-    """agentModels go to the global file; scalar settings go to the layer."""
+    """providerProfiles go to the global file; scalar settings go to the layer."""
     oc_win._agent_settings_tab.model_edit.setText("sonnet")
-    oc_win._agent_models_tab._add_model_row("z", "https://api.z.ai/v1", "glm-5.2", "zk")
+    oc_win._agent_models_tab._add_model_row({"name": "z", "provider": "custom",
+                                             "baseUrl": "https://api.z.ai/v1",
+                                             "model": "glm-5.2", "apiKey": "zk"})
     oc_win._save()
 
     layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
     glob = json.loads((tmp_path / "cfghome.json").read_text())
     assert layer["model"] == "sonnet"
-    assert "agentModels" not in layer            # providers NOT in the settings layer
-    assert "z" in glob["agentModels"]            # providers in the global file
-    assert "model" not in glob                   # scalar setting NOT in global
+    assert "providerProfiles" not in layer        # providers NOT in the settings layer
+    names = [p["name"] for p in glob.get("providerProfiles", [])]
+    assert "z" in names                           # providers in the global file
+    assert "model" not in glob                    # scalar setting NOT in global
 
 
 def test_openclaude_api_key_field_is_masked(oc_win):
     models_tab = oc_win._agent_tabs[1]
-    models_tab._add_model_row("k", "u", "m", "sk-topsecret")
-    widget = models_tab.models_table.cellWidget(0, 3)
+    models_tab._add_model_row({"name": "k", "baseUrl": "u", "model": "m",
+                               "apiKey": "sk-topsecret"})
+    widget = models_tab.models_table.cellWidget(0, 4)
     assert widget.is_secret                       # masked by MaskedLineEdit
     assert widget.value() == "sk-topsecret"       # real value still retrievable
     assert "sk-topsecret" not in widget.edit.text()  # display is masked

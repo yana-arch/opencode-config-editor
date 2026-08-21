@@ -17,7 +17,6 @@ class OpenclaudeSettingsTab(BaseTab):
             self.layer_combo.addItem(lk, lk)
         self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
         form.addRow("Edit layer:", self.layer_combo)
-
         self.model_edit = QLineEdit()
         self.effort_combo = QComboBox()
         for e in self.EFFORTS:
@@ -33,8 +32,9 @@ class OpenclaudeSettingsTab(BaseTab):
         form.addRow("agent:", self.agent_edit)
         form.addRow("advisorModel:", self.advisor_edit)
 
-        info = QLabel("Values shown are for the selected layer only. The effective "
-                      "config is the deep-merge user → project → local.")
+        info = QLabel("Editable text = this layer's own value; greyed placeholder = "
+                      "value inherited from the effective merge (user → project → local). "
+                      "Saving writes only the fields you set into the selected layer.")
         info.setWordWrap(True)
         info.setStyleSheet("color: gray;")
         form.addRow(info)
@@ -48,20 +48,31 @@ class OpenclaudeSettingsTab(BaseTab):
 
     def refresh(self):
         layered = getattr(self.app, "oc_layered", None)
-        data = layered.layer(self.app.oc_layer) if layered else {}
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        eff = layered.effective() if layered else {}
         idx = self.layer_combo.findData(self.app.oc_layer)
         self.layer_combo.blockSignals(True)
         self.layer_combo.setCurrentIndex(max(0, idx))
         self.layer_combo.blockSignals(False)
-        for w in (self.model_edit, self.agent_edit, self.advisor_edit, self.effort_combo):
-            w.blockSignals(True)
-        self.model_edit.setText(str(data.get("model", "")))
-        self.agent_edit.setText(str(data.get("agent", "")))
-        self.advisor_edit.setText(str(data.get("advisorModel", "")))
-        eidx = self.effort_combo.findData(data.get("effortLevel", ""))
+
+        def _set(edit, key):
+            # Show the selected layer's own value as editable text; show the
+            # effective (inherited) value as greyed placeholder so nothing looks
+            # empty when the value comes from another layer.
+            edit.blockSignals(True)
+            edit.setText(str(own.get(key, "")))
+            inherited = str(eff.get(key, ""))
+            edit.setPlaceholderText(f"inherited: {inherited}" if inherited else "(unset)")
+            edit.blockSignals(False)
+
+        _set(self.model_edit, "model")
+        _set(self.agent_edit, "agent")
+        _set(self.advisor_edit, "advisorModel")
+        self.effort_combo.blockSignals(True)
+        eff_val = own.get("effortLevel", eff.get("effortLevel", ""))
+        eidx = self.effort_combo.findData(eff_val)
         self.effort_combo.setCurrentIndex(eidx if eidx >= 0 else 0)
-        for w in (self.model_edit, self.agent_edit, self.advisor_edit, self.effort_combo):
-            w.blockSignals(False)
+        self.effort_combo.blockSignals(False)
 
     def collect(self, data):
         self._put(data, "model", self.model_edit.text().strip(), "")
@@ -126,22 +137,28 @@ class OpenclaudeRawTab(BaseTab):
 
 
 class OpenclaudeAgentModelsTab(BaseTab):
-    """Editor for agentModels (with masked api_key), agentRouting and
-    providerFallbackChain of the selected layer."""
+    """Editor for provider connections in the global ~/.openclaude.json.
+
+    OpenClaude stores providers as a `providerProfiles` list of
+    {id, name, provider, baseUrl, model, apiKey, ...}. Extra/unknown fields on
+    each profile (authHeader, authScheme, id, ...) are preserved on save.
+    agentRouting / providerFallbackChain are also edited here when present.
+    """
+
+    COLS = ["name", "provider", "baseUrl", "model", "apiKey"]
 
     def __init__(self, app):
         super().__init__(app)
         layout = QVBoxLayout(self)
 
-        # --- agentModels ---
-        layout.addWidget(QLabel("Agent models — provider connections in ~/.openclaude.json "
-                                "(api_key is masked):"))
-        self.models_table = QTableWidget(0, 4)
-        self.models_table.setHorizontalHeaderLabels(["key", "base_url", "model", "api_key"])
+        layout.addWidget(QLabel("Providers — providerProfiles in ~/.openclaude.json "
+                                "(apiKey is masked; other fields like id/authScheme are preserved):"))
+        self.models_table = QTableWidget(0, len(self.COLS))
+        self.models_table.setHorizontalHeaderLabels(self.COLS)
         self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.models_table)
         mbtn = QHBoxLayout()
-        add_m = QPushButton("Add model")
+        add_m = QPushButton("Add provider")
         add_m.clicked.connect(lambda: self._add_model_row())
         del_m = QPushButton("Remove selected")
         del_m.clicked.connect(self._remove_model_row)
@@ -150,7 +167,6 @@ class OpenclaudeAgentModelsTab(BaseTab):
         mbtn.addStretch()
         layout.addLayout(mbtn)
 
-        # --- providerFallbackChain ---
         fbar = QHBoxLayout()
         fbar.addWidget(QLabel("providerFallbackChain (comma-separated):"))
         self.fallback_edit = QLineEdit()
@@ -158,8 +174,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         fbar.addWidget(self.fallback_edit)
         layout.addLayout(fbar)
 
-        # --- agentRouting ---
-        layout.addWidget(QLabel("Agent routing — agent → agentModels key ('default' = fallback):"))
+        layout.addWidget(QLabel("Agent routing — agent → profile/model key ('default' = fallback):"))
         self.routing_table = QTableWidget(0, 2)
         self.routing_table.setHorizontalHeaderLabels(["agent", "modelKey"])
         self.routing_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -175,17 +190,22 @@ class OpenclaudeAgentModelsTab(BaseTab):
         layout.addLayout(rbtn)
 
     def _edited(self, *_):
-        self.app.status_bar.showMessage("Unsaved changes…")
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
 
-    # --- agentModels rows ---
-    def _add_model_row(self, key="", base_url="", model="", api_key=""):
+    # --- provider rows (providerProfiles) ---
+    def _add_model_row(self, profile=None):
+        profile = profile if isinstance(profile, dict) else {}
         r = self.models_table.rowCount()
         self.models_table.insertRow(r)
-        self.models_table.setItem(r, 0, QTableWidgetItem(key))
-        self.models_table.setItem(r, 1, QTableWidgetItem(base_url))
-        self.models_table.setItem(r, 2, QTableWidgetItem(model))
-        masked = MaskedLineEdit(api_key, field_name="api_key")
-        self.models_table.setCellWidget(r, 3, masked)
+        name_item = QTableWidgetItem(str(profile.get("name", "")))
+        # Preserve the original profile dict (id, authHeader, authScheme, ...).
+        name_item.setData(Qt.UserRole, dict(profile))
+        self.models_table.setItem(r, 0, name_item)
+        self.models_table.setItem(r, 1, QTableWidgetItem(str(profile.get("provider", ""))))
+        self.models_table.setItem(r, 2, QTableWidgetItem(str(profile.get("baseUrl", ""))))
+        self.models_table.setItem(r, 3, QTableWidgetItem(str(profile.get("model", ""))))
+        masked = MaskedLineEdit(str(profile.get("apiKey", "")), field_name="apiKey")
+        self.models_table.setCellWidget(r, 4, masked)
         self._edited()
 
     def _remove_model_row(self):
@@ -212,12 +232,20 @@ class OpenclaudeAgentModelsTab(BaseTab):
         layered = getattr(self.app, "oc_layered", None)
         # Providers/routing live in the global ~/.openclaude.json file.
         data = layered.global_data if layered else {}
+
         self.models_table.setRowCount(0)
+        profiles = data.get("providerProfiles")
+        if isinstance(profiles, list):
+            for prof in profiles:
+                if isinstance(prof, dict):
+                    self._add_model_row(prof)
+        # Back-compat: also surface legacy agentModels {key: {...}} as rows.
         agent_models = data.get("agentModels") if isinstance(data.get("agentModels"), dict) else {}
         for key, spec in agent_models.items():
             spec = spec if isinstance(spec, dict) else {}
-            self._add_model_row(key, spec.get("base_url", ""), spec.get("model", ""),
-                                spec.get("api_key", ""))
+            self._add_model_row({"name": key, "provider": spec.get("provider", ""),
+                                 "baseUrl": spec.get("base_url", ""), "model": spec.get("model", ""),
+                                 "apiKey": spec.get("api_key", ""), "_legacy_agentModels": True})
 
         chain = data.get("providerFallbackChain")
         self.fallback_edit.blockSignals(True)
@@ -230,27 +258,47 @@ class OpenclaudeAgentModelsTab(BaseTab):
             self._add_route_row(str(agent), str(key))
 
     def collect(self, data):
-        models = {}
+        profiles = []
+        legacy_models = {}
         for r in range(self.models_table.rowCount()):
-            key_item = self.models_table.item(r, 0)
-            key = key_item.text().strip() if key_item else ""
-            if not key:
+            name_item = self.models_table.item(r, 0)
+            name = name_item.text().strip() if name_item else ""
+            if not name:
                 continue
-            spec = {}
-            base_item = self.models_table.item(r, 1)
-            model_item = self.models_table.item(r, 2)
-            widget = self.models_table.cellWidget(r, 3)
-            base_url = base_item.text().strip() if base_item else ""
-            model = model_item.text().strip() if model_item else ""
+            orig = name_item.data(Qt.UserRole) if name_item else None
+            orig = dict(orig) if isinstance(orig, dict) else {}
+            provider = self._cell(r, 1)
+            base_url = self._cell(r, 2)
+            model = self._cell(r, 3)
+            widget = self.models_table.cellWidget(r, 4)
             api_key = widget.value().strip() if widget else ""
-            if base_url:
-                spec["base_url"] = base_url
-            if model:
-                spec["model"] = model
-            if api_key:
-                spec["api_key"] = api_key
-            models[key] = spec
-        self._put(data, "agentModels", models, {})
+
+            if orig.pop("_legacy_agentModels", False):
+                spec = {}
+                if provider:
+                    spec["provider"] = provider
+                if base_url:
+                    spec["base_url"] = base_url
+                if model:
+                    spec["model"] = model
+                if api_key:
+                    spec["api_key"] = api_key
+                legacy_models[name] = spec
+                continue
+
+            prof = dict(orig)
+            prof["name"] = name
+            if not prof.get("id"):
+                prof["id"] = f"provider_{os.urandom(6).hex()}"
+            self._set_or_pop(prof, "provider", provider)
+            self._set_or_pop(prof, "baseUrl", base_url)
+            self._set_or_pop(prof, "model", model)
+            self._set_or_pop(prof, "apiKey", api_key)
+            profiles.append(prof)
+
+        self._put(data, "providerProfiles", profiles, [])
+        if legacy_models or "agentModels" in data:
+            self._put(data, "agentModels", legacy_models, {})
 
         chain = [c.strip() for c in self.fallback_edit.text().split(",") if c.strip()]
         self._put(data, "providerFallbackChain", chain, [])
@@ -264,3 +312,14 @@ class OpenclaudeAgentModelsTab(BaseTab):
             if agent and key:
                 routing[agent] = key
         self._put(data, "agentRouting", routing, {})
+
+    def _cell(self, r, c):
+        item = self.models_table.item(r, c)
+        return item.text().strip() if item else ""
+
+    @staticmethod
+    def _set_or_pop(d, k, v):
+        if v:
+            d[k] = v
+        else:
+            d.pop(k, None)
