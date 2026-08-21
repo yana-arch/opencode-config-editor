@@ -38,12 +38,28 @@ def test_openclaude_agent_models_save_with_masked_key(oc_win, tmp_path):
     models_tab.fallback_edit.setText("gpt, backup")
     oc_win._save()
 
-    saved = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    # Providers/routing are written to the global ~/.openclaude.json (here the
+    # config dir is tmp/cfghome, so its sibling file is tmp/cfghome.json).
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
     assert saved["agentModels"]["gpt"] == {
         "base_url": "https://api.openai.com/v1", "model": "gpt-4o", "api_key": "sk-secret-123",
     }
     assert saved["agentRouting"] == {"build": "gpt"}
     assert saved["providerFallbackChain"] == ["gpt", "backup"]
+
+
+def test_openclaude_global_providers_separate_from_settings_layer(oc_win, tmp_path):
+    """agentModels go to the global file; scalar settings go to the layer."""
+    oc_win._agent_settings_tab.model_edit.setText("sonnet")
+    oc_win._agent_models_tab._add_model_row("z", "https://api.z.ai/v1", "glm-5.2", "zk")
+    oc_win._save()
+
+    layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    glob = json.loads((tmp_path / "cfghome.json").read_text())
+    assert layer["model"] == "sonnet"
+    assert "agentModels" not in layer            # providers NOT in the settings layer
+    assert "z" in glob["agentModels"]            # providers in the global file
+    assert "model" not in glob                   # scalar setting NOT in global
 
 
 def test_openclaude_api_key_field_is_masked(oc_win):

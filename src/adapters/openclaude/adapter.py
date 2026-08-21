@@ -11,6 +11,8 @@ def _openclaude_make_tabs(win):
     models_tab = OpenclaudeAgentModelsTab(win)
     raw_tab = OpenclaudeRawTab(win)
     win._agent_tabs = [settings_tab, models_tab, raw_tab]
+    win._agent_settings_tab = settings_tab
+    win._agent_models_tab = models_tab
     win._agent_raw_tab = raw_tab
     return [
         (settings_tab, "Settings", "settings"),
@@ -41,17 +43,30 @@ def _openclaude_save(win):
             win.status_bar.showMessage("Raw JSON invalid — not saved")
             return
         if layer == "global":
-            win.status_bar.showMessage("Editing the global file is not supported yet")
-            return
-        ok, msg = layered.save_layer(layer, parsed)
+            ok, msg = layered.save_global(parsed)
+        else:
+            ok, msg = layered.save_layer(layer, parsed)
+        win.status_bar.showMessage(msg if ok else f"Save error: {msg}")
+        win.refresh_tabs()
+        return
+
+    # Form-based save:
+    #  - Settings tab writes scalar keys into the selected settings layer
+    #  - Agent Models tab writes agentModels/agentRouting/fallback into the
+    #    global ~/.openclaude.json (where providers live per openclaude docs)
+    layer = win.oc_layer
+    base = dict(layered.layer(layer))
+    win._agent_settings_tab.collect(base)
+    ok1, msg1 = layered.save_layer(layer, base)
+
+    gbase = dict(layered.global_data)
+    win._agent_models_tab.collect(gbase)
+    ok2, msg2 = layered.save_global(gbase)
+
+    if ok1 and ok2:
+        win.status_bar.showMessage(f"Saved layer '{layer}' + global providers")
     else:
-        layer = win.oc_layer
-        base = dict(layered.layer(layer))
-        for tab in win._agent_tabs:
-            if hasattr(tab, "collect"):
-                tab.collect(base)
-        ok, msg = layered.save_layer(layer, base)
-    win.status_bar.showMessage(msg if ok else f"Save error: {msg}")
+        win.status_bar.showMessage(f"Save error: {msg1 if not ok1 else msg2}")
     win.refresh_tabs()
 
 

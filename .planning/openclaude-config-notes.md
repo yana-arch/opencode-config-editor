@@ -55,13 +55,24 @@ Plan: derive known-keys set from the list above until a schema is confirmed.
 
 | opencode | openclaude | notes |
 |---|---|---|
-| `provider` (base_url/api_key/models) | `agentModels` {key:{base_url,api_key,model}} | closest analog |
-| `agent` | `agent` + `agentRouting` | routing is separate |
+| `provider` (base_url/api_key/models) | `agentModels` {key:{base_url,api_key,model}} | VERIFIED: lives in the **global `~/.openclaude.json`** (docs/agent-routing.md, docs/smart-routing.md) |
+| `agent` | `agent` + `agentRouting` | agentRouting also in `~/.openclaude.json` |
 | `permission` | `permissions` | similar allow/deny |
-| `model` / `small_model` | `model` + `smartRouting.simpleModel/strongModel` | |
+| `model` / `small_model` | `model` + `smartRouting.simpleModel/strongModel` | scalar `model` in settings.json |
 | `mcp` | (UNVERIFIED) | no confirmed settings.json key for MCP |
 | `plugin` | (none confirmed) | |
 | — | `hooks`, `env`, `modelLimits`, `providerFallbackChain`, `effortLevel` | openclaude-only |
+
+### VERIFIED via MCP (context7 /gitlawb/openclaude + docs)
+
+- Providers = `agentModels`, and `agentModels`/`agentRouting`/`smartRouting`
+  are configured in the **global `~/.openclaude.json`** file
+  (docs/agent-routing.md, docs/smart-routing.md). `agentModels` may ALSO appear
+  in `~/.openclaude/settings.json` (issue #1119) — the editor writes providers
+  to the global file, which is the documented primary location.
+- OpenClaude keeps its own config dir `~/.openclaude` and does NOT read legacy
+  Claude paths (README "config cutover").
+- Session metadata/logs under the resolved config dir, e.g. `~/.openclaude/bg-sessions/`.
 
 ## Security
 

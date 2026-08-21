@@ -134,7 +134,8 @@ class OpenclaudeAgentModelsTab(BaseTab):
         layout = QVBoxLayout(self)
 
         # --- agentModels ---
-        layout.addWidget(QLabel("Agent models — provider connections (api_key is masked):"))
+        layout.addWidget(QLabel("Agent models — provider connections in ~/.openclaude.json "
+                                "(api_key is masked):"))
         self.models_table = QTableWidget(0, 4)
         self.models_table.setHorizontalHeaderLabels(["key", "base_url", "model", "api_key"])
         self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -209,8 +210,8 @@ class OpenclaudeAgentModelsTab(BaseTab):
 
     def refresh(self):
         layered = getattr(self.app, "oc_layered", None)
-        data = layered.layer(self.app.oc_layer) if layered else {}
-
+        # Providers/routing live in the global ~/.openclaude.json file.
+        data = layered.global_data if layered else {}
         self.models_table.setRowCount(0)
         agent_models = data.get("agentModels") if isinstance(data.get("agentModels"), dict) else {}
         for key, spec in agent_models.items():

@@ -20,11 +20,9 @@ class LayeredConfigFile:
             "project": dot / "settings.json",
             "local": dot / "settings.local.json",
         }
-        self.global_file = self.config_dir / ".." / ".openclaude.json"
-        # Prefer the canonical ~/.openclaude.json when config_dir is the default.
-        home_global = Path("~/.openclaude.json").expanduser()
-        if not self.global_file.exists() and home_global.exists():
-            self.global_file = home_global
+        # Global file is a sibling of the config dir: ~/.openclaude -> ~/.openclaude.json
+        # (per openclaude docs, agentModels/agentRouting/smartRouting live here).
+        self.global_file = Path(str(self.config_dir) + ".json")
         self.layers = {name: {} for name in self.LAYER_ORDER}
         self.global_data = {}
         self.error = None
@@ -56,9 +54,15 @@ class LayeredConfigFile:
         """Atomically write one layer's settings.json."""
         if name not in self.layer_files:
             return False, f"Unknown layer: {name}"
+        return self._atomic_write(self.layer_files[name], data, on_ok=lambda: self.layers.__setitem__(name, data))
+
+    def save_global(self, data: dict) -> Tuple[bool, str]:
+        """Atomically write the global ~/.openclaude.json (providers/routing)."""
+        return self._atomic_write(self.global_file, data, on_ok=lambda: setattr(self, "global_data", data))
+
+    def _atomic_write(self, path, data, on_ok=None) -> Tuple[bool, str]:
         if not isinstance(data, dict):
             return False, "Root must be a JSON object."
-        path = self.layer_files[name]
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
@@ -66,7 +70,8 @@ class LayeredConfigFile:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
             os.replace(tmp, path)
-            self.layers[name] = data
+            if on_ok:
+                on_ok()
             return True, f"Saved to {path}"
         except OSError as e:
             return False, f"Save error: {e}"
