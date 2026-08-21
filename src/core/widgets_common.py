@@ -13,6 +13,7 @@ class MaskedLineEdit(QWidget):
         self.field_name = field_name
         self.is_secret = bool(self.SECRET_HINT.search(field_name))
         self._real_value = str(value) if value is not None else ""
+        self.toggle_btn = None
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -29,9 +30,12 @@ class MaskedLineEdit(QWidget):
             self.toggle_btn.toggled.connect(self._toggle_visibility)
             layout.addWidget(self.toggle_btn)
 
+    def _revealed(self) -> bool:
+        return self.toggle_btn is not None and self.toggle_btn.isChecked()
+
     def _display_value(self) -> str:
         """Get display value (masked if secret)"""
-        if not self.is_secret or self.toggle_btn.isChecked():
+        if not self.is_secret or self._revealed():
             return self._real_value
         return _mask(self._real_value)
 
@@ -46,7 +50,7 @@ class MaskedLineEdit(QWidget):
 
     def value(self) -> str:
         """Get current value"""
-        if self.is_secret and not self.toggle_btn.isChecked():
+        if self.is_secret and not self._revealed():
             return self._real_value
         return self.edit.text()
 

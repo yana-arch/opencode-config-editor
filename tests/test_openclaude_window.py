@@ -26,9 +26,33 @@ def oc_win(qapp, tmp_path, monkeypatch):
 
 def test_openclaude_window_builds_with_adapter(oc_win):
     assert oc_win.adapter.name == "openclaude"
-    assert oc_win.tabs.count() == 2            # Settings + Raw
+    assert oc_win.tabs.count() == 3            # Settings + Agent Models + Raw
     assert oc_win.oc_layered is not None       # initial_load hook ran
     assert oc_win.oc_layer == "project"
+
+
+def test_openclaude_agent_models_save_with_masked_key(oc_win, tmp_path):
+    models_tab = oc_win._agent_tabs[1]
+    models_tab._add_model_row("gpt", "https://api.openai.com/v1", "gpt-4o", "sk-secret-123")
+    models_tab._add_route_row("build", "gpt")
+    models_tab.fallback_edit.setText("gpt, backup")
+    oc_win._save()
+
+    saved = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert saved["agentModels"]["gpt"] == {
+        "base_url": "https://api.openai.com/v1", "model": "gpt-4o", "api_key": "sk-secret-123",
+    }
+    assert saved["agentRouting"] == {"build": "gpt"}
+    assert saved["providerFallbackChain"] == ["gpt", "backup"]
+
+
+def test_openclaude_api_key_field_is_masked(oc_win):
+    models_tab = oc_win._agent_tabs[1]
+    models_tab._add_model_row("k", "u", "m", "sk-topsecret")
+    widget = models_tab.models_table.cellWidget(0, 3)
+    assert widget.is_secret                       # masked by MaskedLineEdit
+    assert widget.value() == "sk-topsecret"       # real value still retrievable
+    assert "sk-topsecret" not in widget.edit.text()  # display is masked
 
 
 def test_openclaude_settings_save_roundtrip(oc_win, tmp_path):

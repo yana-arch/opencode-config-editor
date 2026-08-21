@@ -8,11 +8,13 @@ def _openclaude_make_tabs(win):
     win.oc_layer = "project"          # layer currently edited by the form
     win.oc_layered = None             # set by initial_load hook
     settings_tab = OpenclaudeSettingsTab(win)
+    models_tab = OpenclaudeAgentModelsTab(win)
     raw_tab = OpenclaudeRawTab(win)
-    win._agent_tabs = [settings_tab, raw_tab]
+    win._agent_tabs = [settings_tab, models_tab, raw_tab]
     win._agent_raw_tab = raw_tab
     return [
         (settings_tab, "Settings", "settings"),
+        (models_tab, "Agent Models", "settings"),
         (raw_tab, "Raw (per layer)", None),
     ]
 
