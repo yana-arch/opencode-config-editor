@@ -1,9 +1,10 @@
 class MainWindow(QMainWindow):
     """Enhanced main window with undo/redo, themes, and better UX"""
 
-    def __init__(self, cwd: Path):
+    def __init__(self, cwd: Path, adapter=None):
         super().__init__()
         self.cwd = Path(cwd)
+        self.adapter = adapter or default_adapter()
         self.cfg_oc = None
         self.cfg_tui = None
         self.validator = Validator()
@@ -242,36 +243,14 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.search_edit)
 
     def _build_tabs(self):
-        """Build main tabs"""
+        """Build main tabs from the active adapter."""
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.North)
         self.tabs.setMovable(True)
 
-        self.tab_general = GeneralTab(self)
-        self.tab_runtime = RuntimeTab(self)
-        self.tab_agents = AgentsTab(self)
-        self.tab_commands = CommandsTab(self)
-        self.tab_providers = ProvidersTab(self)
-        self.tab_mcp = McpTab(self)
-        self.tab_plugins = PluginsTab(self)
-        self.tab_permission = PermissionTab(self)
-        self.tab_tui = TuiTab(self)
-        self.tab_raw = RawJsonTab(self)
+        for tab, title, _kind in self.adapter.make_tabs(self):
+            self.tabs.addTab(tab, title)
 
-        self.tabs.addTab(self.tab_general, "General")
-        self.tabs.addTab(self.tab_runtime, "Runtime")
-        self.tabs.addTab(self.tab_agents, "Agents")
-        self.tabs.addTab(self.tab_commands, "Commands")
-        self.tabs.addTab(self.tab_providers, "Providers")
-        self.tabs.addTab(self.tab_mcp, "MCP Servers")
-        self.tabs.addTab(self.tab_plugins, "Plugins")
-        self.tabs.addTab(self.tab_permission, "Permissions")
-        self.tabs.addTab(self.tab_tui, "TUI")
-        self.tabs.addTab(self.tab_raw, "Raw JSON")
-
-        self._oc_tabs = [self.tab_general, self.tab_runtime, self.tab_agents,
-                         self.tab_commands, self.tab_providers, self.tab_mcp,
-                         self.tab_plugins, self.tab_permission]
         self.setCentralWidget(self.tabs)
 
     def _build_status_bar(self):
@@ -511,7 +490,8 @@ class MainWindow(QMainWindow):
             data = json.loads(text)
         except json.JSONDecodeError as e:
             return False, [f"Line {e.lineno}: {e.msg}"], []
-        return self.validator.validate(data, kind)
+        known = self.adapter.known_keys_for(kind) if self.adapter else None
+        return self.validator.validate(data, kind, known_keys=known)
 
     def _save_state(self, kind="auto"):
         k = kind

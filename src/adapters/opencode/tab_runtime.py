@@ -207,13 +207,11 @@ class BoolMapEditor(QWidget):
             self.app.mark_dirty()
 
 
-class RuntimeTab(QWidget):
+class RuntimeTab(BaseTab):
     """Server, session, attachment, advanced and experimental settings."""
 
     def __init__(self, app):
-        super().__init__()
-        self.app = app
-        self._touched = set()
+        super().__init__(app)
 
         outer = QVBoxLayout(self)
         scroll = QScrollArea()
@@ -327,28 +325,6 @@ class RuntimeTab(QWidget):
         s.setSpecialValueText("(unset)")
         s.valueChanged.connect(lambda *_: self.app.mark_dirty())
         return s
-
-    def _t(self, group):
-        def _h(*_):
-            self._touched.add(group)
-            self.app.mark_dirty()
-        return _h
-
-    def _set_checked(self, cb, val):
-        cb.blockSignals(True)
-        cb.setChecked(bool(val))
-        cb.blockSignals(False)
-
-    def _set_spin(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
-        spin.blockSignals(False)
-
-    def _put(self, d, k, val, empty):
-        if val != empty:
-            d[k] = val
-        else:
-            d.pop(k, None)
 
     def _build_policies_table(self):
         w = QWidget()

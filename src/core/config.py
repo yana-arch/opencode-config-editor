@@ -46,6 +46,44 @@ def section(cfg_data, key: str) -> dict:
     v = cfg_data.get(key) if isinstance(cfg_data, dict) else None
     return v if isinstance(v, dict) else {}
 
+
+def deep_merge(base: dict, incoming: dict) -> dict:
+    """Recursively merge `incoming` into a copy of `base` (later wins).
+
+    Nested dicts are merged key-by-key; any non-dict value replaces wholesale.
+    Generic building block for layered configs (e.g. openclaude's
+    user -> project -> local settings.json chain).
+    """
+    out = dict(base) if isinstance(base, dict) else {}
+    for k, v in (incoming or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def merge_layers(layers) -> dict:
+    """Merge an ordered iterable of config dicts; later layers override earlier."""
+    result: dict = {}
+    for layer in layers:
+        if isinstance(layer, dict):
+            result = deep_merge(result, layer)
+    return result
+
+
+def config_home(default_dir, env_vars=()) -> Path:
+    """Resolve a config directory, honoring env overrides (first set wins).
+
+    e.g. config_home("~/.openclaude", ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR")).
+    """
+    for name in env_vars:
+        val = os.environ.get(name)
+        if val:
+            return Path(val).expanduser()
+    return Path(default_dir).expanduser()
+
+
 class ConfigFile:
     """Enhanced config file handler with backup and validation"""
 
@@ -215,7 +253,7 @@ class Validator:
             self.last_schema_fetch = current_time
             return None
 
-    def validate(self, data: dict, kind: str) -> Tuple[bool, List[str], List[str]]:
+    def validate(self, data: dict, kind: str, known_keys: set = None) -> Tuple[bool, List[str], List[str]]:
         """Validate config.
 
         Returns (hard_ok, hard_errors, schema_warnings).
@@ -225,12 +263,16 @@ class Validator:
         official opencode schema is stricter/incomplete (e.g. it rejects the
         `local` MCP type that opencode actually supports), so a valid config
         would otherwise always be flagged.
+
+        `known_keys` may be injected by the active adapter; when omitted we fall
+        back to the built-in opencode/tui key sets.
         """
         if not isinstance(data, dict):
             return False, ["Root must be a JSON object."], []
 
-        known = OPENCODE_KEYS if kind in ("opencode", "generic") else TUI_KEYS
-        hard_ok, hard = self._basic_checks(data, known)
+        if known_keys is None:
+            known_keys = OPENCODE_KEYS if kind in ("opencode", "generic") else TUI_KEYS
+        hard_ok, hard = self._basic_checks(data, known_keys)
         if not hard_ok:
             return False, hard, []
 

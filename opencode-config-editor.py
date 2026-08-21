@@ -33,7 +33,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 try:
     from PySide6.QtCore import (
@@ -355,6 +355,44 @@ def section(cfg_data, key: str) -> dict:
     v = cfg_data.get(key) if isinstance(cfg_data, dict) else None
     return v if isinstance(v, dict) else {}
 
+
+def deep_merge(base: dict, incoming: dict) -> dict:
+    """Recursively merge `incoming` into a copy of `base` (later wins).
+
+    Nested dicts are merged key-by-key; any non-dict value replaces wholesale.
+    Generic building block for layered configs (e.g. openclaude's
+    user -> project -> local settings.json chain).
+    """
+    out = dict(base) if isinstance(base, dict) else {}
+    for k, v in (incoming or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def merge_layers(layers) -> dict:
+    """Merge an ordered iterable of config dicts; later layers override earlier."""
+    result: dict = {}
+    for layer in layers:
+        if isinstance(layer, dict):
+            result = deep_merge(result, layer)
+    return result
+
+
+def config_home(default_dir, env_vars=()) -> Path:
+    """Resolve a config directory, honoring env overrides (first set wins).
+
+    e.g. config_home("~/.openclaude", ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR")).
+    """
+    for name in env_vars:
+        val = os.environ.get(name)
+        if val:
+            return Path(val).expanduser()
+    return Path(default_dir).expanduser()
+
+
 class ConfigFile:
     """Enhanced config file handler with backup and validation"""
 
@@ -524,7 +562,7 @@ class Validator:
             self.last_schema_fetch = current_time
             return None
 
-    def validate(self, data: dict, kind: str) -> Tuple[bool, List[str], List[str]]:
+    def validate(self, data: dict, kind: str, known_keys: set = None) -> Tuple[bool, List[str], List[str]]:
         """Validate config.
 
         Returns (hard_ok, hard_errors, schema_warnings).
@@ -534,12 +572,16 @@ class Validator:
         official opencode schema is stricter/incomplete (e.g. it rejects the
         `local` MCP type that opencode actually supports), so a valid config
         would otherwise always be flagged.
+
+        `known_keys` may be injected by the active adapter; when omitted we fall
+        back to the built-in opencode/tui key sets.
         """
         if not isinstance(data, dict):
             return False, ["Root must be a JSON object."], []
 
-        known = OPENCODE_KEYS if kind in ("opencode", "generic") else TUI_KEYS
-        hard_ok, hard = self._basic_checks(data, known)
+        if known_keys is None:
+            known_keys = OPENCODE_KEYS if kind in ("opencode", "generic") else TUI_KEYS
+        hard_ok, hard = self._basic_checks(data, known_keys)
         if not hard_ok:
             return False, hard, []
 
@@ -1561,6 +1603,64 @@ def fetch_provider_models(spec: ProviderFetchSpec, *, opener=None) -> dict:
     return parse_fetched_models(data, spec)
 
 
+# Agent adapter spec + registry.
+#
+# An AdapterSpec describes ONE agent CLI's config surface (file locations,
+# known keys, which tabs to show) so the editor can be extended to a new CLI
+# (opencode, openclaude, ...) by registering an adapter instead of editing the
+# core. This is the seam that keeps `core` generic and each agent's specifics
+# isolated in its own adapter module.
+
+@dataclass
+class AdapterSpec:
+    name: str                                  # unique id, e.g. "opencode"
+    app_title: str                             # window title base
+    version: str
+    kinds: List[str]                           # config kinds, e.g. ["opencode", "tui"]
+    known_keys: Dict[str, set]                 # kind -> allowed top-level keys
+    raw_files: List[Tuple[str, str]]           # [(label, kind)] for the Raw JSON combo
+    targets_fn: Callable                       # (cwd) -> [(label, Path, kind)]
+    make_tabs_fn: Callable                     # (window) -> [(tab_widget, title, kind|None)]
+    capabilities: set = field(default_factory=set)
+
+    def targets(self, cwd):
+        return self.targets_fn(cwd)
+
+    def make_tabs(self, window):
+        return self.make_tabs_fn(window)
+
+    def known_keys_for(self, kind: str) -> set:
+        if kind in self.known_keys:
+            return self.known_keys[kind]
+        # fall back to the first/primary kind's keys
+        return self.known_keys.get(self.kinds[0], set()) if self.kinds else set()
+
+    def has(self, capability: str) -> bool:
+        return capability in self.capabilities
+
+
+_REGISTRY: Dict[str, AdapterSpec] = {}
+_DEFAULT: List[str] = []  # holds the name of the first-registered adapter
+
+
+def register_adapter(spec: AdapterSpec) -> AdapterSpec:
+    """Register an adapter; the first one registered becomes the default."""
+    _REGISTRY[spec.name] = spec
+    if not _DEFAULT:
+        _DEFAULT.append(spec.name)
+    return spec
+
+
+def get_adapter(name: str) -> Optional[AdapterSpec]:
+    return _REGISTRY.get(name)
+
+
+def list_adapters() -> List[str]:
+    return sorted(_REGISTRY)
+
+
+def default_adapter() -> Optional[AdapterSpec]:
+    return _REGISTRY.get(_DEFAULT[0]) if _DEFAULT else None
 # Shared GUI components and generic import dialogs
 # GUI Components
 def _esc_html(s) -> str:
@@ -1742,6 +1842,55 @@ class JsonImportDialog(QDialog):
             QMessageBox.warning(self, "Invalid JSON", str(e))
 
 
+# Shared base for form-style tabs.
+#
+# A BaseTab bundles the small helpers that config tabs repeat: "touched"-group
+# tracking (only serialize sections the user actually edited) and the
+# widget<->value setters. New tabs (opencode or a future agent adapter) inherit
+# this instead of copy-pasting _t/_put/_set_* into every tab.
+
+class BaseTab(QWidget):
+    """Base class for form tabs with touched-tracking and value helpers."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self._touched = set()
+
+    def _t(self, group):
+        """Return a slot that marks `group` touched and flags the doc dirty."""
+        def _h(*_):
+            self._touched.add(group)
+            self.app.mark_dirty()
+        return _h
+
+    def _put(self, d, k, val, empty):
+        """Set d[k]=val, or remove the key when val equals the 'empty' sentinel."""
+        if val != empty:
+            d[k] = val
+        else:
+            d.pop(k, None)
+
+    def _set_checked(self, cb, val):
+        cb.blockSignals(True)
+        cb.setChecked(bool(val))
+        cb.blockSignals(False)
+
+    def _set_spin(self, spin, val):
+        spin.blockSignals(True)
+        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
+        spin.blockSignals(False)
+
+    def _set_double(self, spin, val):
+        spin.blockSignals(True)
+        spin.setValue(float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else spin.minimum())
+        spin.blockSignals(False)
+
+    def _set_combo(self, combo, val, fallback):
+        combo.blockSignals(True)
+        idx = combo.findData(val)
+        combo.setCurrentIndex(idx if idx >= 0 else fallback)
+        combo.blockSignals(False)
 # Model editing and management dialogs (Models Manager and friends)
 class ModelEditDialog(QDialog):
     """Enhanced model edit dialog with validation"""
@@ -5038,13 +5187,11 @@ class BoolMapEditor(QWidget):
             self.app.mark_dirty()
 
 
-class RuntimeTab(QWidget):
+class RuntimeTab(BaseTab):
     """Server, session, attachment, advanced and experimental settings."""
 
     def __init__(self, app):
-        super().__init__()
-        self.app = app
-        self._touched = set()
+        super().__init__(app)
 
         outer = QVBoxLayout(self)
         scroll = QScrollArea()
@@ -5158,28 +5305,6 @@ class RuntimeTab(QWidget):
         s.setSpecialValueText("(unset)")
         s.valueChanged.connect(lambda *_: self.app.mark_dirty())
         return s
-
-    def _t(self, group):
-        def _h(*_):
-            self._touched.add(group)
-            self.app.mark_dirty()
-        return _h
-
-    def _set_checked(self, cb, val):
-        cb.blockSignals(True)
-        cb.setChecked(bool(val))
-        cb.blockSignals(False)
-
-    def _set_spin(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
-        spin.blockSignals(False)
-
-    def _put(self, d, k, val, empty):
-        if val != empty:
-            d[k] = val
-        else:
-            d.pop(k, None)
 
     def _build_policies_table(self):
         w = QWidget()
@@ -5969,13 +6094,11 @@ class TuiPluginEditor(QWidget):
         data.pop("plugin_enabled", None)
 
 
-class TuiTab(QWidget):
+class TuiTab(BaseTab):
     """Editor for the tui.json schema."""
 
     def __init__(self, app):
-        super().__init__()
-        self.app = app
-        self._touched = set()
+        super().__init__(app)
         form = QFormLayout(self)
 
         self.schema_edit = MaskedLineEdit("", field_name="schema")
@@ -6066,33 +6189,6 @@ class TuiTab(QWidget):
             self._touched.add(group)
             self.app.mark_dirty("tui")
         return _h
-
-    def _set_checked(self, cb, val):
-        cb.blockSignals(True)
-        cb.setChecked(bool(val))
-        cb.blockSignals(False)
-
-    def _set_combo(self, combo, val, fallback):
-        combo.blockSignals(True)
-        idx = combo.findData(val)
-        combo.setCurrentIndex(idx if idx >= 0 else fallback)
-        combo.blockSignals(False)
-
-    def _set_spin(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(int(val) if isinstance(val, int) and not isinstance(val, bool) else 0)
-        spin.blockSignals(False)
-
-    def _set_double(self, spin, val):
-        spin.blockSignals(True)
-        spin.setValue(float(val) if isinstance(val, (int, float)) and not isinstance(val, bool) else spin.minimum())
-        spin.blockSignals(False)
-
-    def _put(self, d, k, val, empty):
-        if val != empty:
-            d[k] = val
-        else:
-            d.pop(k, None)
 
     def refresh(self):
         data = self.app.cfg_tui.data if self.app.cfg_tui else {}
@@ -6484,12 +6580,76 @@ def _confirm(parent, title: str, text: str) -> bool:
         QMessageBox.Yes | QMessageBox.No
     ) == QMessageBox.Yes
 
+# opencode adapter: registers the built-in opencode/tui config surface with the
+# adapter registry. Kept as a distinct module so a second agent (openclaude, …)
+# lives in its own sibling adapter module without touching this one or core.
+
+def _opencode_targets(cwd):
+    home = Path.home()
+    proj_dir = cwd / ".opencode"
+    return [
+        ("Global opencode.json", home / ".config" / "opencode" / "opencode.json", "opencode"),
+        ("Project opencode.json",
+         (proj_dir / "opencode.json") if (proj_dir / "opencode.json").exists() else (cwd / "opencode.json"),
+         "opencode"),
+        ("Global tui.json", home / ".config" / "opencode" / "tui.json", "tui"),
+        ("Project tui.json",
+         (proj_dir / "tui.json") if (proj_dir / "tui.json").exists() else (cwd / "tui.json"),
+         "tui"),
+    ]
+
+
+def _opencode_make_tabs(win):
+    """Instantiate the opencode tabs on `win` and return [(tab, title, kind)].
+
+    Named attributes (win.tab_providers, …) are kept because the menu wiring
+    references them directly; win._oc_tabs lists the tabs that feed opencode.json.
+    """
+    win.tab_general = GeneralTab(win)
+    win.tab_runtime = RuntimeTab(win)
+    win.tab_agents = AgentsTab(win)
+    win.tab_commands = CommandsTab(win)
+    win.tab_providers = ProvidersTab(win)
+    win.tab_mcp = McpTab(win)
+    win.tab_plugins = PluginsTab(win)
+    win.tab_permission = PermissionTab(win)
+    win.tab_tui = TuiTab(win)
+    win.tab_raw = RawJsonTab(win)
+    win._oc_tabs = [win.tab_general, win.tab_runtime, win.tab_agents,
+                    win.tab_commands, win.tab_providers, win.tab_mcp,
+                    win.tab_plugins, win.tab_permission]
+    return [
+        (win.tab_general, "General", "opencode"),
+        (win.tab_runtime, "Runtime", "opencode"),
+        (win.tab_agents, "Agents", "opencode"),
+        (win.tab_commands, "Commands", "opencode"),
+        (win.tab_providers, "Providers", "opencode"),
+        (win.tab_mcp, "MCP Servers", "opencode"),
+        (win.tab_plugins, "Plugins", "opencode"),
+        (win.tab_permission, "Permissions", "opencode"),
+        (win.tab_tui, "TUI", "tui"),
+        (win.tab_raw, "Raw JSON", None),
+    ]
+
+
+OPENCODE_ADAPTER = register_adapter(AdapterSpec(
+    name="opencode",
+    app_title=APP_NAME,
+    version=APP_VERSION,
+    kinds=["opencode", "tui"],
+    known_keys={"opencode": OPENCODE_KEYS, "generic": OPENCODE_KEYS, "tui": TUI_KEYS},
+    raw_files=[("opencode.json", "opencode"), ("tui.json", "tui")],
+    targets_fn=_opencode_targets,
+    make_tabs_fn=_opencode_make_tabs,
+    capabilities={"providers", "mcp", "plugins", "catalog", "tui", "runtime"},
+))
 class MainWindow(QMainWindow):
     """Enhanced main window with undo/redo, themes, and better UX"""
 
-    def __init__(self, cwd: Path):
+    def __init__(self, cwd: Path, adapter=None):
         super().__init__()
         self.cwd = Path(cwd)
+        self.adapter = adapter or default_adapter()
         self.cfg_oc = None
         self.cfg_tui = None
         self.validator = Validator()
@@ -6728,36 +6888,14 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.search_edit)
 
     def _build_tabs(self):
-        """Build main tabs"""
+        """Build main tabs from the active adapter."""
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.North)
         self.tabs.setMovable(True)
 
-        self.tab_general = GeneralTab(self)
-        self.tab_runtime = RuntimeTab(self)
-        self.tab_agents = AgentsTab(self)
-        self.tab_commands = CommandsTab(self)
-        self.tab_providers = ProvidersTab(self)
-        self.tab_mcp = McpTab(self)
-        self.tab_plugins = PluginsTab(self)
-        self.tab_permission = PermissionTab(self)
-        self.tab_tui = TuiTab(self)
-        self.tab_raw = RawJsonTab(self)
+        for tab, title, _kind in self.adapter.make_tabs(self):
+            self.tabs.addTab(tab, title)
 
-        self.tabs.addTab(self.tab_general, "General")
-        self.tabs.addTab(self.tab_runtime, "Runtime")
-        self.tabs.addTab(self.tab_agents, "Agents")
-        self.tabs.addTab(self.tab_commands, "Commands")
-        self.tabs.addTab(self.tab_providers, "Providers")
-        self.tabs.addTab(self.tab_mcp, "MCP Servers")
-        self.tabs.addTab(self.tab_plugins, "Plugins")
-        self.tabs.addTab(self.tab_permission, "Permissions")
-        self.tabs.addTab(self.tab_tui, "TUI")
-        self.tabs.addTab(self.tab_raw, "Raw JSON")
-
-        self._oc_tabs = [self.tab_general, self.tab_runtime, self.tab_agents,
-                         self.tab_commands, self.tab_providers, self.tab_mcp,
-                         self.tab_plugins, self.tab_permission]
         self.setCentralWidget(self.tabs)
 
     def _build_status_bar(self):
@@ -6997,7 +7135,8 @@ class MainWindow(QMainWindow):
             data = json.loads(text)
         except json.JSONDecodeError as e:
             return False, [f"Line {e.lineno}: {e.msg}"], []
-        return self.validator.validate(data, kind)
+        known = self.adapter.known_keys_for(kind) if self.adapter else None
+        return self.validator.validate(data, kind, known_keys=known)
 
     def _save_state(self, kind="auto"):
         k = kind

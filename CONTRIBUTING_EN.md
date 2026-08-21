@@ -12,16 +12,43 @@ Thank you for your interest in contributing to **opencode-config-editor**!
 The source code is divided into modules within the `src/` directory, which are then 
 bundled into a single file by `build.py`. **Important**: Only modify code inside 
 `src/` — the file `opencode-config-editor.py` is the build output and will be 
-overwritten.
+overwritten. The concatenation order is the explicit `ORDER` list in `build.py`.
 
 ```
-src/00_header.py    # Imports, constants, key lists
-src/01_core.py      # Logic: Managers (Settings, Theme, Undo, Validator, Catalog...)
-src/02_widgets.py   # Shared UI widgets and dialogs
-src/03_tabs.py      # Implementation of all 10 editor tabs
-src/04_main_window.py  # Main window assembly and app logic
-src/05_main.py      # Application entry point
+src/core/                  # generic, agent-agnostic
+  header.py                # Imports, constants, key lists
+  settings.py              # SettingsManager, ThemeManager, UndoManager
+  config.py                # ConfigFile, Validator, section(), layered-config helpers
+  parsing.py               # import/parse/merge helpers
+  catalog.py               # ModelCatalog, ModelFormat, matching/fallback
+  provider_fetch.py        # provider model-list fetching
+  adapter.py               # AdapterSpec + registry (the multi-agent seam)
+  widgets_common.py        # shared widgets/dialogs
+  base_tab.py              # BaseTab: touched-tracking + value helpers
+  widgets_models.py        # model editing dialogs
+  widgets_catalog.py       # catalog dialogs
+src/adapters/opencode/     # opencode + tui specifics
+  tab_*.py                 # the 10 editor tabs
+  adapter.py               # registers the opencode AdapterSpec
+src/app/                   # window + entrypoint
+  main_window.py           # MainWindow (adapter-driven)
+  main.py                  # entry point
 ```
+
+## Adding a New Agent CLI (adapter)
+
+The editor is multi-agent via `core/adapter.py`. To support another CLI:
+
+1. Create `src/adapters/<agent>/` with tab classes inheriting `BaseTab`
+   (implement `refresh()`/load and `collect(self, data)`).
+2. Add `src/adapters/<agent>/adapter.py` that calls `register_adapter(AdapterSpec(...))`
+   with the agent's `kinds`, `known_keys`, `raw_files`, `targets_fn`, `make_tabs_fn`
+   and `capabilities`.
+3. Add the new files to `ORDER` in `build.py` (after `core/*`, before `app/*`).
+4. Select it via the adapter registry in `app/main.py` (`--adapter`/env).
+
+No changes to `core/` are required. The parametrized contract test in
+`tests/test_adapter.py` automatically covers any registered adapter.
 
 ## Contribution Workflow
 
@@ -48,10 +75,13 @@ src/05_main.py      # Application entry point
 
 ## How to Add a New Tab
 
-1. Create a new tab class (inheriting from `QWidget`) in `src/03_tabs.py`.
-2. Implement `_refresh`/load logic and the `collect(self, data)` method.
-3. Register the tab in `MainWindow._build_tabs()` within `src/04_main_window.py`.
-4. If it's an `opencode.json` tab, add it to the `self._oc_tabs` list.
+1. Create a new tab class (inheriting from `BaseTab`) in the relevant adapter,
+   e.g. `src/adapters/opencode/tab_yourfeature.py`.
+2. Implement `refresh()`/load logic and the `collect(self, data)` method.
+3. Add it to that adapter's `make_tabs_fn` in `adapters/<agent>/adapter.py`
+   (append `(tab, "Title", kind)`); for opencode.json tabs also append to
+   `win._oc_tabs`.
+4. Add the new file to `ORDER` in `build.py`.
 
 ## Reporting Bugs
 
