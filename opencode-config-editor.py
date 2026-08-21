@@ -6756,19 +6756,20 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cwd = Path(cwd)
         self.adapter = adapter or default_adapter()
-        self.cfg_oc = None
-        self.cfg_tui = None
+        # Per-kind config state, keyed by adapter kind. The opencode-named
+        # attributes below (cfg_oc, dirty_oc, ...) are backward-compat
+        # properties over these dicts, so a future adapter can drive N kinds
+        # generically via self._configs while opencode code stays unchanged.
+        self._kinds = list(self.adapter.kinds) if self.adapter else ["opencode", "tui"]
+        self._configs = {k: None for k in self._kinds}
+        self._dirty = {k: False for k in self._kinds}
+        self._undo_mgrs = {k: UndoManager() for k in self._kinds}
+        self._snap = {k: False for k in self._kinds}
         self.validator = Validator()
         self.model_catalog = ModelCatalog()
-        self.undo_oc = UndoManager()
-        self.undo_tui = UndoManager()
         self.settings = SettingsManager()
         self.theme_manager = None
-        self.dirty_oc = False
-        self.dirty_tui = False
         self.recent_files = []
-        self._snap_oc = False
-        self._snap_tui = False
         self.mode = None
         self.project_path = None
         self._raw_kind = "opencode"
@@ -6787,6 +6788,73 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
 
         self._load_global()
+
+    # --- backward-compat properties over per-kind state dicts ---
+    # Keep opencode call sites (self.cfg_oc, self.dirty_tui, ...) working while
+    # state is stored generically by kind in self._configs / _dirty / _undo / _snap.
+    @property
+    def cfg_oc(self):
+        return self._configs.get("opencode")
+
+    @cfg_oc.setter
+    def cfg_oc(self, v):
+        self._configs["opencode"] = v
+
+    @property
+    def cfg_tui(self):
+        return self._configs.get("tui")
+
+    @cfg_tui.setter
+    def cfg_tui(self, v):
+        self._configs["tui"] = v
+
+    @property
+    def dirty_oc(self):
+        return self._dirty.get("opencode", False)
+
+    @dirty_oc.setter
+    def dirty_oc(self, v):
+        self._dirty["opencode"] = v
+
+    @property
+    def dirty_tui(self):
+        return self._dirty.get("tui", False)
+
+    @dirty_tui.setter
+    def dirty_tui(self, v):
+        self._dirty["tui"] = v
+
+    @property
+    def undo_oc(self):
+        return self._undo_mgrs.get("opencode")
+
+    @undo_oc.setter
+    def undo_oc(self, v):
+        self._undo_mgrs["opencode"] = v
+
+    @property
+    def undo_tui(self):
+        return self._undo_mgrs.get("tui")
+
+    @undo_tui.setter
+    def undo_tui(self, v):
+        self._undo_mgrs["tui"] = v
+
+    @property
+    def _snap_oc(self):
+        return self._snap.get("opencode", False)
+
+    @_snap_oc.setter
+    def _snap_oc(self, v):
+        self._snap["opencode"] = v
+
+    @property
+    def _snap_tui(self):
+        return self._snap.get("tui", False)
+
+    @_snap_tui.setter
+    def _snap_tui(self, v):
+        self._snap["tui"] = v
 
     def _setup_theme(self):
         """Setup application theme"""
