@@ -397,3 +397,48 @@ def test_settings_tab_mcp_gating_roundtrip(oc_win, tmp_path):
     layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
     assert layer["enableAllProjectMcpServers"] is True
     assert layer["enabledMcpjsonServers"] == ["a", "b"]
+
+
+def test_mcp_header_secret_is_masked_and_roundtrips(oc_win, tmp_path):
+    """Headers/env often carry API keys: display must be masked while the real
+    value still saves verbatim."""
+    tab = oc_win._agent_mcp_tab
+    secret = "ctx7sk-supersecret-1234"
+    tab._add_row("context7", {"type": "http", "url": "https://mcp.context7.com/mcp",
+                              "headers": {"CONTEXT7_API_KEY": secret}})
+    w = tab.mcp_table.cellWidget(0, 4)
+    assert secret not in w.edit.text()          # masked on screen
+    assert w.value() == "CONTEXT7_API_KEY=" + secret
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    assert saved["mcpServers"]["context7"]["headers"] == {"CONTEXT7_API_KEY": secret}
+
+
+def test_mcp_project_scope_preserves_args_and_extras(oc_win, tmp_path):
+    """Real-world shape: stdio server with args, plus non-mcpServers top-level
+    keys in .mcp.json (allowedTools, mcpContextUris) must survive a save."""
+    (tmp_path / "proj").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "proj" / ".mcp.json").write_text(json.dumps({
+        "allowedTools": [],
+        "mcpContextUris": [],
+        "mcpServers": {
+            "pandalight": {"type": "stdio",
+                           "command": "/opt/lightpanda",
+                           "args": ["mcp"],
+                           "env": {}},
+        },
+    }), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+    tab = oc_win._agent_mcp_tab
+    idx = tab.scope_combo.findData("project")
+    tab.scope_combo.setCurrentIndex(idx)
+    tab._shown_scope = "project"
+    # touch nothing — just save; fidelity must be byte-equal for untouched rows
+    oc_win._save()
+    saved = json.loads((tmp_path / "proj" / ".mcp.json").read_text())
+    assert saved["allowedTools"] == []
+    assert saved["mcpContextUris"] == []
+    srv = saved["mcpServers"]["pandalight"]
+    assert srv == {"type": "stdio", "command": "/opt/lightpanda",
+                   "args": ["mcp"], "env": {}}

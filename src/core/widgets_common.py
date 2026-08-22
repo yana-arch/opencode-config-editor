@@ -8,10 +8,12 @@ class MaskedLineEdit(QWidget):
 
     SECRET_HINT = re.compile(r"(key|token|secret|password|auth)", re.I)
 
-    def __init__(self, value="", parent=None, field_name="", placeholder=""):
+    def __init__(self, value="", parent=None, field_name="", placeholder="", secret=None):
         super().__init__(parent)
         self.field_name = field_name
-        self.is_secret = bool(self.SECRET_HINT.search(field_name))
+        # secret=None infers from the field name; pass True/False to override
+        # (e.g. env/headers cells whose VALUES may carry API keys).
+        self.is_secret = bool(self.SECRET_HINT.search(field_name)) if secret is None else bool(secret)
         self._real_value = str(value) if value is not None else ""
         self.toggle_btn = None
 

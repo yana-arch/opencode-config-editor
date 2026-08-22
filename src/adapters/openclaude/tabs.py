@@ -613,12 +613,23 @@ class OpenclaudeMcpTab(BaseTab):
         target = server.get("command") if isinstance(server.get("command"), str) else \
             "" if not server.get("url") else str(server.get("url"))
         self.mcp_table.setItem(r, 2, QTableWidgetItem(str(target or "")))
+        # env/headers often carry API keys — always masked (reveal via 👁),
+        # like provider apiKeys.
         env = server.get("env") if isinstance(server.get("env"), dict) else {}
-        self.mcp_table.setItem(r, 3, QTableWidgetItem(
-            ", ".join(f"{k}={v}" for k, v in env.items())))
+        env_text = ", ".join(f"{k}={v}" for k, v in env.items())
+        self.mcp_table.setCellWidget(
+            r, 3, MaskedLineEdit(env_text,
+                                 field_name="env", placeholder="KEY=value, ...",
+                                 secret=True))
         headers = server.get("headers") if isinstance(server.get("headers"), dict) else {}
-        self.mcp_table.setItem(r, 4, QTableWidgetItem(
-            ", ".join(f"{k}={v}" for k, v in headers.items())))
+        hdr_text = ", ".join(f"{k}={v}" for k, v in headers.items())
+        self.mcp_table.setCellWidget(
+            r, 4, MaskedLineEdit(hdr_text,
+                                 field_name="headers", placeholder="KEY=value, ...",
+                                 secret=True))
+        # Remember the initially-rendered texts so collect() can tell "user
+        # cleared it" apart from "never touched" (byte-fidelity for e.g. env:{}).
+        name_item.setData(Qt.UserRole + 1, {"env": env_text, "headers": hdr_text})
         self._edited()
 
     def _remove_row(self):
@@ -668,8 +679,10 @@ class OpenclaudeMcpTab(BaseTab):
             srv = dict(orig) if isinstance(orig, dict) else {}
             typ = self._cell(r, 1)
             target = self._cell(r, 2)
-            env_text = self._cell(r, 3)
-            hdr_text = self._cell(r, 4)
+            env_w = self.mcp_table.cellWidget(r, 3)
+            hdr_w = self.mcp_table.cellWidget(r, 4)
+            env_text = env_w.value().strip() if env_w else ""
+            hdr_text = hdr_w.value().strip() if hdr_w else ""
             if typ:
                 srv["type"] = typ
             else:
@@ -680,14 +693,17 @@ class OpenclaudeMcpTab(BaseTab):
             elif target:
                 srv["command"] = target
                 srv.pop("url", None)
-            if env_text:
-                srv["env"] = self._pairs(env_text)
-            else:
-                srv.pop("env", None)
-            if hdr_text:
-                srv["headers"] = self._pairs(hdr_text)
-            else:
-                srv.pop("headers", None)
+            # env/headers: only rewrite when the user actually edited the cell;
+            # an untouched cell keeps the original verbatim (e.g. env: {}).
+            initial = nitem.data(Qt.UserRole + 1) or {}
+            for key, widget, cur in (("env", env_w, env_text),
+                                     ("headers", hdr_w, hdr_text)):
+                orig_text = str(initial.get(key, ""))
+                if cur != orig_text.strip():
+                    if cur:
+                        srv[key] = self._pairs(cur)
+                    else:
+                        srv.pop(key, None)
             out[name] = srv
         return out
 
