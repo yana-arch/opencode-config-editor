@@ -406,7 +406,7 @@ def test_mcp_header_secret_is_masked_and_roundtrips(oc_win, tmp_path):
     secret = "ctx7sk-supersecret-1234"
     tab._add_row("context7", {"type": "http", "url": "https://mcp.context7.com/mcp",
                               "headers": {"CONTEXT7_API_KEY": secret}})
-    w = tab.mcp_table.cellWidget(0, 4)
+    w = tab.mcp_table.cellWidget(0, 5)
     assert secret not in w.edit.text()          # masked on screen
     assert w.value() == "CONTEXT7_API_KEY=" + secret
     oc_win._save()
@@ -442,3 +442,49 @@ def test_mcp_project_scope_preserves_args_and_extras(oc_win, tmp_path):
     srv = saved["mcpServers"]["pandalight"]
     assert srv == {"type": "stdio", "command": "/opt/lightpanda",
                    "args": ["mcp"], "env": {}}
+
+
+def test_mcp_args_editable(oc_win, tmp_path):
+    """args column: new servers get typed args; loaded servers keep theirs
+    verbatim until the cell is edited."""
+    tab = oc_win._agent_mcp_tab
+    # 1) typing args on a fresh row
+    tab._add_row("pandalight", {"command": "/opt/lightpanda"})
+    r = tab.mcp_table.rowCount() - 1
+    tab.mcp_table.item(r, 3).setText("mcp, --port 8945")
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    assert saved["mcpServers"]["pandalight"]["args"] == ["mcp", "--port 8945"]
+    assert "env" not in saved["mcpServers"]["pandalight"]
+
+    # 2) loaded server with args: untouched cell keeps original verbatim
+    (tmp_path / "proj" / ".openclaude" / "settings.json").write_text("{}", encoding="utf-8")
+    gpath = tmp_path / "cfghome.json"
+    gpath.write_text(json.dumps({"mcpServers": {
+        "keep": {"type": "stdio", "command": "x", "args": ["--flag", "a,b"]}}}),
+        encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+    oc_win._save()
+    kept = json.loads(gpath.read_text())["mcpServers"]["keep"]
+    assert kept["args"] == ["--flag", "a,b"]     # comma inside arg survives
+
+    # 3) editing args rewrites them
+    row = next(r2 for r2 in range(tab.mcp_table.rowCount())
+               if tab.mcp_table.item(r2, 0).text() == "keep")
+    tab.mcp_table.item(row, 3).setText("--other")
+    oc_win._save()
+    edited = json.loads(gpath.read_text())["mcpServers"]["keep"]
+    assert edited["args"] == ["--other"]
+
+
+def test_mcp_viewing_scopes_does_not_create_files(oc_win, tmp_path):
+    """Merely switching scopes must not mark them dirty: a save right after
+    browsing must not conjure .mcp.json or touch an absent global file."""
+    tab = oc_win._agent_mcp_tab
+    for scope in ("project", "local", "user"):
+        idx = tab.scope_combo.findData(scope)
+        tab.scope_combo.setCurrentIndex(idx)
+        tab._shown_scope = scope
+    oc_win._save()
+    assert not (tmp_path / "proj" / ".mcp.json").exists()

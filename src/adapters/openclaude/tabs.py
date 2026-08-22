@@ -288,6 +288,10 @@ class OpenclaudeAgentModelsTab(BaseTab):
         self.routing_table.setHorizontalHeaderLabels(["agent", "modelKey"])
         self.routing_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.routing_table)
+        # Cell edits (existing rows) must mark the tab dirty, else the global
+        # rewrite is skipped on save.
+        self.models_table.itemChanged.connect(self._edited)
+        self.routing_table.itemChanged.connect(self._edited)
         rbtn = QHBoxLayout()
         add_r = QPushButton("Add route")
         add_r.clicked.connect(lambda: self._add_route_row())
@@ -578,11 +582,12 @@ class OpenclaudeMcpTab(BaseTab):
         sbar.addStretch()
         layout.addLayout(sbar)
 
-        layout.addWidget(QLabel("Servers (unknown sub-keys like args/env/headers "
-                                "are preserved; edit complex servers in Raw):"))
-        self.mcp_table = QTableWidget(0, 5)
+        layout.addWidget(QLabel("Servers (args comma-separated; unknown sub-keys "
+                                "preserved; edit complex servers in Raw):"))
+        self.mcp_table = QTableWidget(0, 6)
         self.mcp_table.setHorizontalHeaderLabels(
-            ["name", "transport", "command / url", "env (K=V, ...)", "headers (K=V, ...)"])
+            ["name", "transport", "command / url", "args (comma-separated)",
+             "env (K=V, ...)", "headers (K=V, ...)"])
         self.mcp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.mcp_table)
         btns = QHBoxLayout()
@@ -600,6 +605,10 @@ class OpenclaudeMcpTab(BaseTab):
         self.managed_label.setStyleSheet("color: gray;")
         layout.addWidget(self.managed_label)
 
+        # Typing into an existing cell must mark the scope dirty too, else
+        # global/.mcp.json writes get skipped on save.
+        self.mcp_table.itemChanged.connect(self._edited)
+
     # --- table helpers ---
     def _add_row(self, name="", server=None):
         server = server if isinstance(server, dict) else {}
@@ -613,23 +622,27 @@ class OpenclaudeMcpTab(BaseTab):
         target = server.get("command") if isinstance(server.get("command"), str) else \
             "" if not server.get("url") else str(server.get("url"))
         self.mcp_table.setItem(r, 2, QTableWidgetItem(str(target or "")))
+        args = server.get("args") if isinstance(server.get("args"), list) else []
+        args_text = ", ".join(str(a) for a in args)
+        self.mcp_table.setItem(r, 3, QTableWidgetItem(args_text))
         # env/headers often carry API keys — always masked (reveal via 👁),
         # like provider apiKeys.
         env = server.get("env") if isinstance(server.get("env"), dict) else {}
         env_text = ", ".join(f"{k}={v}" for k, v in env.items())
         self.mcp_table.setCellWidget(
-            r, 3, MaskedLineEdit(env_text,
+            r, 4, MaskedLineEdit(env_text,
                                  field_name="env", placeholder="KEY=value, ...",
                                  secret=True))
         headers = server.get("headers") if isinstance(server.get("headers"), dict) else {}
         hdr_text = ", ".join(f"{k}={v}" for k, v in headers.items())
         self.mcp_table.setCellWidget(
-            r, 4, MaskedLineEdit(hdr_text,
+            r, 5, MaskedLineEdit(hdr_text,
                                  field_name="headers", placeholder="KEY=value, ...",
                                  secret=True))
         # Remember the initially-rendered texts so collect() can tell "user
         # cleared it" apart from "never touched" (byte-fidelity for e.g. env:{}).
-        name_item.setData(Qt.UserRole + 1, {"env": env_text, "headers": hdr_text})
+        name_item.setData(Qt.UserRole + 1,
+                          {"env": env_text, "headers": hdr_text, "args": args_text})
         self._edited()
 
     def _remove_row(self):
@@ -659,7 +672,14 @@ class OpenclaudeMcpTab(BaseTab):
         if prev and prev != new_scope:
             self._scopes_cache[prev] = self._collect_scope_table()
         self._shown_scope = new_scope
-        self._load_scope_table(new_scope)
+        # Loading a scope's rows is population, not an edit — suppress the
+        # itemChanged/_add_row dirty marks so merely VIEWING a scope never
+        # causes its file to be rewritten.
+        self._loading = True
+        try:
+            self._load_scope_table(new_scope)
+        finally:
+            self._loading = False
 
     def _load_scope_table(self, scope):
         self.mcp_table.setRowCount(0)
@@ -679,8 +699,9 @@ class OpenclaudeMcpTab(BaseTab):
             srv = dict(orig) if isinstance(orig, dict) else {}
             typ = self._cell(r, 1)
             target = self._cell(r, 2)
-            env_w = self.mcp_table.cellWidget(r, 3)
-            hdr_w = self.mcp_table.cellWidget(r, 4)
+            args_text = self._cell(r, 3)
+            env_w = self.mcp_table.cellWidget(r, 4)
+            hdr_w = self.mcp_table.cellWidget(r, 5)
             env_text = env_w.value().strip() if env_w else ""
             hdr_text = hdr_w.value().strip() if hdr_w else ""
             if typ:
@@ -693,14 +714,14 @@ class OpenclaudeMcpTab(BaseTab):
             elif target:
                 srv["command"] = target
                 srv.pop("url", None)
-            # env/headers: only rewrite when the user actually edited the cell;
-            # an untouched cell keeps the original verbatim (e.g. env: {}).
+            # args/env/headers: only rewrite when the user actually edited the
+            # cell; an untouched cell keeps the original verbatim (e.g. env:{}).
             initial = nitem.data(Qt.UserRole + 1) or {}
-            for key, widget, cur in (("env", env_w, env_text),
-                                     ("headers", hdr_w, hdr_text)):
-                orig_text = str(initial.get(key, ""))
-                if cur != orig_text.strip():
-                    if cur:
+            for key, cur in (("args", args_text), ("env", env_text), ("headers", hdr_text)):
+                if cur != str(initial.get(key, "")).strip():
+                    if key == "args" and cur:
+                        srv["args"] = [a.strip() for a in cur.split(",") if a.strip()]
+                    elif key != "args" and cur:
                         srv[key] = self._pairs(cur)
                     else:
                         srv.pop(key, None)
