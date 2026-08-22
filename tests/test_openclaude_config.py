@@ -1,5 +1,6 @@
 """Tests for the openclaude layered config model (no Qt required)."""
 import json
+from pathlib import Path
 
 from tests.conftest import app
 
@@ -67,7 +68,7 @@ def test_config_dir_env_override(tmp_path, monkeypatch):
 def test_targets_shape(tmp_path):
     targets = app._openclaude_targets(tmp_path / "proj", config_dir=tmp_path / "cfghome")
     kinds = [k for _, _, k in targets]
-    assert kinds == ["user", "project", "local", "global"]
+    assert kinds == ["user", "project", "local", "global", "project-mcp", "managed"]
     from pathlib import Path
     for _label, path, _kind in targets:
         assert isinstance(path, Path)
@@ -84,3 +85,106 @@ def test_settings_keys_defined():
     assert "providerProfiles" in app.OPENCLAUDE_GLOBAL_KEYS
     assert "activeProviderProfileId" in app.OPENCLAUDE_GLOBAL_KEYS
     assert "api_key" in app.OPENCLAUDE_SECRET_FIELDS
+
+
+def test_settings_keys_defined_extended():
+    """Docs-confirmed openclaude keys must be present (regression for the
+    earlier 'unverified' misclassification)."""
+    for key in ("effortLevel", "smartRouting", "agentModels", "agentRouting",
+                "providerFallbackChain", "advisorModel", "subscriptionType",
+                "enabledPlugins", "extraKnownMarketplaces", "enableAllProjectMcpServers"):
+        assert key in app.OPENCLAUDE_SETTINGS_KEYS
+    # Docs: these live in the global ~/.openclaude.json.
+    for key in ("theme", "verbose", "autoUpdates", "mcpServers"):
+        assert key in app.OPENCLAUDE_GLOBAL_KEYS
+    assert app.OPENCLAUDE_SETTINGS_SCHEMA_URL.startswith("https://")
+
+
+def test_managed_layer_merge(tmp_path):
+    """managed-settings.json (+ drop-ins) is read-only and wins over all layers."""
+    mdir = tmp_path / "managed"
+    mdir.mkdir()
+    (mdir / "managed-settings.json").write_text(
+        json.dumps({"model": "policy-model", "permissions": {"allow": ["Bash(ls)"]}}),
+        encoding="utf-8")
+    drop = mdir / "managed-settings.d"
+    drop.mkdir()
+    (drop / "10-extra.json").write_text(json.dumps({"env": {"B": "2"}}), encoding="utf-8")
+
+    cfg = tmp_path / "cfghome"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps({"model": "user-model"}), encoding="utf-8")
+    proj = tmp_path / "proj" / ".openclaude"
+    proj.mkdir(parents=True)
+    (proj / "settings.json").write_text(json.dumps({"model": "proj-model"}), encoding="utf-8")
+
+    cf = app.LayeredConfigFile(tmp_path / "proj", config_dir=cfg, managed_dir=mdir)
+    cf.load()
+    eff = cf.effective()
+    assert eff["model"] == "policy-model"          # policy overrides user layers
+    assert eff["env"]["B"] == "2"                  # drop-in merged in
+    assert eff["permissions"] == {"allow": ["Bash(ls)"]}
+    # layers themselves untouched by managed
+    assert cf.layer("project")["model"] == "proj-model"
+
+
+def test_managed_mcp_and_project_mcp_load(tmp_path):
+    mdir = tmp_path / "managed"
+    mdir.mkdir(parents=True)
+    (mdir / "managed-mcp.json").write_text(
+        json.dumps({"mcpServers": {"locked": {"type": "stdio", "command": "x"}}}),
+        encoding="utf-8")
+    (tmp_path / "proj").mkdir(parents=True)
+    (tmp_path / "proj" / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"proj-srv": {"type": "http", "url": "https://x/mcp"}}}),
+        encoding="utf-8")
+
+    cf = app.LayeredConfigFile(tmp_path / "proj", config_dir=tmp_path / "cfghome",
+                               managed_dir=mdir)
+    cf.load()
+    assert cf.managed_mcp_servers() == {"locked": {"type": "stdio", "command": "x"}}
+    assert cf.project_mcp == {"mcpServers": {"proj-srv": {"type": "http", "url": "https://x/mcp"}}}
+    assert str(cf.project_mcp_file).endswith(".mcp.json")
+    assert cf.managed_file.parent == mdir
+
+
+def test_project_key_normalization(tmp_path):
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    cf = app.LayeredConfigFile(proj, config_dir=tmp_path / "cfghome")
+    assert cf.project_key() == str(proj.resolve()).replace("\\", "/")
+
+
+def test_local_mcp_scope_roundtrip(tmp_path):
+    """Local MCP servers live under global projects[file dict].mcpServers."""
+    cfg = tmp_path / "cfghome"
+    cfg.mkdir(parents=True)
+    gpath = Path(str(cfg) + ".json")
+    key = str((tmp_path / "proj").resolve()).replace("\\", "/")
+    gpath.write_text(json.dumps({
+        "numStartups": 5,
+        "projects": {key: {"hasTrustDialogAccepted": True,
+                           "mcpServers": {"local1": {"command": "run"}}}},
+    }), encoding="utf-8")
+    cf = app.LayeredConfigFile(tmp_path / "proj", config_dir=cfg)
+    cf.load()
+    assert cf.local_mcp() == {"local1": {"command": "run"}}
+    # rewrite global preserving app-state + other project keys
+    data = dict(cf.global_data)
+    entry = dict(data["projects"][key])
+    entry.pop("mcpServers")
+    data["projects"][key] = entry
+    ok, _ = cf.save_global(data)
+    assert ok
+    saved = json.loads(gpath.read_text())
+    assert saved["numStartups"] == 5
+    assert saved["projects"][key] == {"hasTrustDialogAccepted": True}
+
+
+def test_save_project_mcp(tmp_path):
+    cf = app.LayeredConfigFile(tmp_path / "proj", config_dir=tmp_path / "cfghome")
+    cf.load()
+    ok, _ = cf.save_project_mcp({"mcpServers": {"a": {"command": "c"}}})
+    assert ok
+    saved = json.loads((tmp_path / "proj" / ".mcp.json").read_text())
+    assert saved == {"mcpServers": {"a": {"command": "c"}}}

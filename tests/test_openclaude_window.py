@@ -26,7 +26,7 @@ def oc_win(qapp, tmp_path, monkeypatch):
 
 def test_openclaude_window_builds_with_adapter(oc_win):
     assert oc_win.adapter.name == "openclaude"
-    assert oc_win.tabs.count() == 3            # Settings + Agent Models + Raw
+    assert oc_win.tabs.count() == 5            # Settings + Agent Models + MCP + Plugins + Raw
     assert oc_win.oc_layered is not None       # initial_load hook ran
     assert oc_win.oc_layer == "project"
 
@@ -280,3 +280,120 @@ def test_mcp_servers_roundtrip_preserves_keys(oc_win, tmp_path):
     assert srv["command"] == "npx -y @modelcontextprotocol/server-filesystem /tmp"
     assert srv["type"] == "command"
     assert srv["env"] == {"X": "1"}     # unknown sub-key preserved
+
+
+def test_mcp_tab_user_scope_roundtrip(oc_win, tmp_path):
+    """user-scope MCP servers go to the global ~/.openclaude.json."""
+    tab = oc_win._agent_mcp_tab
+    assert tab.scope_combo.currentData() == "user"
+    tab._add_row("srv1", {"type": "stdio", "command": "npx -y srv", "env": {"A": "1"}})
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    assert saved["mcpServers"] == {"srv1": {"type": "stdio", "command": "npx -y srv",
+                                            "env": {"A": "1"}}}
+
+
+def test_mcp_tab_project_scope_writes_mcpjson(oc_win, tmp_path):
+    """project-scope edits write <proj>/.mcp.json, not the global file."""
+    tab = oc_win._agent_mcp_tab
+    tab._on_scope_change()  # no-op safety; switch explicitly:
+    idx = tab.scope_combo.findData("project")
+    tab.scope_combo.setCurrentIndex(idx)
+    tab._shown_scope = "project"
+    tab._add_row("psrv", {"type": "http", "url": "https://mcp.example/v1"})
+    oc_win._save()
+    mcp = json.loads((tmp_path / "proj" / ".mcp.json").read_text())
+    assert mcp == {"mcpServers": {"psrv": {"type": "http", "url": "https://mcp.example/v1"}}}
+    gpath = tmp_path / "cfghome.json"
+    if gpath.exists():      # project edits alone must not create/rewrite global
+        assert "mcpServers" not in json.loads(gpath.read_text())
+
+
+def test_mcp_tab_local_scope_keeps_project_state(oc_win, tmp_path):
+    """local-scope MCP goes to projects[file dict].mcpServers and preserves
+    sibling project state like hasTrustDialogAccepted + app-state keys."""
+    key = str((tmp_path / "proj").resolve()).replace("\\", "/")
+    (tmp_path / "cfghome.json").write_text(json.dumps({
+        "numStartups": 9,
+        "projects": {key: {"hasTrustDialogAccepted": True}},
+    }), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+    tab = oc_win._agent_mcp_tab
+    idx = tab.scope_combo.findData("local")
+    tab.scope_combo.setCurrentIndex(idx)
+    tab._shown_scope = "local"
+    tab._add_row("lsrv", {"command": "run-me"})
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    assert saved["numStartups"] == 9
+    entry = saved["projects"][key]
+    assert entry["hasTrustDialogAccepted"] is True
+    # the table infers an explicit stdio transport when none was given
+    assert entry["mcpServers"] == {"lsrv": {"type": "stdio", "command": "run-me"}}
+
+
+def test_mcp_tab_managed_policy_displayed_readonly(oc_win, tmp_path):
+    """managed-mcp.json servers are shown as a read-only policy hint."""
+    mdir = tmp_path / "managed"
+    mdir.mkdir(parents=True)
+    (mdir / "managed-mcp.json").write_text(
+        json.dumps({"mcpServers": {"locked": {"command": "x"}}}), encoding="utf-8")
+    cf = app.LayeredConfigFile(tmp_path / "proj", config_dir=tmp_path / "cfghome",
+                               managed_dir=mdir)
+    cf.load()
+    monkey = oc_win.oc_layered
+    oc_win.oc_layered = cf  # swap in the layered model with the policy layer
+    try:
+        oc_win.refresh_tabs()
+        label = oc_win._agent_mcp_tab.managed_label.text()
+        assert "locked" in label and "read-only" in label
+    finally:
+        oc_win.oc_layered = monkey
+
+
+def test_plugins_tab_roundtrip(oc_win, tmp_path):
+    """enabledPlugins/extraKnownMarketplaces round-trip into the layer."""
+    plugins_tab = oc_win._agent_plugins_tab
+    # enabledPlugins row: bool value
+    plugins_tab.plugins_table.setRowCount(0)
+    r = plugins_tab.plugins_table.rowCount()
+    plugins_tab._add_plugin_row("formatter@claude-plugins-official")
+    plugins_tab.plugins_table.item(r, 1).setText("true")
+    # marketplace row: github source with ref + autoUpdate
+    plugins_tab.market_table.setRowCount(0)
+    plugins_tab._add_market_row("team-market", {
+        "source": {"source": "github", "repo": "acme/plugins"},
+        "autoUpdate": True,
+    })
+    mr = plugins_tab.market_table.rowCount() - 1
+    plugins_tab.market_table.item(mr, 3).setText("v1.2.0")
+    oc_win._save()
+    layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert layer["enabledPlugins"] == {"formatter@claude-plugins-official": True}
+    mk = layer["extraKnownMarketplaces"]["team-market"]
+    assert mk["source"]["source"] == "github"
+    assert mk["source"]["repo"] == "acme/plugins"
+    assert mk["source"]["ref"] == "v1.2.0"
+    assert mk["autoUpdate"] is True
+
+
+def test_plugins_tab_marketplace_value_field_mapping(oc_win, tmp_path):
+    """url/file/directory/npm sources map to the right schema field."""
+    plugins_tab = oc_win._agent_plugins_tab
+    plugins_tab.market_table.setRowCount(0)
+    plugins_tab._add_market_row("u", {"source": {"source": "url", "url": "https://x/market.json"}})
+    oc_win._save()
+    layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    src = layer["extraKnownMarketplaces"]["u"]["source"]
+    assert src == {"source": "url", "url": "https://x/market.json"}
+
+
+def test_settings_tab_mcp_gating_roundtrip(oc_win, tmp_path):
+    st = oc_win._agent_settings_tab
+    st.enable_all_mcp_chk.setChecked(True)
+    st.enabled_mcpjson_edit.setText("a, b")
+    oc_win._save()
+    layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert layer["enableAllProjectMcpServers"] is True
+    assert layer["enabledMcpjsonServers"] == ["a", "b"]

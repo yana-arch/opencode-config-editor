@@ -50,6 +50,18 @@ class OpenclaudeSettingsTab(BaseTab):
         form.addRow("Permission prompts:", self.skip_dangerous_chk)
         form.addRow("", self.skip_fullaccess_chk)
 
+        # MCP gating (settings.json) — controls how .mcp.json project servers
+        # are approved. allowed/deniedMcpServers are object lists: edit in Raw.
+        self.enable_all_mcp_chk = QCheckBox("enableAllProjectMcpServers")
+        self.enable_all_mcp_chk.stateChanged.connect(self._edited)
+        self.enabled_mcpjson_edit = QLineEdit()
+        self.disabled_mcpjson_edit = QLineEdit()
+        self.enabled_mcpjson_edit.textChanged.connect(self._edited)
+        self.disabled_mcpjson_edit.textChanged.connect(self._edited)
+        form.addRow("Project MCP:", self.enable_all_mcp_chk)
+        form.addRow("enabledMcpjsonServers:", self.enabled_mcpjson_edit)
+        form.addRow("disabledMcpjsonServers:", self.disabled_mcpjson_edit)
+
         info = QLabel("Editable text = this layer's own value; greyed placeholder = "
                       "value inherited from the effective merge (user → project → local). "
                       "Saving writes only the fields you set into the selected layer.")
@@ -91,6 +103,19 @@ class OpenclaudeSettingsTab(BaseTab):
         self.skip_dangerous_chk.blockSignals(False)
         self.skip_fullaccess_chk.blockSignals(False)
 
+        # MCP gating fields
+        self.enable_all_mcp_chk.blockSignals(True)
+        self.enabled_mcpjson_edit.blockSignals(True)
+        self.disabled_mcpjson_edit.blockSignals(True)
+        self.enable_all_mcp_chk.setChecked(bool(own.get("enableAllProjectMcpServers")))
+        for edit, key in ((self.enabled_mcpjson_edit, "enabledMcpjsonServers"),
+                          (self.disabled_mcpjson_edit, "disabledMcpjsonServers")):
+            val = own.get(key)
+            edit.setText(", ".join(val) if isinstance(val, list) else "")
+        self.enable_all_mcp_chk.blockSignals(False)
+        self.enabled_mcpjson_edit.blockSignals(False)
+        self.disabled_mcpjson_edit.blockSignals(False)
+
         def _set(edit, key):
             # Show the selected layer's own value as editable text; show the
             # effective (inherited) value as greyed placeholder so nothing looks
@@ -126,6 +151,16 @@ class OpenclaudeSettingsTab(BaseTab):
             self._put(data, "statusLine", value, None)
         else:
             data.pop("statusLine", None)
+        # MCP gating: write when pre-existing in this layer or explicitly set.
+        if "enableAllProjectMcpServers" in data or self.enable_all_mcp_chk.isChecked():
+            self._put(data, "enableAllProjectMcpServers",
+                      self.enable_all_mcp_chk.isChecked(), None)
+        for edit, key in ((self.enabled_mcpjson_edit, "enabledMcpjsonServers"),
+                          (self.disabled_mcpjson_edit, "disabledMcpjsonServers")):
+            items = [x.strip() for x in edit.text().split(",") if x.strip()]
+            if items or key in data:
+                self._put(data, key, items, [])
+
         # skip-permission toggles: write when pre-existing in this layer (so
         # unchecking writes an explicit false) or when explicitly opted in.
         if "skipDangerousModePermissionPrompt" in data or self.skip_dangerous_chk.isChecked():
@@ -145,7 +180,7 @@ class OpenclaudeRawTab(BaseTab):
         bar = QHBoxLayout()
         bar.addWidget(QLabel(" Layer: "))
         self.layer_combo = QComboBox()
-        for lk in ("user", "project", "local", "global"):
+        for lk in ("user", "project", "local", "global", "project-mcp"):
             self.layer_combo.addItem(lk, lk)
         self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
         bar.addWidget(self.layer_combo)
@@ -177,7 +212,12 @@ class OpenclaudeRawTab(BaseTab):
         layer = self._current_raw_layer()
         if layered is None:
             return
-        data = layered.global_data if layer == "global" else layered.layer(layer)
+        if layer == "global":
+            data = layered.global_data
+        elif layer == "project-mcp":
+            data = layered.project_mcp
+        else:
+            data = layered.layer(layer)
         self.editor.blockSignals(True)
         self.editor.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
         self.editor.blockSignals(False)
@@ -504,3 +544,447 @@ class OpenclaudeAgentModelsTab(BaseTab):
             d[k] = v
         else:
             d.pop(k, None)
+
+
+class OpenclaudeMcpTab(BaseTab):
+    """MCP servers across user/project/local scopes (+ policy read-only).
+
+    Verified openclaude v0.28.0 storage:
+      user    -> global ~/.openclaude.json -> mcpServers
+      project -> <cwd>/.mcp.json           -> mcpServers
+      local   -> global projects[file dict]     -> mcpServers
+      policy  -> <managed>/managed-mcp.json (read-only display)
+    Unknown sub-keys on each server (env, args, headers, ...) are preserved.
+    """
+
+    SCOPES = ("user", "project", "local")
+    SOURCE_TYPES = ("github", "git", "url", "file", "directory", "npm")
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._scopes_cache = {"user": {}, "project": {}, "local": {}}
+        self._dirty_scopes = set()
+        self._project_mcp_orig = {}
+        self._shown_scope = "user"
+
+        layout = QVBoxLayout(self)
+        sbar = QHBoxLayout()
+        sbar.addWidget(QLabel("Scope:"))
+        self.scope_combo = QComboBox()
+        for sc in self.SCOPES:
+            self.scope_combo.addItem(sc, sc)
+        self.scope_combo.currentIndexChanged.connect(self._on_scope_change)
+        sbar.addWidget(self.scope_combo)
+        sbar.addStretch()
+        layout.addLayout(sbar)
+
+        layout.addWidget(QLabel("Servers (unknown sub-keys like args/env/headers "
+                                "are preserved; edit complex servers in Raw):"))
+        self.mcp_table = QTableWidget(0, 5)
+        self.mcp_table.setHorizontalHeaderLabels(
+            ["name", "transport", "command / url", "env (K=V, ...)", "headers (K=V, ...)"])
+        self.mcp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.mcp_table)
+        btns = QHBoxLayout()
+        add_b = QPushButton("Add server")
+        add_b.clicked.connect(lambda: self._add_row())
+        del_b = QPushButton("Remove selected")
+        del_b.clicked.connect(self._remove_row)
+        btns.addWidget(add_b)
+        btns.addWidget(del_b)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        self.managed_label = QLabel("")
+        self.managed_label.setWordWrap(True)
+        self.managed_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.managed_label)
+
+    # --- table helpers ---
+    def _add_row(self, name="", server=None):
+        server = server if isinstance(server, dict) else {}
+        r = self.mcp_table.rowCount()
+        self.mcp_table.insertRow(r)
+        name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.UserRole, dict(server))
+        self.mcp_table.setItem(r, 0, name_item)
+        typ = str(server.get("type") or ("http" if server.get("url") else "stdio"))
+        self.mcp_table.setItem(r, 1, QTableWidgetItem(typ))
+        target = server.get("command") if isinstance(server.get("command"), str) else \
+            "" if not server.get("url") else str(server.get("url"))
+        self.mcp_table.setItem(r, 2, QTableWidgetItem(str(target or "")))
+        env = server.get("env") if isinstance(server.get("env"), dict) else {}
+        self.mcp_table.setItem(r, 3, QTableWidgetItem(
+            ", ".join(f"{k}={v}" for k, v in env.items())))
+        headers = server.get("headers") if isinstance(server.get("headers"), dict) else {}
+        self.mcp_table.setItem(r, 4, QTableWidgetItem(
+            ", ".join(f"{k}={v}" for k, v in headers.items())))
+        self._edited()
+
+    def _remove_row(self):
+        r = self.mcp_table.currentRow()
+        if r >= 0:
+            self.mcp_table.removeRow(r)
+            self._edited()
+
+    def _cell(self, r, c):
+        item = self.mcp_table.item(r, c)
+        return item.text().strip() if item else ""
+
+    @staticmethod
+    def _pairs(text):
+        out = {}
+        for part in text.split(","):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                if k.strip():
+                    out[k.strip()] = v.strip()
+        return out
+
+    # --- scope switching keeps unsaved edits per scope ---
+    def _on_scope_change(self, *_):
+        prev = getattr(self, "_shown_scope", None)
+        new_scope = self.scope_combo.currentData() or "user"
+        if prev and prev != new_scope:
+            self._scopes_cache[prev] = self._collect_scope_table()
+        self._shown_scope = new_scope
+        self._load_scope_table(new_scope)
+
+    def _load_scope_table(self, scope):
+        self.mcp_table.setRowCount(0)
+        for name, srv in self._scopes_cache.get(scope, {}).items():
+            if isinstance(srv, dict):
+                self._add_row(name, srv)
+
+    def _collect_scope_table(self) -> dict:
+        """Rebuild the visible rows into a servers dict, preserving unknown keys."""
+        out = {}
+        for r in range(self.mcp_table.rowCount()):
+            nitem = self.mcp_table.item(r, 0)
+            name = nitem.text().strip() if nitem else ""
+            if not name:
+                continue
+            orig = nitem.data(Qt.UserRole) or {}
+            srv = dict(orig) if isinstance(orig, dict) else {}
+            typ = self._cell(r, 1)
+            target = self._cell(r, 2)
+            env_text = self._cell(r, 3)
+            hdr_text = self._cell(r, 4)
+            if typ:
+                srv["type"] = typ
+            else:
+                srv.pop("type", None)
+            if typ == "http":
+                srv["url"] = target
+                srv.pop("command", None)
+            elif target:
+                srv["command"] = target
+                srv.pop("url", None)
+            if env_text:
+                srv["env"] = self._pairs(env_text)
+            else:
+                srv.pop("env", None)
+            if hdr_text:
+                srv["headers"] = self._pairs(hdr_text)
+            else:
+                srv.pop("headers", None)
+            out[name] = srv
+        return out
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        scope = getattr(self, "_shown_scope", None)
+        if scope:
+            self._dirty_scopes.add(scope)
+            self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        self._loading = True
+        try:
+            if layered:
+                guser = layered.global_data.get("mcpServers")
+                self._scopes_cache["user"] = guser if isinstance(guser, dict) else {}
+                pmc = layered.project_mcp
+                self._project_mcp_orig = dict(pmc) if isinstance(pmc, dict) else {}
+                psrv = self._project_mcp_orig.get("mcpServers")
+                self._scopes_cache["project"] = psrv if isinstance(psrv, dict) else {}
+                self._scopes_cache["local"] = layered.local_mcp()
+            idx = self.scope_combo.findData(getattr(self.app, "oc_mcp_scope", None) or "user")
+            self.scope_combo.blockSignals(True)
+            self.scope_combo.setCurrentIndex(max(0, idx))
+            self.scope_combo.blockSignals(False)
+            self._shown_scope = self.scope_combo.currentData() or "user"
+            self._load_scope_table(self._shown_scope)
+            managed = layered.managed_mcp_servers() if layered else {}
+            if managed:
+                names = ", ".join(sorted(managed.keys()))
+                self.managed_label.setText(
+                    f"Policy servers from {layered.managed_mcp_file} (read-only): {names}")
+            else:
+                self.managed_label.setText("No managed-mcp.json policy layer found.")
+        finally:
+            self._loading = False
+            self._dirty_scopes = set()
+
+    def commit_current(self):
+        """Flush the visible table into the cache of the shown scope."""
+        self._scopes_cache[self._shown_scope] = self._collect_scope_table()
+
+    def global_dirty(self) -> bool:
+        return "user" in self._dirty_scopes or "local" in self._dirty_scopes
+
+    def project_dirty(self) -> bool:
+        return "project" in self._dirty_scopes
+
+    def collect_global(self, gdata):
+        """Apply dirty user/local scopes into the global data dict."""
+        if "user" in self._dirty_scopes:
+            servers = self._scopes_cache["user"]
+            if servers:
+                gdata["mcpServers"] = servers
+            else:
+                gdata.pop("mcpServers", None)
+        if "local" in self._dirty_scopes:
+            layered = getattr(self.app, "oc_layered", None)
+            if layered is None:
+                return
+            projects = gdata.get("projects")
+            projects = dict(projects) if isinstance(projects, dict) else {}
+            key = layered.project_key()
+            entry = projects.get(key)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            servers = self._scopes_cache["local"]
+            if servers:
+                entry["mcpServers"] = servers
+            else:
+                entry.pop("mcpServers", None)
+            if entry:
+                projects[key] = entry
+            else:
+                projects.pop(key, None)
+            if projects or "projects" in gdata:
+                gdata["projects"] = projects
+
+    def project_mcp_data(self) -> dict:
+        base = dict(self._project_mcp_orig)
+        servers = self._scopes_cache["project"]
+        if servers or "mcpServers" in base:
+            base["mcpServers"] = servers
+        return base
+
+
+class OpenclaudePluginsTab(BaseTab):
+    """Plugin + marketplace settings keys (settings.json of the selected layer).
+
+    Shapes verified against openclaude v0.28.0 SettingsSchema:
+      enabledPlugins: {"plugin-id@marketplace-id": true|false|["version"]}
+      extraKnownMarketplaces: {name: {source: {source:"github"|... , ...},
+                                      installLocation?, autoUpdate?}}
+    blockedMarketplaces / pluginConfigs are object lists/dicts: Raw only.
+    """
+
+    MARKET_TYPES = ("github", "git", "url", "file", "directory", "npm")
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._loading = False
+        layout = QVBoxLayout(self)
+
+        info = QLabel("Plugins live in the selected settings layer. Complex values "
+                      "(version arrays, blockedMarketplaces, pluginConfigs) — edit in Raw.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        layout.addWidget(QLabel("enabledPlugins — plugin-id@marketplace-id → true/false:"))
+        self.plugins_table = QTableWidget(0, 2)
+        self.plugins_table.setHorizontalHeaderLabels(["plugin@marketplace", "value (true/false/[..])"])
+        self.plugins_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.plugins_table)
+        pbtns = QHBoxLayout()
+        add_p = QPushButton("Add plugin")
+        add_p.clicked.connect(lambda: self._add_plugin_row())
+        del_p = QPushButton("Remove selected")
+        del_p.clicked.connect(self._remove_plugin_row)
+        pbtns.addWidget(add_p)
+        pbtns.addWidget(del_p)
+        pbtns.addStretch()
+        layout.addLayout(pbtns)
+
+        layout.addWidget(QLabel("extraKnownMarketplaces — additional marketplace sources:"))
+        self.market_table = QTableWidget(0, 5)
+        self.market_table.setHorizontalHeaderLabels(
+            ["name", "source type", "repo / url / path / package", "ref", "autoUpdate"])
+        self.market_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.market_table)
+        mbtns = QHBoxLayout()
+        add_m = QPushButton("Add marketplace")
+        add_m.clicked.connect(lambda: self._add_market_row())
+        del_m = QPushButton("Remove selected")
+        del_m.clicked.connect(self._remove_market_row)
+        mbtns.addWidget(add_m)
+        mbtns.addWidget(del_m)
+        mbtns.addStretch()
+        layout.addLayout(mbtns)
+
+        self.cache_label = QLabel("")
+        self.cache_label.setWordWrap(True)
+        self.cache_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.cache_label)
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    # --- plugins rows ---
+    def _add_plugin_row(self, pid=""):
+        r = self.plugins_table.rowCount()
+        self.plugins_table.insertRow(r)
+        item = QTableWidgetItem(pid)
+        item.setData(Qt.UserRole, None)
+        self.plugins_table.setItem(r, 0, item)
+        self.plugins_table.setItem(r, 1, QTableWidgetItem("true"))
+        self._edited()
+
+    def _remove_plugin_row(self):
+        r = self.plugins_table.currentRow()
+        if r >= 0:
+            self.plugins_table.removeRow(r)
+            self._edited()
+
+    # --- marketplace rows ---
+    def _add_market_row(self, name="", entry=None):
+        entry = entry if isinstance(entry, dict) else {}
+        src = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+        stype = src.get("source", "github")
+        value = ""
+        for fname in ("repo", "url", "path", "package"):
+            if fname in src:
+                value = str(src[fname])
+                break
+        r = self.market_table.rowCount()
+        self.market_table.insertRow(r)
+        name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.UserRole, dict(entry))  # preserve installLocation etc.
+        self.market_table.setItem(r, 0, name_item)
+        self.market_table.setItem(r, 1, QTableWidgetItem(stype if stype in self.MARKET_TYPES else "github"))
+        self.market_table.setItem(r, 2, QTableWidgetItem(value))
+        self.market_table.setItem(r, 3, QTableWidgetItem(str(src.get("ref", "") or "")))
+        chk = QCheckBox()
+        chk.setChecked(bool(entry.get("autoUpdate")))
+        chk.stateChanged.connect(self._edited)
+        self.market_table.setCellWidget(r, 4, chk)
+        self._edited()
+
+    def _remove_market_row(self):
+        r = self.market_table.currentRow()
+        if r >= 0:
+            self.market_table.removeRow(r)
+            self._edited()
+
+    def _pcell(self, r, c):
+        item = self.plugins_table.item(r, c)
+        return item.text().strip() if item else ""
+
+    def _mcell(self, r, c):
+        item = self.market_table.item(r, c)
+        return item.text().strip() if item else ""
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        self._loading = True
+        try:
+            self.plugins_table.setRowCount(0)
+            enabled = own.get("enabledPlugins")
+            enabled = enabled if isinstance(enabled, dict) else {}
+            for pid, val in enabled.items():
+                r = self.plugins_table.rowCount()
+                self._add_plugin_row(pid)
+                if isinstance(val, list):
+                    text = json.dumps(val)
+                    self.plugins_table.item(r, 1).setData(Qt.UserRole, json.dumps(val))
+                else:
+                    text = "true" if val else "false"
+                    self.plugins_table.item(r, 1).setData(Qt.UserRole, text)
+                self.plugins_table.item(r, 1).setText(text)
+
+            self.market_table.setRowCount(0)
+            markets = own.get("extraKnownMarketplaces")
+            markets = markets if isinstance(markets, dict) else {}
+            for name, entry in markets.items():
+                if isinstance(entry, dict):
+                    self._add_market_row(name, entry)
+
+            # Read-only listing of cached marketplaces under the config dir.
+            cache_txt = ""
+            if layered:
+                plug_dir = layered.config_dir / "plugins"
+                mk_dir = plug_dir / "marketplaces"
+                try:
+                    if mk_dir.is_dir():
+                        found = sorted(p.name for p in mk_dir.iterdir() if p.is_dir())
+                        if found:
+                            cache_txt = f"Cached marketplaces ({mk_dir}): " + ", ".join(found)
+                except OSError:
+                    pass
+            self.cache_label.setText(cache_txt or "")
+        finally:
+            self._loading = False
+
+    def collect(self, data):
+        # enabledPlugins
+        plugins = {}
+        for r in range(self.plugins_table.rowCount()):
+            pid = self._pcell(r, 0)
+            if not pid:
+                continue
+            item = self.plugins_table.item(r, 1)
+            text = (item.text().strip() if item else "").lower()
+            orig = item.data(Qt.UserRole) if item else None
+            if text == "true":
+                plugins[pid] = True
+            elif text == "false":
+                plugins[pid] = False
+            elif text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        plugins[pid] = [str(v) for v in parsed]
+                        continue
+                except json.JSONDecodeError:
+                    pass
+                plugins[pid] = orig  # keep original verbatim when unparsable
+        if "enabledPlugins" in data or plugins:
+            data["enabledPlugins"] = plugins
+
+        # extraKnownMarketplaces
+        markets = {}
+        for r in range(self.market_table.rowCount()):
+            name = self._mcell(r, 0)
+            if not name:
+                continue
+            nitem = self.market_table.item(r, 0)
+            entry = nitem.data(Qt.UserRole) or {}
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            stype = self._mcell(r, 1)
+            value = self._mcell(r, 2)
+            ref = self._mcell(r, 3)
+            chk = self.market_table.cellWidget(r, 4)
+            src = {"source": stype if stype in self.MARKET_TYPES else "github"}
+            field = {"github": "repo", "git": "url", "url": "url",
+                     "file": "path", "directory": "path", "npm": "package"}.get(src["source"], "repo")
+            if value:
+                src[field] = value
+            if ref and src["source"] in ("github", "git"):
+                src["ref"] = ref
+            entry["source"] = src
+            if chk is not None and not chk.isChecked():
+                entry.pop("autoUpdate", None)
+            elif chk is not None and chk.isChecked():
+                entry["autoUpdate"] = True
+            markets[name] = entry
+        if "extraKnownMarketplaces" in data or markets:
+            data["extraKnownMarketplaces"] = markets

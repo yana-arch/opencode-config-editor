@@ -1,16 +1,34 @@
 # openclaude layered config model.
 #
-# Unlike opencode (a single file per kind), openclaude merges three settings
-# layers (user -> project -> local, later wins) plus a separate global file.
-# LayeredConfigFile reads each layer independently, exposes the deep-merged
-# effective view for display, and writes edits back to ONE chosen layer.
+# openclaude merges three settings layers (user -> project -> local, later
+# wins) under a read-only, highest-precedence enterprise policy layer
+# (managed-settings.json), plus separate stores:
+#   - global ~/.openclaude.json  (providerProfiles, activeProviderProfileId,
+#     user-scope mcpServers, app STATE we preserve but never edit)
+#   - <cwd>/.mcp.json            (project-scope MCP servers)
+#   - global projects[file dict].mcpServers (local-scope MCP servers)
+#
+# Verified against openclaude @gitlawb v0.28.0:
+#   - managed dir: /etc/claude-code (linux), /Library/Application Support/
+#     ClaudeCode (macos), C:\Program Files\ClaudeCode (windows); the policy
+#     layer = managed-settings.json merged with managed-settings.d/*.json
+#     drop-ins (sorted), and managed-mcp.json holds policy MCP servers.
+#   - projects[] key = normalize(cwd) with backslashes replaced by "/".
+
+def default_managed_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/ClaudeCode")
+    if os.name == "nt":
+        return Path("C:/Program Files/ClaudeCode")
+    return Path("/etc/claude-code")
+
 
 class LayeredConfigFile:
-    """openclaude settings across user/project/local layers + global file."""
+    """openclaude settings across user/project/local layers + policy + global."""
 
     LAYER_ORDER = ("user", "project", "local")
 
-    def __init__(self, cwd, config_dir=None):
+    def __init__(self, cwd, config_dir=None, managed_dir=None):
         self.cwd = Path(cwd)
         self.config_dir = Path(config_dir).expanduser() if config_dir else config_home(
             "~/.openclaude", OPENCLAUDE_CONFIG_ENV)
@@ -21,10 +39,20 @@ class LayeredConfigFile:
             "local": dot / "settings.local.json",
         }
         # Global file is a sibling of the config dir: ~/.openclaude -> ~/.openclaude.json
-        # (per openclaude docs, agentModels/agentRouting/smartRouting live here).
         self.global_file = Path(str(self.config_dir) + ".json")
+        # Enterprise policy layer (read-only).
+        self.managed_dir = Path(managed_dir) if managed_dir else default_managed_dir()
+        self.managed_file = self.managed_dir / "managed-settings.json"
+        self.managed_dropin_dir = self.managed_dir / "managed-settings.d"
+        self.managed_mcp_file = self.managed_dir / "managed-mcp.json"
+        # Project-scope MCP servers live in <cwd>/.mcp.json.
+        self.project_mcp_file = self.cwd / ".mcp.json"
+
         self.layers = {name: {} for name in self.LAYER_ORDER}
         self.global_data = {}
+        self.managed_settings = {}
+        self.managed_mcp = {}
+        self.project_mcp = {}
         self.error = None
 
     @staticmethod
@@ -41,14 +69,44 @@ class LayeredConfigFile:
         for name, path in self.layer_files.items():
             self.layers[name] = self._read(path)
         self.global_data = self._read(self.global_file)
+        self.managed_settings = self._load_managed_settings()
+        self.managed_mcp = self._read(self.managed_mcp_file)
+        self.project_mcp = self._read(self.project_mcp_file)
         return True
 
+    def _load_managed_settings(self) -> dict:
+        """managed-settings.json merged with sorted managed-settings.d drop-ins."""
+        sources = [self._read(self.managed_file)]
+        try:
+            if self.managed_dropin_dir.is_dir():
+                for p in sorted(self.managed_dropin_dir.glob("*.json")):
+                    sources.append(self._read(p))
+        except OSError:
+            pass
+        return merge_layers(sources)
+
     def effective(self) -> dict:
-        """Deep-merged settings across layers (later layer wins)."""
-        return merge_layers(self.layers[name] for name in self.LAYER_ORDER)
+        """Deep-merged settings; policy (managed) overrides all user layers."""
+        return merge_layers(
+            [self.layers[name] for name in self.LAYER_ORDER] + [self.managed_settings])
 
     def layer(self, name: str) -> dict:
         return self.layers.get(name, {})
+
+    def project_key(self) -> str:
+        """Key under global projects[file dict] for this cwd (normalized, '/' separators)."""
+        return str(Path(self.cwd).resolve()).replace("\\", "/")
+
+    def local_mcp(self) -> dict:
+        """Local-scope MCP servers from global projects[file dict].mcpServers."""
+        entry = self.global_data.get("projects", {})
+        entry = entry.get(self.project_key(), {}) if isinstance(entry, dict) else {}
+        servers = entry.get("mcpServers") if isinstance(entry, dict) else None
+        return servers if isinstance(servers, dict) else {}
+
+    def managed_mcp_servers(self) -> dict:
+        servers = self.managed_mcp.get("mcpServers")
+        return servers if isinstance(servers, dict) else {}
 
     def save_layer(self, name: str, data: dict) -> Tuple[bool, str]:
         """Atomically write one layer's settings.json."""
@@ -57,8 +115,12 @@ class LayeredConfigFile:
         return self._atomic_write(self.layer_files[name], data, on_ok=lambda: self.layers.__setitem__(name, data))
 
     def save_global(self, data: dict) -> Tuple[bool, str]:
-        """Atomically write the global ~/.openclaude.json (providers/routing)."""
+        """Atomically write the global ~/.openclaude.json (providers/routing/mcp)."""
         return self._atomic_write(self.global_file, data, on_ok=lambda: setattr(self, "global_data", data))
+
+    def save_project_mcp(self, data: dict) -> Tuple[bool, str]:
+        """Atomically write the project-scope .mcp.json."""
+        return self._atomic_write(self.project_mcp_file, data, on_ok=lambda: setattr(self, "project_mcp", data))
 
     def _atomic_write(self, path, data, on_ok=None) -> Tuple[bool, str]:
         if not isinstance(data, dict):
@@ -85,4 +147,6 @@ def _openclaude_targets(cwd, config_dir=None):
         ("Project settings.json", cf.layer_files["project"], "project"),
         ("Local settings.local.json", cf.layer_files["local"], "local"),
         ("Global ~/.openclaude.json", cf.global_file, "global"),
+        ("Project .mcp.json", cf.project_mcp_file, "project-mcp"),
+        ("Managed settings (policy, read-only)", cf.managed_file, "managed"),
     ]

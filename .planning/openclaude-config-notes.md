@@ -108,13 +108,57 @@ User-meaningful keys: **`providerProfiles`** (list of
 **`mcpServers`**. => The editor must NOT rewrite this file unless a provider
 field actually changed (implemented: per-tab `_dirty` guard).
 
-### Keys that could NOT be confirmed in v0.28.0 (treat as legacy/unverified)
-`effortLevel`, `advisorModel`, `smartRouting`, `providerFallbackChain`,
-`subscriptionType` — absent from binary, README, and live config.
-`agentModels`/`agentRouting` appear ONCE in the README but are absent from the
-binary and live config. Kept only for lenient round-trip/back-compat.
+### CORRECTION (schema extraction, later session)
+The earlier literal-grep conclusion "could not be confirmed" for effortLevel,
+advisorModel, smartRouting, providerFallbackChain, agentModels, agentRouting,
+subscriptionType was WRONG (minification defeated the grep). Extracting
+SettingsSchema from dist/cli.mjs shows ALL of them are real settings keys.
+Likewise docs confirm theme/verbose/autoUpdates DO belong in the global
+~/.openclaude.json. The full key vocabulary now comes from:
+  - SettingsSchema in dist/cli.mjs (zod), which extends
+  - https://json.schemastore.org/claude-code-settings.json ($schema URL that
+    openclaude itself writes; 142 top-level props) + openclaude extensions.
+constants.py OPENCLAUDE_SETTINGS_KEYS is generated from that union (159 keys).
 
 ### Editor gaps still open
 - No `managed-settings.json` in the effective/inherited view.
 - `mcpServers` (global) not editable via form (Raw only).
 - Form still lacks `statusLine`/`modelLimits`/permission-mode/env/hooks editors.
+
+## MCP scopes + Plugins surface (verified v0.28.0, drives the editor tabs)
+
+### MCP — 4 storage locations
+| scope | file | key |
+|---|---|---|
+| user | `~/.openclaude.json` | `mcpServers` |
+| project | `<cwd>/.mcp.json` | `mcpServers` (atomic tmp+rename, preserves file mode) |
+| local | `~/.openclaude.json` | `projects[file dict].mcpServers` (project key = normalized cwd, backslashes→"/") |
+| policy | `<managed>/managed-mcp.json` | read-only |
+
+Server shape: `{type: "stdio"|"http", command|url, env?, headers?, args?, ...}`
+(unknown sub-keys must be preserved). CLI: `openclaude mcp add --transport
+stdio|http [-e K=V] [--header K:V] name ...`.
+Gating settings keys: `enableAllProjectMcpServers` (bool),
+`enabled/disabledMcpjsonServers` (string arrays; approval of .mcp.json),
+`allowed/deniedMcpServers` (object lists — enterprise, Raw only).
+
+### Policy layer
+managed dir per platform: `/etc/claude-code`,
+`/Library/Application Support/ClaudeCode`, `C:\Program Files\ClaudeCode`.
+Policy = managed-settings.json merged with sorted `managed-settings.d/*.json`
+drop-ins; highest precedence in effective view. Editor reads it read-only.
+
+### Plugins / marketplaces (settings.json keys)
+- `enabledPlugins`: {"plugin-id@marketplace-id": true|false|["version"]}.
+- `extraKnownMarketplaces`: {name: {source: {source:"github"|"git"|"url"|"npm"|
+  "file"|"directory"|..., repo/url/path/package, ref?, headers?},
+  installLocation?, autoUpdate?}}. Field mapping per source type matters.
+- `blockedMarketplaces`: array of source OBJECTS (Raw only).
+- Official marketplace: claude-plugins-official (github anthropics/
+  claude-plugins-official); plugin cache at <configdir>/plugins.
+- CLI: `openclaude plugin install/uninstall/enable/disable/update`, group
+  `marketplace`.
+
+### Other config files (targets)
+`<configdir>/keybindings.json` (KeybindingsSchema), output styles under the
+config dir (`output-styles/`), CLAUDE.md project instructions.

@@ -9,14 +9,20 @@ def _openclaude_make_tabs(win):
     win.oc_layered = None             # set by initial_load hook
     settings_tab = OpenclaudeSettingsTab(win)
     models_tab = OpenclaudeAgentModelsTab(win)
+    mcp_tab = OpenclaudeMcpTab(win)
+    plugins_tab = OpenclaudePluginsTab(win)
     raw_tab = OpenclaudeRawTab(win)
-    win._agent_tabs = [settings_tab, models_tab, raw_tab]
+    win._agent_tabs = [settings_tab, models_tab, mcp_tab, plugins_tab, raw_tab]
     win._agent_settings_tab = settings_tab
     win._agent_models_tab = models_tab
+    win._agent_mcp_tab = mcp_tab
+    win._agent_plugins_tab = plugins_tab
     win._agent_raw_tab = raw_tab
     return [
         (settings_tab, "Settings", "settings"),
         (models_tab, "Agent Models", "settings"),
+        (mcp_tab, "MCP", "settings"),
+        (plugins_tab, "Plugins", "settings"),
         (raw_tab, "Raw (per layer)", None),
     ]
 
@@ -47,6 +53,8 @@ def _openclaude_save(win):
             return
         if layer == "global":
             ok, msg = layered.save_global(parsed)
+        elif layer == "project-mcp":
+            ok, msg = layered.save_project_mcp(parsed)
         else:
             ok, msg = layered.save_layer(layer, parsed)
         win.status_bar.showMessage(msg if ok else f"Save error: {msg}")
@@ -55,27 +63,39 @@ def _openclaude_save(win):
 
     # Form-based save:
     #  - Settings tab writes scalar keys into the selected settings layer
-    #  - Agent Models tab writes providerProfiles/agentRouting/fallback into the
-    #    global ~/.openclaude.json (where providers live per openclaude docs)
+    #  - Plugins tab writes enabledPlugins/marketplaces into the same layer
+    #  - Agent Models tab writes providerProfiles/routing into the global
+    #  - MCP tab writes per-scope: user/local -> global, project -> .mcp.json
     layer = win.oc_layer
     base = dict(layered.layer(layer))
     win._agent_settings_tab.collect(base)
+    win._agent_plugins_tab.collect(base)
     ok1, msg1 = layered.save_layer(layer, base)
 
-    # Only rewrite the global file when the Agent Models tab was actually
+    # Only rewrite the global file when a tab that owns global data was actually
     # touched, so an untouched global (with app-state keys) is left alone.
-    if getattr(win._agent_models_tab, "_dirty", False):
+    mcp_tab = win._agent_mcp_tab
+    mcp_tab.commit_current()
+    if getattr(win._agent_models_tab, "_dirty", False) or mcp_tab.global_dirty():
         gbase = dict(layered.global_data)
         win._agent_models_tab.collect(gbase)
+        mcp_tab.collect_global(gbase)
         ok2, msg2 = layered.save_global(gbase)
-        tail = " + global providers"
+        tail = " + global"
     else:
         ok2, msg2, tail = True, "", ""
 
-    if ok1 and ok2:
+    ok3 = True
+    msg3 = ""
+    if mcp_tab.project_dirty():
+        ok3, msg3 = layered.save_project_mcp(mcp_tab.project_mcp_data())
+        tail += " + .mcp.json"
+
+    if ok1 and ok2 and ok3:
         win.status_bar.showMessage(f"Saved layer '{layer}'{tail}")
     else:
-        win.status_bar.showMessage(f"Save error: {msg1 if not ok1 else msg2}")
+        first_err = next((m for m in (msg1, msg2, msg3) if m), "")
+        win.status_bar.showMessage(f"Save error: {first_err}")
     win.refresh_tabs()
 
 
@@ -83,12 +103,14 @@ OPENCLAUDE_ADAPTER = register_adapter(AdapterSpec(
     name="openclaude",
     app_title=APP_NAME_OPENCLAUDE,
     version=APP_VERSION,
-    kinds=["user", "project", "local", "global"],
+    kinds=["user", "project", "local", "global", "project-mcp", "managed"],
     known_keys={
         "user": OPENCLAUDE_SETTINGS_KEYS,
         "project": OPENCLAUDE_SETTINGS_KEYS,
         "local": OPENCLAUDE_SETTINGS_KEYS,
         "global": OPENCLAUDE_GLOBAL_KEYS,
+        "project-mcp": {"mcpServers"},
+        "managed": OPENCLAUDE_SETTINGS_KEYS,
     },
     raw_files=[("settings.json", "project")],
     targets_fn=_openclaude_targets,

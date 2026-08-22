@@ -6653,45 +6653,74 @@ OPENCODE_ADAPTER = register_adapter(AdapterSpec(
     make_tabs_fn=_opencode_make_tabs,
     capabilities={"providers", "mcp", "plugins", "catalog", "tui", "runtime"},
 ))
-# openclaude config constants: top-level keys for settings.json and the global
-# ~/.openclaude.json.
+# openclaude config constants.
 #
-# Verified against openclaude v0.28.0 (@gitlawb/openclaude) and a live install:
-#   - settings.json (user/project) real keys: model, env, hooks, statusLine,
-#     modelLimits, permissions, skipDangerousModePermissionPrompt,
-#     skipFullAccessModePermissionPrompt, plus common Claude-Code-compatible
-#     keys (outputStyle, cleanupPeriodDays, includeCoAuthoredBy,
-#     autoCompactEnabled, apiKeyHelper, enableAllProjectMcpServers).
-#   - settings.local.json commonly holds `permissions`.
-#   - A 4th, highest-precedence policy layer `managed-settings.json` exists
-#     (enterprise/MDM) — read-only, not edited here.
-#   - Global ~/.openclaude.json is mostly app STATE; the user-meaningful keys
-#     are providerProfiles, activeProviderProfileId, mcpServers.
-#   - `agentModels`/`agentRouting` appear once in the README but are absent from
-#     the shipped binary and live config; kept only for lenient back-compat.
-#   - `effortLevel`, `advisorModel`, `smartRouting`, `providerFallbackChain`,
-#     `subscriptionType` could NOT be confirmed in v0.28.0 (absent from binary,
-#     README, and live config) — treat as unverified/legacy.
+# VERIFIED sources (openclaude @gitlawb v0.28.0, 2026-08):
+#   1. The shipped binary's SettingsSchema (zod) — superset of the official
+#      Claude Code settings schema it embeds:
+#      https://json.schemastore.org/claude-code-settings.json
+#   2. openclaude docs (openclaude.gitlawb.com/docs/configuration/):
+#      theme/verbose/autoUpdates live in the GLOBAL ~/.openclaude.json, not
+#      settings.json; effortLevel/smartRouting/agentModels/agentRouting/
+#      providerFallbackChain/advisorModel/subscriptionType/modelLimits are
+#      real, documented settings keys.
+#   3. Layered settings: user -> project -> local (later wins), plus a
+#      highest-precedence read-only policy layer managed-settings.json
+#      (/etc/claude-code on Linux).
+#
+# NOTE: keys here form the advisory known-key vocabulary for validation.
+# The list is intentionally generous: unknown keys are preserved verbatim on
+# save regardless of membership.
 
 APP_NAME_OPENCLAUDE = "openclaude-config-editor"
 
+# Official JSON Schema URL for settings.json (what openclaude itself writes
+# into "$schema" for editor validation).
+OPENCLAUDE_SETTINGS_SCHEMA_URL = "https://json.schemastore.org/claude-code-settings.json"
+
 # Keys allowed in the layered settings.json files (user/project/local).
 OPENCLAUDE_SETTINGS_KEYS = {
-    "$schema", "model", "agent", "permissions", "env", "hooks",
-    "statusLine", "modelLimits",
-    "skipDangerousModePermissionPrompt", "skipFullAccessModePermissionPrompt",
-    "outputStyle", "cleanupPeriodDays", "includeCoAuthoredBy",
-    "autoCompactEnabled", "apiKeyHelper", "enableAllProjectMcpServers",
-    # Unverified against v0.28.0 but tolerated for back-compat:
-    "effortLevel", "advisorModel", "smartRouting", "providerFallbackChain",
-    "agentModels", "agentRouting", "subscriptionType",
+    "$schema", "advisorModel", "agent", "agentModels", "agentPushNotifEnabled",
+    "agentRouting", "allowAllClaudeAiMcps", "allowManagedHooksOnly", "allowManagedMcpServersOnly", "allowManagedPermissionRulesOnly",
+    "allowedChannelPlugins", "allowedHttpHookUrls", "allowedMcpServers", "alwaysThinkingEnabled", "apiKeyHelper",
+    "askUserQuestionTimeout", "attribution", "autoCompactEnabled", "autoConnectIde", "autoDreamEnabled",
+    "autoFix", "autoInstallIdeExtension", "autoMemoryDirectory", "autoMemoryEnabled", "autoMode",
+    "autoScrollEnabled", "autoUpdatesChannel", "availableModels", "awaySummaryEnabled", "awsAuthRefresh",
+    "awsCredentialExport", "axScreenReader", "blockedMarketplaces", "browserExternalPageTools", "channelsEnabled",
+    "claudeMd", "claudeMdExcludes", "cleanupPeriodDays", "companyAnnouncements", "defaultShell",
+    "deniedMcpServers", "diffTool", "disableAgentView", "disableAllHooks", "disableArtifact",
+    "disableAutoMode", "disableBrowserExternalNavigation", "disableBundledSkills", "disableClaudeAiConnectors", "disableDeepLinkRegistration",
+    "disableMobileSimulatorTools", "disableRemoteControl", "disableSideloadFlags", "disableSkillShellExecution", "disableWorkflows",
+    "disabledMcpjsonServers", "editorMode", "effortLevel", "emojiCompletionEnabled", "enableAllProjectMcpServers",
+    "enableArtifact", "enabledMcpjsonServers", "enabledPlugins", "enforceAvailableModels", "env",
+    "externalEditorContext", "extraKnownMarketplaces", "fallbackModel", "fastMode", "fastModePerSessionOptIn",
+    "feedbackSurveyRate", "fileCheckpointingEnabled", "fileSuggestion", "footerLinksRegexes", "forceLoginGatewayUrl",
+    "forceLoginMethod", "forceLoginOrgUUID", "forceRemoteSettingsRefresh", "gcpAuthRefresh", "git",
+    "hooks", "httpHookAllowedEnvVars", "includeCoAuthoredBy", "includeGitInstructions", "inputNeededNotifEnabled",
+    "language", "managedMcpServers", "memory", "minimumVersion", "model",
+    "modelLimits", "modelOverrides", "modelPricing", "otelHeadersHelper", "outputStyle",
+    "parentSettingsBehavior", "permissionExplainerEnabled", "permissions", "plansDirectory", "pluginConfigs",
+    "pluginSuggestionMarketplaces", "pluginTrustMessage", "policyHelper", "prUrlTemplate", "preferredNotifChannel",
+    "prefersReducedMotion", "processWrapper", "promptSuggestionEnabled", "providerFallbackChain", "providerProfileModelPickerMode",
+    "remote", "remoteControlAtStartup", "requireCoworkFullVmSandbox", "requiredMaximumVersion", "requiredMinimumVersion",
+    "respectGitignore", "respondToBashCommands", "sandbox", "showClearContextOnPlanAccept", "showThinkingSummaries",
+    "showTurnDuration", "skillListingBudgetFraction", "skillListingMaxDescChars", "skillOverrides", "skipDangerousModePermissionPrompt",
+    "skipWebFetchPreflight", "skippedMarketplaces", "skippedPlugins", "smartRouting", "spinnerTipsEnabled",
+    "spinnerTipsOverride", "spinnerVerbs", "sponsoredTipsEnabled", "sponsoredTipsFrequency", "sshConfigs",
+    "sshHostAllowlist", "statusLine", "strictKnownMarketplaces", "strictPluginOnlyCustomization", "subagentStatusLine",
+    "subscriptionType", "syntaxHighlightingDisabled", "teammateDefaultModel", "teammateMode", "terminalProgressBarEnabled",
+    "terminalTitleFromRename", "theme", "tui", "useAutoModeDuringPlan", "verbose",
+    "viewMode", "vimInsertModeRemaps", "voice", "voiceEnabled", "wheelScrollAccelerationEnabled",
+    "workflowKeywordTriggerEnabled", "workflowSizeGuideline", "worktree", "wslInheritsWindowsSettings",
 }
 
-# Keys that live in the global ~/.openclaude.json (user-meaningful subset;
-# the file also stores app state like numStartups/tipsHistory which we preserve
-# verbatim but do not treat as config).
+# Keys that live in the global ~/.openclaude.json. That file is mostly app
+# STATE (numStartups, tipsHistory, projects, skillUsage, ...) which we
+# preserve verbatim but never treat as config. These are the user-meaningful
+# keys the editor understands:
 OPENCLAUDE_GLOBAL_KEYS = {
-    "$schema", "providerProfiles", "activeProviderProfileId", "mcpServers",
+    "$schema", "theme", "verbose", "autoUpdates",
+    "providerProfiles", "activeProviderProfileId", "mcpServers",
 }
 
 # Value-bearing fields that hold secrets and must be masked in any UI / raw view.
@@ -6699,19 +6728,40 @@ OPENCLAUDE_SECRET_FIELDS = {"api_key", "apiKey", "token", "authToken"}
 
 # Env dir override precedence (first set wins), default ~/.openclaude.
 OPENCLAUDE_CONFIG_ENV = ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR")
+
+# MCP server scopes and where each is stored.
+OPENCLAUDE_MCP_SCOPES = ("user", "project", "local")
 # openclaude layered config model.
 #
-# Unlike opencode (a single file per kind), openclaude merges three settings
-# layers (user -> project -> local, later wins) plus a separate global file.
-# LayeredConfigFile reads each layer independently, exposes the deep-merged
-# effective view for display, and writes edits back to ONE chosen layer.
+# openclaude merges three settings layers (user -> project -> local, later
+# wins) under a read-only, highest-precedence enterprise policy layer
+# (managed-settings.json), plus separate stores:
+#   - global ~/.openclaude.json  (providerProfiles, activeProviderProfileId,
+#     user-scope mcpServers, app STATE we preserve but never edit)
+#   - <cwd>/.mcp.json            (project-scope MCP servers)
+#   - global projects[file dict].mcpServers (local-scope MCP servers)
+#
+# Verified against openclaude @gitlawb v0.28.0:
+#   - managed dir: /etc/claude-code (linux), /Library/Application Support/
+#     ClaudeCode (macos), C:\Program Files\ClaudeCode (windows); the policy
+#     layer = managed-settings.json merged with managed-settings.d/*.json
+#     drop-ins (sorted), and managed-mcp.json holds policy MCP servers.
+#   - projects[] key = normalize(cwd) with backslashes replaced by "/".
+
+def default_managed_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/ClaudeCode")
+    if os.name == "nt":
+        return Path("C:/Program Files/ClaudeCode")
+    return Path("/etc/claude-code")
+
 
 class LayeredConfigFile:
-    """openclaude settings across user/project/local layers + global file."""
+    """openclaude settings across user/project/local layers + policy + global."""
 
     LAYER_ORDER = ("user", "project", "local")
 
-    def __init__(self, cwd, config_dir=None):
+    def __init__(self, cwd, config_dir=None, managed_dir=None):
         self.cwd = Path(cwd)
         self.config_dir = Path(config_dir).expanduser() if config_dir else config_home(
             "~/.openclaude", OPENCLAUDE_CONFIG_ENV)
@@ -6722,10 +6772,20 @@ class LayeredConfigFile:
             "local": dot / "settings.local.json",
         }
         # Global file is a sibling of the config dir: ~/.openclaude -> ~/.openclaude.json
-        # (per openclaude docs, agentModels/agentRouting/smartRouting live here).
         self.global_file = Path(str(self.config_dir) + ".json")
+        # Enterprise policy layer (read-only).
+        self.managed_dir = Path(managed_dir) if managed_dir else default_managed_dir()
+        self.managed_file = self.managed_dir / "managed-settings.json"
+        self.managed_dropin_dir = self.managed_dir / "managed-settings.d"
+        self.managed_mcp_file = self.managed_dir / "managed-mcp.json"
+        # Project-scope MCP servers live in <cwd>/.mcp.json.
+        self.project_mcp_file = self.cwd / ".mcp.json"
+
         self.layers = {name: {} for name in self.LAYER_ORDER}
         self.global_data = {}
+        self.managed_settings = {}
+        self.managed_mcp = {}
+        self.project_mcp = {}
         self.error = None
 
     @staticmethod
@@ -6742,14 +6802,44 @@ class LayeredConfigFile:
         for name, path in self.layer_files.items():
             self.layers[name] = self._read(path)
         self.global_data = self._read(self.global_file)
+        self.managed_settings = self._load_managed_settings()
+        self.managed_mcp = self._read(self.managed_mcp_file)
+        self.project_mcp = self._read(self.project_mcp_file)
         return True
 
+    def _load_managed_settings(self) -> dict:
+        """managed-settings.json merged with sorted managed-settings.d drop-ins."""
+        sources = [self._read(self.managed_file)]
+        try:
+            if self.managed_dropin_dir.is_dir():
+                for p in sorted(self.managed_dropin_dir.glob("*.json")):
+                    sources.append(self._read(p))
+        except OSError:
+            pass
+        return merge_layers(sources)
+
     def effective(self) -> dict:
-        """Deep-merged settings across layers (later layer wins)."""
-        return merge_layers(self.layers[name] for name in self.LAYER_ORDER)
+        """Deep-merged settings; policy (managed) overrides all user layers."""
+        return merge_layers(
+            [self.layers[name] for name in self.LAYER_ORDER] + [self.managed_settings])
 
     def layer(self, name: str) -> dict:
         return self.layers.get(name, {})
+
+    def project_key(self) -> str:
+        """Key under global projects[file dict] for this cwd (normalized, '/' separators)."""
+        return str(Path(self.cwd).resolve()).replace("\\", "/")
+
+    def local_mcp(self) -> dict:
+        """Local-scope MCP servers from global projects[file dict].mcpServers."""
+        entry = self.global_data.get("projects", {})
+        entry = entry.get(self.project_key(), {}) if isinstance(entry, dict) else {}
+        servers = entry.get("mcpServers") if isinstance(entry, dict) else None
+        return servers if isinstance(servers, dict) else {}
+
+    def managed_mcp_servers(self) -> dict:
+        servers = self.managed_mcp.get("mcpServers")
+        return servers if isinstance(servers, dict) else {}
 
     def save_layer(self, name: str, data: dict) -> Tuple[bool, str]:
         """Atomically write one layer's settings.json."""
@@ -6758,8 +6848,12 @@ class LayeredConfigFile:
         return self._atomic_write(self.layer_files[name], data, on_ok=lambda: self.layers.__setitem__(name, data))
 
     def save_global(self, data: dict) -> Tuple[bool, str]:
-        """Atomically write the global ~/.openclaude.json (providers/routing)."""
+        """Atomically write the global ~/.openclaude.json (providers/routing/mcp)."""
         return self._atomic_write(self.global_file, data, on_ok=lambda: setattr(self, "global_data", data))
+
+    def save_project_mcp(self, data: dict) -> Tuple[bool, str]:
+        """Atomically write the project-scope .mcp.json."""
+        return self._atomic_write(self.project_mcp_file, data, on_ok=lambda: setattr(self, "project_mcp", data))
 
     def _atomic_write(self, path, data, on_ok=None) -> Tuple[bool, str]:
         if not isinstance(data, dict):
@@ -6786,6 +6880,8 @@ def _openclaude_targets(cwd, config_dir=None):
         ("Project settings.json", cf.layer_files["project"], "project"),
         ("Local settings.local.json", cf.layer_files["local"], "local"),
         ("Global ~/.openclaude.json", cf.global_file, "global"),
+        ("Project .mcp.json", cf.project_mcp_file, "project-mcp"),
+        ("Managed settings (policy, read-only)", cf.managed_file, "managed"),
     ]
 # openclaude editor tabs. Minimal but functional: a Settings form (scalar keys)
 # and a per-layer Raw JSON editor. Both operate on the layer currently selected
@@ -6839,6 +6935,18 @@ class OpenclaudeSettingsTab(BaseTab):
         form.addRow("Permission prompts:", self.skip_dangerous_chk)
         form.addRow("", self.skip_fullaccess_chk)
 
+        # MCP gating (settings.json) — controls how .mcp.json project servers
+        # are approved. allowed/deniedMcpServers are object lists: edit in Raw.
+        self.enable_all_mcp_chk = QCheckBox("enableAllProjectMcpServers")
+        self.enable_all_mcp_chk.stateChanged.connect(self._edited)
+        self.enabled_mcpjson_edit = QLineEdit()
+        self.disabled_mcpjson_edit = QLineEdit()
+        self.enabled_mcpjson_edit.textChanged.connect(self._edited)
+        self.disabled_mcpjson_edit.textChanged.connect(self._edited)
+        form.addRow("Project MCP:", self.enable_all_mcp_chk)
+        form.addRow("enabledMcpjsonServers:", self.enabled_mcpjson_edit)
+        form.addRow("disabledMcpjsonServers:", self.disabled_mcpjson_edit)
+
         info = QLabel("Editable text = this layer's own value; greyed placeholder = "
                       "value inherited from the effective merge (user → project → local). "
                       "Saving writes only the fields you set into the selected layer.")
@@ -6880,6 +6988,19 @@ class OpenclaudeSettingsTab(BaseTab):
         self.skip_dangerous_chk.blockSignals(False)
         self.skip_fullaccess_chk.blockSignals(False)
 
+        # MCP gating fields
+        self.enable_all_mcp_chk.blockSignals(True)
+        self.enabled_mcpjson_edit.blockSignals(True)
+        self.disabled_mcpjson_edit.blockSignals(True)
+        self.enable_all_mcp_chk.setChecked(bool(own.get("enableAllProjectMcpServers")))
+        for edit, key in ((self.enabled_mcpjson_edit, "enabledMcpjsonServers"),
+                          (self.disabled_mcpjson_edit, "disabledMcpjsonServers")):
+            val = own.get(key)
+            edit.setText(", ".join(val) if isinstance(val, list) else "")
+        self.enable_all_mcp_chk.blockSignals(False)
+        self.enabled_mcpjson_edit.blockSignals(False)
+        self.disabled_mcpjson_edit.blockSignals(False)
+
         def _set(edit, key):
             # Show the selected layer's own value as editable text; show the
             # effective (inherited) value as greyed placeholder so nothing looks
@@ -6915,6 +7036,16 @@ class OpenclaudeSettingsTab(BaseTab):
             self._put(data, "statusLine", value, None)
         else:
             data.pop("statusLine", None)
+        # MCP gating: write when pre-existing in this layer or explicitly set.
+        if "enableAllProjectMcpServers" in data or self.enable_all_mcp_chk.isChecked():
+            self._put(data, "enableAllProjectMcpServers",
+                      self.enable_all_mcp_chk.isChecked(), None)
+        for edit, key in ((self.enabled_mcpjson_edit, "enabledMcpjsonServers"),
+                          (self.disabled_mcpjson_edit, "disabledMcpjsonServers")):
+            items = [x.strip() for x in edit.text().split(",") if x.strip()]
+            if items or key in data:
+                self._put(data, key, items, [])
+
         # skip-permission toggles: write when pre-existing in this layer (so
         # unchecking writes an explicit false) or when explicitly opted in.
         if "skipDangerousModePermissionPrompt" in data or self.skip_dangerous_chk.isChecked():
@@ -6934,7 +7065,7 @@ class OpenclaudeRawTab(BaseTab):
         bar = QHBoxLayout()
         bar.addWidget(QLabel(" Layer: "))
         self.layer_combo = QComboBox()
-        for lk in ("user", "project", "local", "global"):
+        for lk in ("user", "project", "local", "global", "project-mcp"):
             self.layer_combo.addItem(lk, lk)
         self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
         bar.addWidget(self.layer_combo)
@@ -6966,7 +7097,12 @@ class OpenclaudeRawTab(BaseTab):
         layer = self._current_raw_layer()
         if layered is None:
             return
-        data = layered.global_data if layer == "global" else layered.layer(layer)
+        if layer == "global":
+            data = layered.global_data
+        elif layer == "project-mcp":
+            data = layered.project_mcp
+        else:
+            data = layered.layer(layer)
         self.editor.blockSignals(True)
         self.editor.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
         self.editor.blockSignals(False)
@@ -7293,6 +7429,450 @@ class OpenclaudeAgentModelsTab(BaseTab):
             d[k] = v
         else:
             d.pop(k, None)
+
+
+class OpenclaudeMcpTab(BaseTab):
+    """MCP servers across user/project/local scopes (+ policy read-only).
+
+    Verified openclaude v0.28.0 storage:
+      user    -> global ~/.openclaude.json -> mcpServers
+      project -> <cwd>/.mcp.json           -> mcpServers
+      local   -> global projects[file dict]     -> mcpServers
+      policy  -> <managed>/managed-mcp.json (read-only display)
+    Unknown sub-keys on each server (env, args, headers, ...) are preserved.
+    """
+
+    SCOPES = ("user", "project", "local")
+    SOURCE_TYPES = ("github", "git", "url", "file", "directory", "npm")
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._scopes_cache = {"user": {}, "project": {}, "local": {}}
+        self._dirty_scopes = set()
+        self._project_mcp_orig = {}
+        self._shown_scope = "user"
+
+        layout = QVBoxLayout(self)
+        sbar = QHBoxLayout()
+        sbar.addWidget(QLabel("Scope:"))
+        self.scope_combo = QComboBox()
+        for sc in self.SCOPES:
+            self.scope_combo.addItem(sc, sc)
+        self.scope_combo.currentIndexChanged.connect(self._on_scope_change)
+        sbar.addWidget(self.scope_combo)
+        sbar.addStretch()
+        layout.addLayout(sbar)
+
+        layout.addWidget(QLabel("Servers (unknown sub-keys like args/env/headers "
+                                "are preserved; edit complex servers in Raw):"))
+        self.mcp_table = QTableWidget(0, 5)
+        self.mcp_table.setHorizontalHeaderLabels(
+            ["name", "transport", "command / url", "env (K=V, ...)", "headers (K=V, ...)"])
+        self.mcp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.mcp_table)
+        btns = QHBoxLayout()
+        add_b = QPushButton("Add server")
+        add_b.clicked.connect(lambda: self._add_row())
+        del_b = QPushButton("Remove selected")
+        del_b.clicked.connect(self._remove_row)
+        btns.addWidget(add_b)
+        btns.addWidget(del_b)
+        btns.addStretch()
+        layout.addLayout(btns)
+
+        self.managed_label = QLabel("")
+        self.managed_label.setWordWrap(True)
+        self.managed_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.managed_label)
+
+    # --- table helpers ---
+    def _add_row(self, name="", server=None):
+        server = server if isinstance(server, dict) else {}
+        r = self.mcp_table.rowCount()
+        self.mcp_table.insertRow(r)
+        name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.UserRole, dict(server))
+        self.mcp_table.setItem(r, 0, name_item)
+        typ = str(server.get("type") or ("http" if server.get("url") else "stdio"))
+        self.mcp_table.setItem(r, 1, QTableWidgetItem(typ))
+        target = server.get("command") if isinstance(server.get("command"), str) else \
+            "" if not server.get("url") else str(server.get("url"))
+        self.mcp_table.setItem(r, 2, QTableWidgetItem(str(target or "")))
+        env = server.get("env") if isinstance(server.get("env"), dict) else {}
+        self.mcp_table.setItem(r, 3, QTableWidgetItem(
+            ", ".join(f"{k}={v}" for k, v in env.items())))
+        headers = server.get("headers") if isinstance(server.get("headers"), dict) else {}
+        self.mcp_table.setItem(r, 4, QTableWidgetItem(
+            ", ".join(f"{k}={v}" for k, v in headers.items())))
+        self._edited()
+
+    def _remove_row(self):
+        r = self.mcp_table.currentRow()
+        if r >= 0:
+            self.mcp_table.removeRow(r)
+            self._edited()
+
+    def _cell(self, r, c):
+        item = self.mcp_table.item(r, c)
+        return item.text().strip() if item else ""
+
+    @staticmethod
+    def _pairs(text):
+        out = {}
+        for part in text.split(","):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                if k.strip():
+                    out[k.strip()] = v.strip()
+        return out
+
+    # --- scope switching keeps unsaved edits per scope ---
+    def _on_scope_change(self, *_):
+        prev = getattr(self, "_shown_scope", None)
+        new_scope = self.scope_combo.currentData() or "user"
+        if prev and prev != new_scope:
+            self._scopes_cache[prev] = self._collect_scope_table()
+        self._shown_scope = new_scope
+        self._load_scope_table(new_scope)
+
+    def _load_scope_table(self, scope):
+        self.mcp_table.setRowCount(0)
+        for name, srv in self._scopes_cache.get(scope, {}).items():
+            if isinstance(srv, dict):
+                self._add_row(name, srv)
+
+    def _collect_scope_table(self) -> dict:
+        """Rebuild the visible rows into a servers dict, preserving unknown keys."""
+        out = {}
+        for r in range(self.mcp_table.rowCount()):
+            nitem = self.mcp_table.item(r, 0)
+            name = nitem.text().strip() if nitem else ""
+            if not name:
+                continue
+            orig = nitem.data(Qt.UserRole) or {}
+            srv = dict(orig) if isinstance(orig, dict) else {}
+            typ = self._cell(r, 1)
+            target = self._cell(r, 2)
+            env_text = self._cell(r, 3)
+            hdr_text = self._cell(r, 4)
+            if typ:
+                srv["type"] = typ
+            else:
+                srv.pop("type", None)
+            if typ == "http":
+                srv["url"] = target
+                srv.pop("command", None)
+            elif target:
+                srv["command"] = target
+                srv.pop("url", None)
+            if env_text:
+                srv["env"] = self._pairs(env_text)
+            else:
+                srv.pop("env", None)
+            if hdr_text:
+                srv["headers"] = self._pairs(hdr_text)
+            else:
+                srv.pop("headers", None)
+            out[name] = srv
+        return out
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        scope = getattr(self, "_shown_scope", None)
+        if scope:
+            self._dirty_scopes.add(scope)
+            self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        self._loading = True
+        try:
+            if layered:
+                guser = layered.global_data.get("mcpServers")
+                self._scopes_cache["user"] = guser if isinstance(guser, dict) else {}
+                pmc = layered.project_mcp
+                self._project_mcp_orig = dict(pmc) if isinstance(pmc, dict) else {}
+                psrv = self._project_mcp_orig.get("mcpServers")
+                self._scopes_cache["project"] = psrv if isinstance(psrv, dict) else {}
+                self._scopes_cache["local"] = layered.local_mcp()
+            idx = self.scope_combo.findData(getattr(self.app, "oc_mcp_scope", None) or "user")
+            self.scope_combo.blockSignals(True)
+            self.scope_combo.setCurrentIndex(max(0, idx))
+            self.scope_combo.blockSignals(False)
+            self._shown_scope = self.scope_combo.currentData() or "user"
+            self._load_scope_table(self._shown_scope)
+            managed = layered.managed_mcp_servers() if layered else {}
+            if managed:
+                names = ", ".join(sorted(managed.keys()))
+                self.managed_label.setText(
+                    f"Policy servers from {layered.managed_mcp_file} (read-only): {names}")
+            else:
+                self.managed_label.setText("No managed-mcp.json policy layer found.")
+        finally:
+            self._loading = False
+            self._dirty_scopes = set()
+
+    def commit_current(self):
+        """Flush the visible table into the cache of the shown scope."""
+        self._scopes_cache[self._shown_scope] = self._collect_scope_table()
+
+    def global_dirty(self) -> bool:
+        return "user" in self._dirty_scopes or "local" in self._dirty_scopes
+
+    def project_dirty(self) -> bool:
+        return "project" in self._dirty_scopes
+
+    def collect_global(self, gdata):
+        """Apply dirty user/local scopes into the global data dict."""
+        if "user" in self._dirty_scopes:
+            servers = self._scopes_cache["user"]
+            if servers:
+                gdata["mcpServers"] = servers
+            else:
+                gdata.pop("mcpServers", None)
+        if "local" in self._dirty_scopes:
+            layered = getattr(self.app, "oc_layered", None)
+            if layered is None:
+                return
+            projects = gdata.get("projects")
+            projects = dict(projects) if isinstance(projects, dict) else {}
+            key = layered.project_key()
+            entry = projects.get(key)
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            servers = self._scopes_cache["local"]
+            if servers:
+                entry["mcpServers"] = servers
+            else:
+                entry.pop("mcpServers", None)
+            if entry:
+                projects[key] = entry
+            else:
+                projects.pop(key, None)
+            if projects or "projects" in gdata:
+                gdata["projects"] = projects
+
+    def project_mcp_data(self) -> dict:
+        base = dict(self._project_mcp_orig)
+        servers = self._scopes_cache["project"]
+        if servers or "mcpServers" in base:
+            base["mcpServers"] = servers
+        return base
+
+
+class OpenclaudePluginsTab(BaseTab):
+    """Plugin + marketplace settings keys (settings.json of the selected layer).
+
+    Shapes verified against openclaude v0.28.0 SettingsSchema:
+      enabledPlugins: {"plugin-id@marketplace-id": true|false|["version"]}
+      extraKnownMarketplaces: {name: {source: {source:"github"|... , ...},
+                                      installLocation?, autoUpdate?}}
+    blockedMarketplaces / pluginConfigs are object lists/dicts: Raw only.
+    """
+
+    MARKET_TYPES = ("github", "git", "url", "file", "directory", "npm")
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._loading = False
+        layout = QVBoxLayout(self)
+
+        info = QLabel("Plugins live in the selected settings layer. Complex values "
+                      "(version arrays, blockedMarketplaces, pluginConfigs) — edit in Raw.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        layout.addWidget(QLabel("enabledPlugins — plugin-id@marketplace-id → true/false:"))
+        self.plugins_table = QTableWidget(0, 2)
+        self.plugins_table.setHorizontalHeaderLabels(["plugin@marketplace", "value (true/false/[..])"])
+        self.plugins_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.plugins_table)
+        pbtns = QHBoxLayout()
+        add_p = QPushButton("Add plugin")
+        add_p.clicked.connect(lambda: self._add_plugin_row())
+        del_p = QPushButton("Remove selected")
+        del_p.clicked.connect(self._remove_plugin_row)
+        pbtns.addWidget(add_p)
+        pbtns.addWidget(del_p)
+        pbtns.addStretch()
+        layout.addLayout(pbtns)
+
+        layout.addWidget(QLabel("extraKnownMarketplaces — additional marketplace sources:"))
+        self.market_table = QTableWidget(0, 5)
+        self.market_table.setHorizontalHeaderLabels(
+            ["name", "source type", "repo / url / path / package", "ref", "autoUpdate"])
+        self.market_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.market_table)
+        mbtns = QHBoxLayout()
+        add_m = QPushButton("Add marketplace")
+        add_m.clicked.connect(lambda: self._add_market_row())
+        del_m = QPushButton("Remove selected")
+        del_m.clicked.connect(self._remove_market_row)
+        mbtns.addWidget(add_m)
+        mbtns.addWidget(del_m)
+        mbtns.addStretch()
+        layout.addLayout(mbtns)
+
+        self.cache_label = QLabel("")
+        self.cache_label.setWordWrap(True)
+        self.cache_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.cache_label)
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    # --- plugins rows ---
+    def _add_plugin_row(self, pid=""):
+        r = self.plugins_table.rowCount()
+        self.plugins_table.insertRow(r)
+        item = QTableWidgetItem(pid)
+        item.setData(Qt.UserRole, None)
+        self.plugins_table.setItem(r, 0, item)
+        self.plugins_table.setItem(r, 1, QTableWidgetItem("true"))
+        self._edited()
+
+    def _remove_plugin_row(self):
+        r = self.plugins_table.currentRow()
+        if r >= 0:
+            self.plugins_table.removeRow(r)
+            self._edited()
+
+    # --- marketplace rows ---
+    def _add_market_row(self, name="", entry=None):
+        entry = entry if isinstance(entry, dict) else {}
+        src = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+        stype = src.get("source", "github")
+        value = ""
+        for fname in ("repo", "url", "path", "package"):
+            if fname in src:
+                value = str(src[fname])
+                break
+        r = self.market_table.rowCount()
+        self.market_table.insertRow(r)
+        name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.UserRole, dict(entry))  # preserve installLocation etc.
+        self.market_table.setItem(r, 0, name_item)
+        self.market_table.setItem(r, 1, QTableWidgetItem(stype if stype in self.MARKET_TYPES else "github"))
+        self.market_table.setItem(r, 2, QTableWidgetItem(value))
+        self.market_table.setItem(r, 3, QTableWidgetItem(str(src.get("ref", "") or "")))
+        chk = QCheckBox()
+        chk.setChecked(bool(entry.get("autoUpdate")))
+        chk.stateChanged.connect(self._edited)
+        self.market_table.setCellWidget(r, 4, chk)
+        self._edited()
+
+    def _remove_market_row(self):
+        r = self.market_table.currentRow()
+        if r >= 0:
+            self.market_table.removeRow(r)
+            self._edited()
+
+    def _pcell(self, r, c):
+        item = self.plugins_table.item(r, c)
+        return item.text().strip() if item else ""
+
+    def _mcell(self, r, c):
+        item = self.market_table.item(r, c)
+        return item.text().strip() if item else ""
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        self._loading = True
+        try:
+            self.plugins_table.setRowCount(0)
+            enabled = own.get("enabledPlugins")
+            enabled = enabled if isinstance(enabled, dict) else {}
+            for pid, val in enabled.items():
+                r = self.plugins_table.rowCount()
+                self._add_plugin_row(pid)
+                if isinstance(val, list):
+                    text = json.dumps(val)
+                    self.plugins_table.item(r, 1).setData(Qt.UserRole, json.dumps(val))
+                else:
+                    text = "true" if val else "false"
+                    self.plugins_table.item(r, 1).setData(Qt.UserRole, text)
+                self.plugins_table.item(r, 1).setText(text)
+
+            self.market_table.setRowCount(0)
+            markets = own.get("extraKnownMarketplaces")
+            markets = markets if isinstance(markets, dict) else {}
+            for name, entry in markets.items():
+                if isinstance(entry, dict):
+                    self._add_market_row(name, entry)
+
+            # Read-only listing of cached marketplaces under the config dir.
+            cache_txt = ""
+            if layered:
+                plug_dir = layered.config_dir / "plugins"
+                mk_dir = plug_dir / "marketplaces"
+                try:
+                    if mk_dir.is_dir():
+                        found = sorted(p.name for p in mk_dir.iterdir() if p.is_dir())
+                        if found:
+                            cache_txt = f"Cached marketplaces ({mk_dir}): " + ", ".join(found)
+                except OSError:
+                    pass
+            self.cache_label.setText(cache_txt or "")
+        finally:
+            self._loading = False
+
+    def collect(self, data):
+        # enabledPlugins
+        plugins = {}
+        for r in range(self.plugins_table.rowCount()):
+            pid = self._pcell(r, 0)
+            if not pid:
+                continue
+            item = self.plugins_table.item(r, 1)
+            text = (item.text().strip() if item else "").lower()
+            orig = item.data(Qt.UserRole) if item else None
+            if text == "true":
+                plugins[pid] = True
+            elif text == "false":
+                plugins[pid] = False
+            elif text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        plugins[pid] = [str(v) for v in parsed]
+                        continue
+                except json.JSONDecodeError:
+                    pass
+                plugins[pid] = orig  # keep original verbatim when unparsable
+        if "enabledPlugins" in data or plugins:
+            data["enabledPlugins"] = plugins
+
+        # extraKnownMarketplaces
+        markets = {}
+        for r in range(self.market_table.rowCount()):
+            name = self._mcell(r, 0)
+            if not name:
+                continue
+            nitem = self.market_table.item(r, 0)
+            entry = nitem.data(Qt.UserRole) or {}
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            stype = self._mcell(r, 1)
+            value = self._mcell(r, 2)
+            ref = self._mcell(r, 3)
+            chk = self.market_table.cellWidget(r, 4)
+            src = {"source": stype if stype in self.MARKET_TYPES else "github"}
+            field = {"github": "repo", "git": "url", "url": "url",
+                     "file": "path", "directory": "path", "npm": "package"}.get(src["source"], "repo")
+            if value:
+                src[field] = value
+            if ref and src["source"] in ("github", "git"):
+                src["ref"] = ref
+            entry["source"] = src
+            if chk is not None and not chk.isChecked():
+                entry.pop("autoUpdate", None)
+            elif chk is not None and chk.isChecked():
+                entry["autoUpdate"] = True
+            markets[name] = entry
+        if "extraKnownMarketplaces" in data or markets:
+            data["extraKnownMarketplaces"] = markets
 # openclaude adapter registration + session hooks.
 #
 # openclaude's config topology (layered settings.json + a global file) differs
@@ -7304,14 +7884,20 @@ def _openclaude_make_tabs(win):
     win.oc_layered = None             # set by initial_load hook
     settings_tab = OpenclaudeSettingsTab(win)
     models_tab = OpenclaudeAgentModelsTab(win)
+    mcp_tab = OpenclaudeMcpTab(win)
+    plugins_tab = OpenclaudePluginsTab(win)
     raw_tab = OpenclaudeRawTab(win)
-    win._agent_tabs = [settings_tab, models_tab, raw_tab]
+    win._agent_tabs = [settings_tab, models_tab, mcp_tab, plugins_tab, raw_tab]
     win._agent_settings_tab = settings_tab
     win._agent_models_tab = models_tab
+    win._agent_mcp_tab = mcp_tab
+    win._agent_plugins_tab = plugins_tab
     win._agent_raw_tab = raw_tab
     return [
         (settings_tab, "Settings", "settings"),
         (models_tab, "Agent Models", "settings"),
+        (mcp_tab, "MCP", "settings"),
+        (plugins_tab, "Plugins", "settings"),
         (raw_tab, "Raw (per layer)", None),
     ]
 
@@ -7342,6 +7928,8 @@ def _openclaude_save(win):
             return
         if layer == "global":
             ok, msg = layered.save_global(parsed)
+        elif layer == "project-mcp":
+            ok, msg = layered.save_project_mcp(parsed)
         else:
             ok, msg = layered.save_layer(layer, parsed)
         win.status_bar.showMessage(msg if ok else f"Save error: {msg}")
@@ -7350,27 +7938,39 @@ def _openclaude_save(win):
 
     # Form-based save:
     #  - Settings tab writes scalar keys into the selected settings layer
-    #  - Agent Models tab writes providerProfiles/agentRouting/fallback into the
-    #    global ~/.openclaude.json (where providers live per openclaude docs)
+    #  - Plugins tab writes enabledPlugins/marketplaces into the same layer
+    #  - Agent Models tab writes providerProfiles/routing into the global
+    #  - MCP tab writes per-scope: user/local -> global, project -> .mcp.json
     layer = win.oc_layer
     base = dict(layered.layer(layer))
     win._agent_settings_tab.collect(base)
+    win._agent_plugins_tab.collect(base)
     ok1, msg1 = layered.save_layer(layer, base)
 
-    # Only rewrite the global file when the Agent Models tab was actually
+    # Only rewrite the global file when a tab that owns global data was actually
     # touched, so an untouched global (with app-state keys) is left alone.
-    if getattr(win._agent_models_tab, "_dirty", False):
+    mcp_tab = win._agent_mcp_tab
+    mcp_tab.commit_current()
+    if getattr(win._agent_models_tab, "_dirty", False) or mcp_tab.global_dirty():
         gbase = dict(layered.global_data)
         win._agent_models_tab.collect(gbase)
+        mcp_tab.collect_global(gbase)
         ok2, msg2 = layered.save_global(gbase)
-        tail = " + global providers"
+        tail = " + global"
     else:
         ok2, msg2, tail = True, "", ""
 
-    if ok1 and ok2:
+    ok3 = True
+    msg3 = ""
+    if mcp_tab.project_dirty():
+        ok3, msg3 = layered.save_project_mcp(mcp_tab.project_mcp_data())
+        tail += " + .mcp.json"
+
+    if ok1 and ok2 and ok3:
         win.status_bar.showMessage(f"Saved layer '{layer}'{tail}")
     else:
-        win.status_bar.showMessage(f"Save error: {msg1 if not ok1 else msg2}")
+        first_err = next((m for m in (msg1, msg2, msg3) if m), "")
+        win.status_bar.showMessage(f"Save error: {first_err}")
     win.refresh_tabs()
 
 
@@ -7378,12 +7978,14 @@ OPENCLAUDE_ADAPTER = register_adapter(AdapterSpec(
     name="openclaude",
     app_title=APP_NAME_OPENCLAUDE,
     version=APP_VERSION,
-    kinds=["user", "project", "local", "global"],
+    kinds=["user", "project", "local", "global", "project-mcp", "managed"],
     known_keys={
         "user": OPENCLAUDE_SETTINGS_KEYS,
         "project": OPENCLAUDE_SETTINGS_KEYS,
         "local": OPENCLAUDE_SETTINGS_KEYS,
         "global": OPENCLAUDE_GLOBAL_KEYS,
+        "project-mcp": {"mcpServers"},
+        "managed": OPENCLAUDE_SETTINGS_KEYS,
     },
     raw_files=[("settings.json", "project")],
     targets_fn=_openclaude_targets,
