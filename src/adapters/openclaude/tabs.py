@@ -80,41 +80,25 @@ class OpenclaudeSettingsTab(BaseTab):
         layered = getattr(self.app, "oc_layered", None)
         own = layered.layer(self.app.oc_layer) if layered else {}
         eff = layered.effective() if layered else {}
-        idx = self.layer_combo.findData(self.app.oc_layer)
-        self.layer_combo.blockSignals(True)
-        self.layer_combo.setCurrentIndex(max(0, idx))
-        self.layer_combo.blockSignals(False)
+        self._set_combo(self.layer_combo, self.app.oc_layer, 0)
 
         # statusLine (bool or {type,command}) + skip-permission booleans
         sl = own.get("statusLine")
         self._orig_statusline = sl
-        self.statusline_chk.blockSignals(True)
-        self.statusline_cmd.blockSignals(True)
-        self.statusline_chk.setChecked(bool(sl))
-        self.statusline_cmd.setText(sl.get("command", "") if isinstance(sl, dict) else "")
-        self.statusline_chk.blockSignals(False)
-        self.statusline_cmd.blockSignals(False)
-        self.skip_dangerous_chk.blockSignals(True)
-        self.skip_fullaccess_chk.blockSignals(True)
-        self.skip_dangerous_chk.setChecked(bool(own.get("skipDangerousModePermissionPrompt")))
-        self.skip_fullaccess_chk.setChecked(bool(own.get("skipFullAccessModePermissionPrompt")))
+        self._set_checked(self.statusline_chk, bool(sl))
+        self._set_text(self.statusline_cmd,
+                       sl.get("command", "") if isinstance(sl, dict) else "")
+        self._set_checked(self.skip_dangerous_chk, own.get("skipDangerousModePermissionPrompt"))
+        self._set_checked(self.skip_fullaccess_chk, own.get("skipFullAccessModePermissionPrompt"))
         self._had_dangerous = "skipDangerousModePermissionPrompt" in own
         self._had_fullaccess = "skipFullAccessModePermissionPrompt" in own
-        self.skip_dangerous_chk.blockSignals(False)
-        self.skip_fullaccess_chk.blockSignals(False)
 
         # MCP gating fields
-        self.enable_all_mcp_chk.blockSignals(True)
-        self.enabled_mcpjson_edit.blockSignals(True)
-        self.disabled_mcpjson_edit.blockSignals(True)
-        self.enable_all_mcp_chk.setChecked(bool(own.get("enableAllProjectMcpServers")))
+        self._set_checked(self.enable_all_mcp_chk, own.get("enableAllProjectMcpServers"))
         for edit, key in ((self.enabled_mcpjson_edit, "enabledMcpjsonServers"),
                           (self.disabled_mcpjson_edit, "disabledMcpjsonServers")):
             val = own.get(key)
-            edit.setText(", ".join(val) if isinstance(val, list) else "")
-        self.enable_all_mcp_chk.blockSignals(False)
-        self.enabled_mcpjson_edit.blockSignals(False)
-        self.disabled_mcpjson_edit.blockSignals(False)
+            self._set_text(edit, ", ".join(val) if isinstance(val, list) else "")
 
         def _set(edit, key):
             # Show the selected layer's own value as editable text; show the
@@ -132,10 +116,7 @@ class OpenclaudeSettingsTab(BaseTab):
         # effortLevel: select this layer's OWN value only (do not bake in the
         # inherited effective value on save); show effective as a hint via the
         # "(default)" entry when unset.
-        self.effort_combo.blockSignals(True)
-        eidx = self.effort_combo.findData(own.get("effortLevel", ""))
-        self.effort_combo.setCurrentIndex(eidx if eidx >= 0 else 0)
-        self.effort_combo.blockSignals(False)
+        self._set_combo(self.effort_combo, own.get("effortLevel", ""), 0)
 
     def collect(self, data):
         self._put(data, "model", self.model_edit.text().strip(), "")
@@ -218,9 +199,7 @@ class OpenclaudeRawTab(BaseTab):
             data = layered.project_mcp
         else:
             data = layered.layer(layer)
-        self.editor.blockSignals(True)
-        self.editor.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
-        self.editor.blockSignals(False)
+        self._set_text(self.editor, json.dumps(data, indent=2, ensure_ascii=False))
         self._modified = False
 
     def parsed(self):
@@ -302,24 +281,6 @@ class OpenclaudeAgentModelsTab(BaseTab):
         rbtn.addStretch()
         layout.addLayout(rbtn)
 
-        # mcpServers — global ~/.openclaude.json (name + type + command/url;
-        # other sub-keys on each server are preserved on save).
-        layout.addWidget(QLabel("MCP servers — mcpServers in ~/.openclaude.json "
-                                "(unknown sub-keys like env/headers preserved):"))
-        self.mcp_table = QTableWidget(0, 3)
-        self.mcp_table.setHorizontalHeaderLabels(["name", "type", "command / url"])
-        self.mcp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        layout.addWidget(self.mcp_table)
-        mcbtn = QHBoxLayout()
-        add_mc = QPushButton("Add server")
-        add_mc.clicked.connect(lambda: self._add_mcp_row())
-        del_mc = QPushButton("Remove selected")
-        del_mc.clicked.connect(self._remove_mcp_row)
-        mcbtn.addWidget(add_mc)
-        mcbtn.addWidget(del_mc)
-        mcbtn.addStretch()
-        layout.addLayout(mcbtn)
-
     def _edited(self, *_):
         if getattr(self, "_loading", False):
             return
@@ -333,7 +294,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         self.models_table.insertRow(r)
         name_item = QTableWidgetItem(str(profile.get("name", "")))
         # Preserve the original profile dict (id, authHeader, authScheme, ...).
-        name_item.setData(Qt.UserRole, dict(profile))
+        self.preserve(name_item, profile)
         self.models_table.setItem(r, 0, name_item)
         self.models_table.setItem(r, 1, QTableWidgetItem(str(profile.get("provider", ""))))
         self.models_table.setItem(r, 2, QTableWidgetItem(str(profile.get("baseUrl", ""))))
@@ -343,9 +304,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         self._edited()
 
     def _remove_model_row(self):
-        r = self.models_table.currentRow()
-        if r >= 0:
-            self.models_table.removeRow(r)
+        if self.remove_current(self.models_table):
             self._edited()
 
     # --- agentRouting rows ---
@@ -357,28 +316,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         self._edited()
 
     def _remove_route_row(self):
-        r = self.routing_table.currentRow()
-        if r >= 0:
-            self.routing_table.removeRow(r)
-            self._edited()
-
-    # --- mcpServers rows ---
-    def _add_mcp_row(self, server=None, name=""):
-        server = server if isinstance(server, dict) else {}
-        r = self.mcp_table.rowCount()
-        self.mcp_table.insertRow(r)
-        name_item = QTableWidgetItem(name or str(server.get("name", "")))
-        # Preserve the original full server config (env, headers, args, ...).
-        name_item.setData(Qt.UserRole, dict(server))
-        self.mcp_table.setItem(r, 0, name_item)
-        self.mcp_table.setItem(r, 1, QTableWidgetItem(str(server.get("type", ""))))
-        self.mcp_table.setItem(r, 2, QTableWidgetItem(str(server.get("command") or server.get("url", ""))))
-        self._edited()
-
-    def _remove_mcp_row(self):
-        r = self.mcp_table.currentRow()
-        if r >= 0:
-            self.mcp_table.removeRow(r)
+        if self.remove_current(self.routing_table):
             self._edited()
 
     def refresh(self):
@@ -411,9 +349,8 @@ class OpenclaudeAgentModelsTab(BaseTab):
                 self._add_model_row(row)
 
             chain = data.get("providerFallbackChain")
-            self.fallback_edit.blockSignals(True)
-            self.fallback_edit.setText(", ".join(chain) if isinstance(chain, list) else "")
-            self.fallback_edit.blockSignals(False)
+            self._set_text(self.fallback_edit,
+                           ", ".join(chain) if isinstance(chain, list) else "")
 
             # Populate active-provider picker from the saved profiles (stable ids).
             self.active_combo.blockSignals(True)
@@ -434,14 +371,6 @@ class OpenclaudeAgentModelsTab(BaseTab):
             routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
             for agent, key in routing.items():
                 self._add_route_row(str(agent), str(key))
-
-            # mcpServers
-            self.mcp_table.setRowCount(0)
-            mcp = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else {}
-            self._had_mcp = "mcpServers" in data
-            for name, server in mcp.items():
-                if isinstance(server, dict):
-                    self._add_mcp_row(server, name)
         finally:
             self._loading = False
             self._dirty = False
@@ -456,8 +385,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
             if not name or name in seen_names:
                 continue
             seen_names.add(name)
-            orig = name_item.data(Qt.UserRole) if name_item else None
-            orig = dict(orig) if isinstance(orig, dict) else {}
+            orig = self.preserved(name_item) if name_item else {}
             provider = self._cell(r, 1)
             base_url = self._cell(r, 2)
             model = self._cell(r, 3)
@@ -495,32 +423,6 @@ class OpenclaudeAgentModelsTab(BaseTab):
         if "activeProviderProfileId" in data or active:
             self._put(data, "activeProviderProfileId", active, "")
 
-        # mcpServers: rebuild each server from its preserved original full dict,
-        # overlaying the edited type + command/url so unknown sub-keys survive.
-        mcp = {}
-        for r in range(self.mcp_table.rowCount()):
-            nitem = self.mcp_table.item(r, 0)
-            name = nitem.text().strip() if nitem else ""
-            if not name:
-                continue
-            orig = nitem.data(Qt.UserRole) or {}
-            orig = dict(orig) if isinstance(orig, dict) else {}
-            typ = self._mcp_cell(r, 1)
-            target = self._mcp_cell(r, 2)
-            srv = dict(orig)
-            if typ:
-                srv["type"] = typ
-            if typ == "remote":
-                srv["url"] = target
-                srv.pop("command", None)
-            else:
-                if target:
-                    srv["command"] = target
-                srv.pop("url", None)
-            mcp[name] = srv
-        if "mcpServers" in data or mcp:
-            data["mcpServers"] = mcp
-
         chain = [c.strip() for c in self.fallback_edit.text().split(",") if c.strip()]
         self._put(data, "providerFallbackChain", chain, [])
 
@@ -535,12 +437,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         self._put(data, "agentRouting", routing, {})
 
     def _cell(self, r, c):
-        item = self.models_table.item(r, c)
-        return item.text().strip() if item else ""
-
-    def _mcp_cell(self, r, c):
-        item = self.mcp_table.item(r, c)
-        return item.text().strip() if item else ""
+        return self.cell_text(self.models_table, r, c)
 
     @staticmethod
     def _set_or_pop(d, k, v):
@@ -561,7 +458,7 @@ class OpenclaudeMcpTab(BaseTab):
     Unknown sub-keys on each server (env, args, headers, ...) are preserved.
     """
 
-    SCOPES = ("user", "project", "local")
+    SCOPES = OPENCLAUDE_MCP_SCOPES          # from constants (single source)
     SOURCE_TYPES = ("github", "git", "url", "file", "directory", "npm")
 
     def __init__(self, app):
@@ -615,7 +512,7 @@ class OpenclaudeMcpTab(BaseTab):
         r = self.mcp_table.rowCount()
         self.mcp_table.insertRow(r)
         name_item = QTableWidgetItem(name)
-        name_item.setData(Qt.UserRole, dict(server))
+        self.preserve(name_item, server)
         self.mcp_table.setItem(r, 0, name_item)
         typ = str(server.get("type") or ("http" if server.get("url") else "stdio"))
         self.mcp_table.setItem(r, 1, QTableWidgetItem(typ))
@@ -625,35 +522,29 @@ class OpenclaudeMcpTab(BaseTab):
         args = server.get("args") if isinstance(server.get("args"), list) else []
         args_text = ", ".join(str(a) for a in args)
         self.mcp_table.setItem(r, 3, QTableWidgetItem(args_text))
-        # env/headers often carry API keys — always masked (reveal via 👁),
-        # like provider apiKeys.
-        env = server.get("env") if isinstance(server.get("env"), dict) else {}
-        env_text = ", ".join(f"{k}={v}" for k, v in env.items())
-        self.mcp_table.setCellWidget(
-            r, 4, MaskedLineEdit(env_text,
-                                 field_name="env", placeholder="KEY=value, ...",
-                                 secret=True))
-        headers = server.get("headers") if isinstance(server.get("headers"), dict) else {}
-        hdr_text = ", ".join(f"{k}={v}" for k, v in headers.items())
-        self.mcp_table.setCellWidget(
-            r, 5, MaskedLineEdit(hdr_text,
-                                 field_name="headers", placeholder="KEY=value, ...",
-                                 secret=True))
+        # env/headers often carry API keys - always masked (reveal via the
+        # eye toggle), like provider apiKeys.
+        texts = {}
+        for key in ("env", "headers"):
+            val = server.get(key) if isinstance(server.get(key), dict) else {}
+            texts[key] = ", ".join(f"{k}={v}" for k, v in val.items())
+        for col, key in ((4, "env"), (5, "headers")):
+            self.mcp_table.setCellWidget(
+                r, col, MaskedLineEdit(texts[key], field_name=key,
+                                       placeholder="KEY=value, ...", secret=True))
         # Remember the initially-rendered texts so collect() can tell "user
         # cleared it" apart from "never touched" (byte-fidelity for e.g. env:{}).
         name_item.setData(Qt.UserRole + 1,
-                          {"env": env_text, "headers": hdr_text, "args": args_text})
+                          {"env": texts["env"], "headers": texts["headers"],
+                           "args": args_text})
         self._edited()
 
     def _remove_row(self):
-        r = self.mcp_table.currentRow()
-        if r >= 0:
-            self.mcp_table.removeRow(r)
+        if self.remove_current(self.mcp_table):
             self._edited()
 
     def _cell(self, r, c):
-        item = self.mcp_table.item(r, c)
-        return item.text().strip() if item else ""
+        return self.cell_text(self.mcp_table, r, c)
 
     @staticmethod
     def _pairs(text):
@@ -695,8 +586,7 @@ class OpenclaudeMcpTab(BaseTab):
             name = nitem.text().strip() if nitem else ""
             if not name:
                 continue
-            orig = nitem.data(Qt.UserRole) or {}
-            srv = dict(orig) if isinstance(orig, dict) else {}
+            srv = dict(self.preserved(nitem))
             typ = self._cell(r, 1)
             target = self._cell(r, 2)
             args_text = self._cell(r, 3)
@@ -748,10 +638,8 @@ class OpenclaudeMcpTab(BaseTab):
                 psrv = self._project_mcp_orig.get("mcpServers")
                 self._scopes_cache["project"] = psrv if isinstance(psrv, dict) else {}
                 self._scopes_cache["local"] = layered.local_mcp()
-            idx = self.scope_combo.findData(getattr(self.app, "oc_mcp_scope", None) or "user")
-            self.scope_combo.blockSignals(True)
-            self.scope_combo.setCurrentIndex(max(0, idx))
-            self.scope_combo.blockSignals(False)
+            self._set_combo(self.scope_combo,
+                            getattr(self.app, "oc_mcp_scope", None) or "user", 0)
             self._shown_scope = self.scope_combo.currentData() or "user"
             self._load_scope_table(self._shown_scope)
             managed = layered.managed_mcp_servers() if layered else {}
@@ -822,7 +710,7 @@ class OpenclaudePluginsTab(BaseTab):
     blockedMarketplaces / pluginConfigs are object lists/dicts: Raw only.
     """
 
-    MARKET_TYPES = ("github", "git", "url", "file", "directory", "npm")
+    MARKET_TYPES = OpenclaudeMcpTab.SOURCE_TYPES   # same vocabulary, one definition
 
     def __init__(self, app):
         super().__init__(app)
@@ -886,9 +774,7 @@ class OpenclaudePluginsTab(BaseTab):
         self._edited()
 
     def _remove_plugin_row(self):
-        r = self.plugins_table.currentRow()
-        if r >= 0:
-            self.plugins_table.removeRow(r)
+        if self.remove_current(self.plugins_table):
             self._edited()
 
     # --- marketplace rows ---
@@ -904,7 +790,7 @@ class OpenclaudePluginsTab(BaseTab):
         r = self.market_table.rowCount()
         self.market_table.insertRow(r)
         name_item = QTableWidgetItem(name)
-        name_item.setData(Qt.UserRole, dict(entry))  # preserve installLocation etc.
+        self.preserve(name_item, entry)  # keep installLocation etc.
         self.market_table.setItem(r, 0, name_item)
         self.market_table.setItem(r, 1, QTableWidgetItem(stype if stype in self.MARKET_TYPES else "github"))
         self.market_table.setItem(r, 2, QTableWidgetItem(value))
@@ -916,18 +802,14 @@ class OpenclaudePluginsTab(BaseTab):
         self._edited()
 
     def _remove_market_row(self):
-        r = self.market_table.currentRow()
-        if r >= 0:
-            self.market_table.removeRow(r)
+        if self.remove_current(self.market_table):
             self._edited()
 
     def _pcell(self, r, c):
-        item = self.plugins_table.item(r, c)
-        return item.text().strip() if item else ""
+        return self.cell_text(self.plugins_table, r, c)
 
     def _mcell(self, r, c):
-        item = self.market_table.item(r, c)
-        return item.text().strip() if item else ""
+        return self.cell_text(self.market_table, r, c)
 
     def refresh(self):
         layered = getattr(self.app, "oc_layered", None)
@@ -1004,8 +886,7 @@ class OpenclaudePluginsTab(BaseTab):
             if not name:
                 continue
             nitem = self.market_table.item(r, 0)
-            entry = nitem.data(Qt.UserRole) or {}
-            entry = dict(entry) if isinstance(entry, dict) else {}
+            entry = self.preserved(nitem)
             stype = self._mcell(r, 1)
             value = self._mcell(r, 2)
             ref = self._mcell(r, 3)

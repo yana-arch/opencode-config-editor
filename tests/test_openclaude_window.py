@@ -266,22 +266,6 @@ def test_settings_skip_permission_roundtrip(oc_win, tmp_path):
     assert proj["skipDangerousModePermissionPrompt"] is False
 
 
-def test_mcp_servers_roundtrip_preserves_keys(oc_win, tmp_path):
-    tab = oc_win._agent_models_tab
-    tab._add_mcp_row(
-        {"name": "fs", "type": "command",
-         "command": "npx -y @modelcontextprotocol/server-filesystem /tmp",
-         "env": {"X": "1"}},
-        name="fs",
-    )
-    oc_win._save()
-    saved = json.loads((tmp_path / "cfghome.json").read_text())
-    srv = saved["mcpServers"]["fs"]
-    assert srv["command"] == "npx -y @modelcontextprotocol/server-filesystem /tmp"
-    assert srv["type"] == "command"
-    assert srv["env"] == {"X": "1"}     # unknown sub-key preserved
-
-
 def test_mcp_tab_user_scope_roundtrip(oc_win, tmp_path):
     """user-scope MCP servers go to the global ~/.openclaude.json."""
     tab = oc_win._agent_mcp_tab

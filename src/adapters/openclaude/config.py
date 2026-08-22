@@ -127,11 +127,7 @@ class LayeredConfigFile:
             return False, "Root must be a JSON object."
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            content = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(content)
-            os.replace(tmp, path)
+            atomic_write_json(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
             if on_ok:
                 on_ok()
             return True, f"Saved to {path}"

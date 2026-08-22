@@ -72,6 +72,25 @@ def merge_layers(layers) -> dict:
     return result
 
 
+def atomic_write_json(path, content: str) -> None:
+    """Write text to `path` atomically via mkstemp + os.replace.
+
+    Raises OSError on failure; the temp file is always cleaned up.
+    """
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def config_home(default_dir, env_vars=()) -> Path:
     """Resolve a config directory, honoring env overrides (first set wins).
 
@@ -169,14 +188,7 @@ class ConfigFile:
             self.create_backup()
 
             # Atomic write
-            fd, tmp = tempfile.mkstemp(
-                dir=str(self.path.parent),
-                prefix=f"{self.path.name}.",
-                suffix=".tmp"
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(content)
-            os.replace(tmp, self.path)
+            atomic_write_json(self.path, content)
 
             self.data = data
             return True, f"Saved to {self.path}"

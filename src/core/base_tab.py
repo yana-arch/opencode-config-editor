@@ -47,3 +47,38 @@ class BaseTab(QWidget):
         idx = combo.findData(val)
         combo.setCurrentIndex(idx if idx >= 0 else fallback)
         combo.blockSignals(False)
+
+    def _set_text(self, edit, val):
+        """blockSignals-safe population for QLineEdit/QPlainTextEdit-like widgets."""
+        text = str(val if val is not None else "")
+        setter = getattr(edit, "setPlainText", None) or edit.setText
+        edit.blockSignals(True)
+        setter(text)
+        edit.blockSignals(False)
+
+    # --- shared table helpers (row fidelity pattern) ---
+    @staticmethod
+    def cell_text(table, r, c):
+        """Read a table cell as stripped text ('' when missing)."""
+        item = table.item(r, c)
+        return item.text().strip() if item else ""
+
+    @staticmethod
+    def remove_current(table):
+        """Remove the table's current row; return True when a row was removed."""
+        r = table.currentRow()
+        if r >= 0:
+            table.removeRow(r)
+            return True
+        return False
+
+    @staticmethod
+    def preserve(item, data):
+        """Stash a row's original dict on its name item (Qt.UserRole)."""
+        item.setData(Qt.UserRole, dict(data) if isinstance(data, dict) else {})
+
+    @staticmethod
+    def preserved(item):
+        """Read back the stashed original dict as a defensive copy."""
+        orig = item.data(Qt.UserRole)
+        return dict(orig) if isinstance(orig, dict) else {}
