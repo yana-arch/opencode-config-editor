@@ -586,3 +586,34 @@ def test_hooks_tab_no_hooks_section_stays_absent(oc_win, tmp_path):
     oc_win._save()
     proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
     assert "hooks" not in proj
+
+
+def test_hooks_tab_layer_switcher_reveals_user_hooks(oc_win, tmp_path):
+    """Hooks live in the USER layer; the tab must default to the project view
+    with an empty table plus a hint, and reveal rows after switching layers."""
+    _seed_user_layer(oc_win, tmp_path)          # seeds cfghome/settings.json (user)
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "project"                 # fresh-launch default
+    oc_win.refresh_tabs()
+    tab = oc_win._agent_hooks_tab
+    assert tab.hooks_table.rowCount() == 0      # nothing in project layer
+    assert "user (" in tab.empty_hint.text()    # hint points at the user layer
+    # switching the combo must load the user-layer hooks
+    idx = tab.layer_combo.findData("user")
+    tab.layer_combo.setCurrentIndex(idx)
+    assert oc_win.oc_layer == "user"
+    assert tab.hooks_table.rowCount() == 4
+    assert tab.empty_hint.text() == ""
+
+
+def test_plugins_tab_layer_hint(oc_win, tmp_path):
+    cfg = tmp_path / "cfghome"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps(
+        {"enabledPlugins": {"fmt@official": True}}), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "project"
+    oc_win.refresh_tabs()
+    tab = oc_win._agent_plugins_tab
+    assert tab.plugins_table.rowCount() == 0
+    assert "user (plugins)" in tab.empty_hint.text()

@@ -7647,6 +7647,16 @@ class OpenclaudePluginsTab(BaseTab):
         self._loading = False
         layout = QVBoxLayout(self)
 
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Edit layer:"))
+        self.layer_combo = QComboBox()
+        for lk in ("user", "project", "local"):
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        top.addWidget(self.layer_combo)
+        top.addStretch()
+        layout.addLayout(top)
+
         info = QLabel("Plugins live in the selected settings layer. Complex values "
                       "(version arrays, blockedMarketplaces, pluginConfigs) — edit in Raw.")
         info.setWordWrap(True)
@@ -7687,6 +7697,17 @@ class OpenclaudePluginsTab(BaseTab):
         self.cache_label.setWordWrap(True)
         self.cache_label.setStyleSheet("color: gray;")
         layout.addWidget(self.cache_label)
+
+        self.empty_hint = QLabel("")
+        self.empty_hint.setWordWrap(True)
+        self.empty_hint.setStyleSheet("color: gray;")
+        layout.addWidget(self.empty_hint)
+
+    def _on_layer_change(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.oc_layer = self.layer_combo.currentData()
+        self.app.refresh_tabs()
 
     def _edited(self, *_):
         if getattr(self, "_loading", False):
@@ -7746,6 +7767,7 @@ class OpenclaudePluginsTab(BaseTab):
         own = layered.layer(self.app.oc_layer) if layered else {}
         self._loading = True
         try:
+            self._set_combo(self.layer_combo, self.app.oc_layer, 0)
             self.plugins_table.setRowCount(0)
             enabled = own.get("enabledPlugins")
             enabled = enabled if isinstance(enabled, dict) else {}
@@ -7780,6 +7802,25 @@ class OpenclaudePluginsTab(BaseTab):
                 except OSError:
                     pass
             self.cache_label.setText(cache_txt or "")
+            # empty-state hint: point at layers that DO hold plugin settings
+            if self.plugins_table.rowCount() or self.market_table.rowCount():
+                self.empty_hint.setText("")
+            else:
+                msg = f"No plugin settings in the '{getattr(self.app, 'oc_layer', '?')}' layer."
+                found = []
+                if layered:
+                    for lk in ("user", "project", "local"):
+                        if lk == self.app.oc_layer:
+                            continue
+                        data = layered.layer(lk)
+                        if isinstance(data.get("enabledPlugins"), dict) and data["enabledPlugins"]:
+                            found.append(f"{lk} (plugins)")
+                        if isinstance(data.get("extraKnownMarketplaces"), dict) and data["extraKnownMarketplaces"]:
+                            found.append(f"{lk} (marketplaces)")
+                if found:
+                    msg += " Found in: " + ", ".join(found) + \
+                           " — switch 'Edit layer' above."
+                self.empty_hint.setText(msg)
         finally:
             self._loading = False
 
@@ -7867,6 +7908,16 @@ class OpenclaudeHooksTab(BaseTab):
         super().__init__(app)
         self._loading = False
         layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Edit layer:"))
+        self.layer_combo = QComboBox()
+        for lk in ("user", "project", "local"):
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        top.addWidget(self.layer_combo)
+        top.addStretch()
+        layout.addLayout(top)
+
         info = QLabel("hooks — one row per hook entry. Events: "
                       + ", ".join(self.KNOWN_EVENTS)
                       + " (free text allowed). Unknown group/entry keys are "
@@ -7888,7 +7939,47 @@ class OpenclaudeHooksTab(BaseTab):
         btns.addWidget(del_b)
         btns.addStretch()
         layout.addLayout(btns)
+
+        self.empty_hint = QLabel("")
+        self.empty_hint.setWordWrap(True)
+        self.empty_hint.setStyleSheet("color: gray;")
+        layout.addWidget(self.empty_hint)
         self.hooks_table.itemChanged.connect(self._edited)
+
+    def _on_layer_change(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.oc_layer = self.layer_combo.currentData()
+        self.app.refresh_tabs()
+
+    @staticmethod
+    def _count_hook_entries(hooks):
+        """Count hook entries in a parsed hooks dict (0 for odd shapes)."""
+        n = 0
+        for groups in hooks.values() if isinstance(hooks, dict) else []:
+            if isinstance(groups, list):
+                for grp in groups:
+                    if isinstance(grp, dict) and isinstance(grp.get("hooks"), list):
+                        n += sum(1 for e in grp["hooks"] if isinstance(e, dict))
+        return n
+
+    def _update_empty_hint(self, layered, own):
+        if self.hooks_table.rowCount():
+            self.empty_hint.setText("")
+            return
+        msg = f"No hooks in the '{getattr(self.app, 'oc_layer', '?')}' layer."
+        found = []
+        if layered:
+            for lk in ("user", "project", "local"):
+                if lk == self.app.oc_layer:
+                    continue
+                n = self._count_hook_entries(layered.layer(lk).get("hooks"))
+                if n:
+                    found.append(f"{lk} ({n} entries)")
+        if found:
+            msg += " Hooks found in: " + ", ".join(found) + \
+                   " — switch 'Edit layer' above."
+        self.empty_hint.setText(msg)
 
     def _edited(self, *_):
         if getattr(self, "_loading", False):
@@ -7967,6 +8058,7 @@ class OpenclaudeHooksTab(BaseTab):
         own = layered.layer(self.app.oc_layer) if layered else {}
         self._loading = True
         try:
+            self._set_combo(self.layer_combo, self.app.oc_layer, 0)
             self.hooks_table.setRowCount(0)
             hooks = own.get("hooks") if isinstance(own.get("hooks"), dict) else {}
             for ev, groups in hooks.items():
@@ -7990,6 +8082,7 @@ class OpenclaudeHooksTab(BaseTab):
                                       gi=gi, ei=ei)
         finally:
             self._loading = False
+            self._update_empty_hint(layered, own)
 
     def collect(self, data):
         rows = self._rows_snapshot()
