@@ -70,10 +70,10 @@ class OpenclaudeSettingsTab(BaseTab):
         form.addRow(info)
 
     def _on_layer_change(self, *_):
-        self.app.oc_layer = self.layer_combo.currentData()
-        self.app.refresh_tabs()
+        _layer_change_guarded(self, self.layer_combo)
 
     def _edited(self, *_):
+        self.app.oc_form_dirty = True
         self.app.status_bar.showMessage("Unsaved changes…")
 
     def refresh(self):
@@ -116,7 +116,12 @@ class OpenclaudeSettingsTab(BaseTab):
         # effortLevel: select this layer's OWN value only (do not bake in the
         # inherited effective value on save); show effective as a hint via the
         # "(default)" entry when unset.
-        self._set_combo(self.effort_combo, own.get("effortLevel", ""), 0)
+        eff_val = own.get("effortLevel", "")
+        if eff_val and self.effort_combo.findData(eff_val) < 0:
+            self.effort_combo.blockSignals(True)
+            self.effort_combo.addItem(f"(current) {eff_val}", eff_val)
+            self.effort_combo.blockSignals(False)
+        self._set_combo(self.effort_combo, eff_val, 0)
 
     def collect(self, data):
         self._put(data, "model", self.model_edit.text().strip(), "")
@@ -178,7 +183,19 @@ class OpenclaudeRawTab(BaseTab):
         layout.addWidget(self.editor)
 
     def _on_layer_change(self, *_):
-        self._raw_layer = self.layer_combo.currentData()
+        new_layer = self.layer_combo.currentData()
+        old_layer = self._current_raw_layer()
+        if new_layer == old_layer:
+            return
+        if self._modified:
+            act = _confirm_unsaved(self.app,
+                                   f"leave Raw layer '{old_layer}' with unsaved edits")
+            if act == "cancel":
+                self._set_combo(self.layer_combo, old_layer, 0)
+                return
+            if act == "save":
+                self.app._save()          # raw-priority path saves this buffer
+        self._raw_layer = new_layer
         self.refresh()
 
     def _on_text(self, *_):
@@ -285,6 +302,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         if getattr(self, "_loading", False):
             return
         self._dirty = True
+        self.app.oc_form_dirty = True
         self.app.status_bar.showMessage("Unsaved changes\u2026")
 
     # --- provider rows (providerProfiles) ---
@@ -300,6 +318,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         self.models_table.setItem(r, 2, QTableWidgetItem(str(profile.get("baseUrl", ""))))
         self.models_table.setItem(r, 3, QTableWidgetItem(str(profile.get("model", ""))))
         masked = MaskedLineEdit(str(profile.get("apiKey", "")), field_name="apiKey")
+        masked.textChanged.connect(self._edited)
         self.models_table.setCellWidget(r, 4, masked)
         self._edited()
 
@@ -394,8 +413,8 @@ class OpenclaudeAgentModelsTab(BaseTab):
 
             if orig.pop("_legacy_agentModels", False):
                 spec = dict(orig)  # preserve extra legacy keys
-                spec.pop("name", None)
-                self._set_or_pop(spec, "provider", provider)
+                for mirror in ("name", "provider", "baseUrl", "model", "apiKey"):
+                    spec.pop(mirror, None)   # UI mirrors, not schema keys
                 self._set_or_pop(spec, "base_url", base_url)
                 self._set_or_pop(spec, "model", model)
                 self._set_or_pop(spec, "api_key", api_key)
@@ -419,7 +438,10 @@ class OpenclaudeAgentModelsTab(BaseTab):
         if legacy_models or "agentModels" in data:
             self._put(data, "agentModels", legacy_models, {})
 
+        known_ids = {p.get("id") for p in profiles if isinstance(p, dict)}
         active = self.active_combo.currentData() or ""
+        if active and known_ids and active not in known_ids:
+            active = ""                     # profile was deleted; don't dangle
         if "activeProviderProfileId" in data or active:
             self._put(data, "activeProviderProfileId", active, "")
 
@@ -529,9 +551,10 @@ class OpenclaudeMcpTab(BaseTab):
             val = server.get(key) if isinstance(server.get(key), dict) else {}
             texts[key] = ", ".join(f"{k}={v}" for k, v in val.items())
         for col, key in ((4, "env"), (5, "headers")):
-            self.mcp_table.setCellWidget(
-                r, col, MaskedLineEdit(texts[key], field_name=key,
-                                       placeholder="KEY=value, ...", secret=True))
+            w = MaskedLineEdit(texts[key], field_name=key,
+                               placeholder="KEY=value, ...", secret=True)
+            w.textChanged.connect(self._edited)
+            self.mcp_table.setCellWidget(r, col, w)
         # Remember the initially-rendered texts so collect() can tell "user
         # cleared it" apart from "never touched" (byte-fidelity for e.g. env:{}).
         name_item.setData(Qt.UserRole + 1,
@@ -624,6 +647,7 @@ class OpenclaudeMcpTab(BaseTab):
         scope = getattr(self, "_shown_scope", None)
         if scope:
             self._dirty_scopes.add(scope)
+            self.app.oc_form_dirty = True
             self.app.status_bar.showMessage("Unsaved changes\u2026")
 
     def refresh(self):
@@ -774,14 +798,12 @@ class OpenclaudePluginsTab(BaseTab):
         layout.addWidget(self.empty_hint)
 
     def _on_layer_change(self, *_):
-        if getattr(self, "_loading", False):
-            return
-        self.app.oc_layer = self.layer_combo.currentData()
-        self.app.refresh_tabs()
+        _layer_change_guarded(self, self.layer_combo)
 
     def _edited(self, *_):
         if getattr(self, "_loading", False):
             return
+        self.app.oc_form_dirty = True
         self.app.status_bar.showMessage("Unsaved changes\u2026")
 
     # --- plugins rows ---
@@ -802,7 +824,7 @@ class OpenclaudePluginsTab(BaseTab):
     def _add_market_row(self, name="", entry=None):
         entry = entry if isinstance(entry, dict) else {}
         src = entry.get("source") if isinstance(entry.get("source"), dict) else {}
-        stype = src.get("source", "github")
+        stype = str(src.get("source", "github"))
         value = ""
         for fname in ("repo", "url", "path", "package"):
             if fname in src:
@@ -812,10 +834,14 @@ class OpenclaudePluginsTab(BaseTab):
         self.market_table.insertRow(r)
         name_item = QTableWidgetItem(name)
         self.preserve(name_item, entry)  # keep installLocation etc.
+        ref_text = str(src.get("ref", "") or "")
+        item_snapshot = {"name": name, "stype": stype, "value": value,
+                         "ref": ref_text, "auto": bool(entry.get("autoUpdate"))}
+        name_item.setData(Qt.UserRole + 1, item_snapshot)
         self.market_table.setItem(r, 0, name_item)
-        self.market_table.setItem(r, 1, QTableWidgetItem(stype if stype in self.MARKET_TYPES else "github"))
+        self.market_table.setItem(r, 1, QTableWidgetItem(stype))
         self.market_table.setItem(r, 2, QTableWidgetItem(value))
-        self.market_table.setItem(r, 3, QTableWidgetItem(str(src.get("ref", "") or "")))
+        self.market_table.setItem(r, 3, QTableWidgetItem(ref_text))
         chk = QCheckBox()
         chk.setChecked(bool(entry.get("autoUpdate")))
         chk.stateChanged.connect(self._edited)
@@ -932,7 +958,18 @@ class OpenclaudePluginsTab(BaseTab):
             value = self._mcell(r, 2)
             ref = self._mcell(r, 3)
             chk = self.market_table.cellWidget(r, 4)
-            src = {"source": stype if stype in self.MARKET_TYPES else "github"}
+            snap = nitem.data(Qt.UserRole + 1) or {}
+            auto_now = bool(chk.isChecked()) if chk else False
+            untouched = (
+                name == str(snap.get("name", ""))
+                and stype == str(snap.get("stype", ""))
+                and value == str(snap.get("value", ""))
+                and ref == str(snap.get("ref", ""))
+                and auto_now == bool(snap.get("auto", False)))
+            if untouched:
+                markets[name] = entry     # byte-fidelity for unedited sources
+                continue
+            src = {"source": stype or "github"}
             field = {"github": "repo", "git": "url", "url": "url",
                      "file": "path", "directory": "path", "npm": "package"}.get(src["source"], "repo")
             if value:
@@ -1017,10 +1054,7 @@ class OpenclaudeHooksTab(BaseTab):
         self.hooks_table.itemChanged.connect(self._edited)
 
     def _on_layer_change(self, *_):
-        if getattr(self, "_loading", False):
-            return
-        self.app.oc_layer = self.layer_combo.currentData()
-        self.app.refresh_tabs()
+        _layer_change_guarded(self, self.layer_combo)
 
     @staticmethod
     def _count_hook_entries(hooks):
@@ -1054,6 +1088,7 @@ class OpenclaudeHooksTab(BaseTab):
     def _edited(self, *_):
         if getattr(self, "_loading", False):
             return
+        self.app.oc_form_dirty = True
         self.app.status_bar.showMessage("Unsaved changes\u2026")
 
     def _add_row(self, event="", matcher="", typ="command", target="",
@@ -1178,12 +1213,20 @@ class OpenclaudeHooksTab(BaseTab):
             return groups
 
         for ev, groups in orig_hooks.items():
+            # Map original entries to their rows. Fresh rows (gi=-1) never map;
+            # membership is tracked by id() because dict equality would treat
+            # identical-looking rows as the same object.
             slot = {}
+            slotted = set()
             for row in rows:
-                if row["stored_event"] == ev and row["cur_event"] == ev:
-                    slot[(row["meta"].get("gi"), row["meta"].get("ei"))] = row
-            if not slot:
-                continue                     # event emptied or all rows moved
+                if (row["stored_event"] == ev and row["cur_event"] == ev
+                        and int(row["meta"].get("gi", -1)) >= 0):
+                    slot[(row["meta"]["gi"], row["meta"]["ei"])] = row
+                    slotted.add(id(row))
+            pending = [row for row in rows
+                       if row["cur_event"] == ev and id(row) not in slotted]
+            if not slot and not pending:
+                continue             # event emptied or all rows moved away
             new_groups = []
             for gi, grp in enumerate(groups):
                 entries = (grp.get("hooks")
@@ -1223,8 +1266,6 @@ class OpenclaudeHooksTab(BaseTab):
                     else:
                         kept.pop("matcher", None)
                 new_groups.append(kept)
-            pending = [row for row in rows
-                       if row["cur_event"] == ev and row not in slot.values()]
             new_groups.extend(place_new(pending))
             if new_groups:
                 out[ev] = new_groups

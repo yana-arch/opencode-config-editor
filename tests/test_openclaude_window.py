@@ -617,3 +617,138 @@ def test_plugins_tab_layer_hint(oc_win, tmp_path):
     tab = oc_win._agent_plugins_tab
     assert tab.plugins_table.rowCount() == 0
     assert "user (plugins)" in tab.empty_hint.text()
+
+
+def test_hooks_new_row_under_existing_event_survives(oc_win, tmp_path):
+    """Fresh rows (no gi/ei) must not collide or vanish (id-based slotting)."""
+    _seed_user_layer(oc_win, tmp_path)
+    tab = oc_win._agent_hooks_tab
+    tab._add_row("Stop", "*", "command", "a.sh", "5")
+    tab._add_row("Stop", "", "command", "b.sh", "")
+    after = _save_user_layer(oc_win, tmp_path)
+    stop = after["hooks"]["Stop"]
+    assert stop[0] == HOOKS_SAMPLE["Stop"][0]            # original group intact
+    assert {"matcher": "*", "hooks": [{"type": "command", "command": "a.sh",
+                                       "timeout": 5}]} in stop
+    assert {"hooks": [{"type": "command", "command": "b.sh"}]} in stop
+
+
+def test_hooks_replace_all_entries_with_new(oc_win, tmp_path):
+    """Deleting every original entry of an event then adding a fresh one must
+    keep the event (pending placement happens before the empty-slot bail)."""
+    _seed_user_layer(oc_win, tmp_path)
+    tab = oc_win._agent_hooks_tab
+    for r in range(tab.hooks_table.rowCount() - 1, -1, -1):
+        if tab._cell(r, 0) == "SessionStart":
+            tab.hooks_table.selectRow(r)
+            tab._remove_hook_row()
+    tab._add_row("SessionStart", "", "command", "/new-start.sh", "")
+    after = _save_user_layer(oc_win, tmp_path)
+    assert after["hooks"]["SessionStart"] == [
+        {"hooks": [{"type": "command", "command": "/new-start.sh"}]}]
+    assert after["hooks"]["Stop"] == HOOKS_SAMPLE["Stop"]
+
+
+def test_masked_env_cell_typed_input_kept_and_dirty(oc_win, tmp_path):
+    """Typing into a masked env cell (never revealed) must keep the typed text
+    and mark the scope dirty so the global file actually gets written."""
+    tab = oc_win._agent_mcp_tab
+    tab._add_row("srv", {"command": "x"})
+    w = tab.mcp_table.cellWidget(0, 4)
+    w.edit.setText("API_KEY=typed-not-revealed")
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    assert saved["mcpServers"]["srv"]["env"] == {"API_KEY": "typed-not-revealed"}
+
+
+def test_legacy_agent_models_no_camelcase_mirrors(oc_win, tmp_path):
+    models_tab = oc_win._agent_models_tab
+    # mimic how refresh() materializes a legacy agentModels row: snake keys in
+    # the stash, camelCase values in the visible cells
+    models_tab._add_model_row({"name": "leg", "_legacy_agentModels": True,
+                               "base_url": "https://l.example/v1",
+                               "api_key": "kkk", "model": "m1",
+                               "provider": "",
+                               "baseUrl": "https://l.example/v1",
+                               "apiKey": "kkk"})
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    spec = saved["agentModels"]["leg"]
+    assert spec == {"base_url": "https://l.example/v1", "api_key": "kkk",
+                    "model": "m1"}
+
+
+def test_effort_level_exotic_value_roundtrips(oc_win, tmp_path):
+    st = oc_win._agent_settings_tab
+    st.effort_combo.blockSignals(True)
+    st.effort_combo.addItem("(current) turbo", "turbo")
+    st.effort_combo.setCurrentIndex(st.effort_combo.count() - 1)
+    st.effort_combo.blockSignals(False)
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert proj["effortLevel"] == "turbo"
+
+
+def test_marketplace_unknown_source_type_verbatim(oc_win, tmp_path):
+    """A marketplace source type we don't model must not be coerced to github."""
+    cfg = tmp_path / "cfghome"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps(
+        {"extraKnownMarketplaces": {
+            "weird": {"source": {"source": "settings", "name": "weird"}}}}),
+        encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "user"
+    oc_win.refresh_tabs()
+    oc_win._save()
+    saved = json.loads((cfg / "settings.json").read_text())
+    assert saved["extraKnownMarketplaces"]["weird"] == \
+        {"source": {"source": "settings", "name": "weird"}}
+
+
+def test_corrupt_layer_json_blocks_form_save(oc_win, tmp_path, monkeypatch):
+    """A layer that fails to parse must never be overwritten by the form path."""
+    cfg = tmp_path / "proj" / ".openclaude"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text("{not json!!", encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "project"
+    oc_win.refresh_tabs()
+    oc_win._agent_settings_tab.model_edit.setText("should-not-persist")
+    oc_win._save()
+    assert (cfg / "settings.json").read_text() == "{not json!!"
+
+
+def test_layer_switch_prompts_before_discarding(oc_win, tmp_path, monkeypatch):
+    """Switching edit layers with unsaved form edits must ask first."""
+    answers = []
+    monkeypatch.setattr(app, "_confirm_unsaved",
+                        lambda win, action="": answers.append(action) or "cancel")
+    st = oc_win._agent_settings_tab
+    st.model_edit.setText("unsaved-model")           # marks oc_form_dirty
+    assert oc_win.oc_form_dirty is True
+    hooks_tab = oc_win._agent_hooks_tab
+    idx = hooks_tab.layer_combo.findData("user")
+    hooks_tab.layer_combo.setCurrentIndex(idx)       # triggers prompt
+    assert answers and "user" in answers[-1]
+    assert oc_win.oc_layer == "project"              # cancelled -> unchanged
+    assert st.model_edit.text() == "unsaved-model"   # edits preserved
+
+    # discard path: layer switches and flag clears via refresh
+    monkeypatch.setattr(app, "_confirm_unsaved",
+                        lambda win, action="": "discard")
+    hooks_tab.layer_combo.setCurrentIndex(idx)
+    assert oc_win.oc_layer == "user"
+
+    # save-first path persists the pending edit to the ORIGINAL layer
+    monkeypatch.setattr(app, "_confirm_unsaved",
+                        lambda win, action="": "save")
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "project"
+    oc_win.refresh_tabs()
+    oc_win._agent_settings_tab.model_edit.setText("saved-on-switch")
+    plugins_tab = oc_win._agent_plugins_tab
+    idx_p = plugins_tab.layer_combo.findData("user")
+    plugins_tab.layer_combo.setCurrentIndex(idx_p)
+    layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert layer["model"] == "saved-on-switch"

@@ -54,18 +54,23 @@ class LayeredConfigFile:
         self.managed_mcp = {}
         self.project_mcp = {}
         self.error = None
+        # path-str -> error message for files that exist but are unparsable;
+        # guards the form-save path against clobbering them with empty dicts.
+        self.parse_errors = {}
 
-    @staticmethod
-    def _read(path) -> dict:
+    def _read(self, path) -> dict:
         try:
             if Path(path).exists():
                 data = json.loads(Path(path).read_text(encoding="utf-8"))
                 return data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError):
-            return {}
+        except OSError as e:
+            self.parse_errors[str(path)] = str(e)
+        except json.JSONDecodeError as e:
+            self.parse_errors[str(path)] = f"invalid JSON: {e}"
         return {}
 
     def load(self) -> bool:
+        self.parse_errors = {}
         for name, path in self.layer_files.items():
             self.layers[name] = self._read(path)
         self.global_data = self._read(self.global_file)
@@ -128,6 +133,7 @@ class LayeredConfigFile:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+            self.parse_errors.pop(str(path), None)
             if on_ok:
                 on_ok()
             return True, f"Saved to {path}"

@@ -7,6 +7,7 @@ class MaskedLineEdit(QWidget):
     """Line edit with optional masking for sensitive fields"""
 
     SECRET_HINT = re.compile(r"(key|token|secret|password|auth)", re.I)
+    textChanged = Signal()          # emitted on any edit-text change
 
     def __init__(self, value="", parent=None, field_name="", placeholder="", secret=None):
         super().__init__(parent)
@@ -23,6 +24,7 @@ class MaskedLineEdit(QWidget):
         self.edit = QLineEdit()
         self.edit.setPlaceholderText(placeholder)
         self.edit.setText(self._display_value())
+        self.edit.textChanged.connect(self.textChanged.emit)
         layout.addWidget(self.edit)
 
         if self.is_secret:
@@ -35,6 +37,11 @@ class MaskedLineEdit(QWidget):
     def _revealed(self) -> bool:
         return self.toggle_btn is not None and self.toggle_btn.isChecked()
 
+    def _user_modified(self) -> bool:
+        """True when the edit text differs from the masked rendering of the
+        stored value (i.e. the user typed something)."""
+        return self.edit.text() != _mask(self._real_value)
+
     def _display_value(self) -> str:
         """Get display value (masked if secret)"""
         if not self.is_secret or self._revealed():
@@ -42,8 +49,12 @@ class MaskedLineEdit(QWidget):
         return _mask(self._real_value)
 
     def _toggle_visibility(self, checked: bool):
-        """Toggle visibility of secret value"""
-        self.edit.setText(self._display_value())
+        """Toggle visibility without clobbering anything the user typed."""
+        modified = self._user_modified()
+        if checked and not modified and self.edit.text() != self._real_value:
+            self.edit.setText(self._real_value)
+        elif not checked and not modified:
+            self.edit.setText(_mask(self._real_value))
 
     def set_value(self, value):
         """Set value"""
@@ -51,8 +62,9 @@ class MaskedLineEdit(QWidget):
         self.edit.setText(self._display_value())
 
     def value(self) -> str:
-        """Get current value"""
-        if self.is_secret and not self._revealed():
+        """Get current value: what the user typed, or the stored secret while
+        the (untouched) display is still masked."""
+        if self.is_secret and not self._revealed() and not self._user_modified():
             return self._real_value
         return self.edit.text()
 

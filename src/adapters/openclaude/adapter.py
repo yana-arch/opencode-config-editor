@@ -33,8 +33,51 @@ def _openclaude_make_tabs(win):
 
 def _openclaude_initial_load(win):
     win.oc_layer = getattr(win, "oc_layer", "project")
+    win.oc_form_dirty = False         # any openclaude form tab has unsaved edits
     win.oc_layered = LayeredConfigFile(win.cwd)
     win.oc_layered.load()
+    win.refresh_tabs()
+
+
+def _confirm_unsaved(win, action="switch layer"):
+    """Ask what to do about unsaved form edits. Returns 'save'|'discard'|'cancel'.
+
+    Module-level so tests can monkeypatch it (offscreen runs never exec dialogs).
+    """
+    if not HAS_QT:
+        return "cancel"
+    box = QMessageBox(win)
+    box.setWindowTitle("Unsaved changes")
+    box.setText(f"You have unsaved changes.\n{action.capitalize()} anyway?")
+    save_btn = box.addButton("Save & continue", QMessageBox.AcceptRole)
+    box.addButton("Discard", QMessageBox.DestructiveRole)
+    cancel_btn = box.addButton(QMessageBox.Cancel)
+    box.setDefaultButton(cancel_btn)
+    box.exec()
+    if box.clickedButton() is save_btn:
+        return "save"
+    if box.clickedButton() is cancel_btn:
+        return "cancel"
+    return "discard"
+
+
+def _layer_change_guarded(tab, combo):
+    """Shared layer-combo handler: prompts before discarding unsaved edits."""
+    win = tab.app
+    new_layer = combo.currentData()
+    cur = getattr(win, "oc_layer", None)
+    if new_layer == cur:
+        return
+    if getattr(win, "oc_form_dirty", False):
+        act = _confirm_unsaved(win, f"switch to the '{new_layer}' layer")
+        if act == "cancel":
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(0, combo.findData(cur)))
+            combo.blockSignals(False)
+            return
+        if act == "save":
+            win._save()
+    win.oc_layer = new_layer
     win.refresh_tabs()
 
 
@@ -62,6 +105,9 @@ def _openclaude_save(win):
         else:
             ok, msg = layered.save_layer(layer, parsed)
         win.status_bar.showMessage(msg if ok else f"Save error: {msg}")
+        if ok:
+            win.oc_form_dirty = False
+            raw._modified = False
         win.refresh_tabs()
         return
 
@@ -71,6 +117,14 @@ def _openclaude_save(win):
     #  - Agent Models tab writes providerProfiles/routing into the global
     #  - MCP tab writes per-scope: user/local -> global, project -> .mcp.json
     layer = win.oc_layer
+
+    # Never let the form path clobber a file whose JSON failed to parse —
+    # its in-memory {} would erase the user's real (broken) config on disk.
+    if str(layered.layer_files[layer]) in layered.parse_errors:
+        win.status_bar.showMessage(
+            "Save blocked: settings file has invalid JSON — fix it in the Raw tab")
+        return
+
     base = dict(layered.layer(layer))
     win._agent_settings_tab.collect(base)
     win._agent_plugins_tab.collect(base)
@@ -81,11 +135,16 @@ def _openclaude_save(win):
     # touched, so an untouched global (with app-state keys) is left alone.
     mcp_tab = win._agent_mcp_tab
     mcp_tab.commit_current()
+    global_broken = str(layered.global_file) in layered.parse_errors
+    mcpjson_broken = str(layered.project_mcp_file) in layered.parse_errors
     if getattr(win._agent_models_tab, "_dirty", False) or mcp_tab.global_dirty():
-        gbase = dict(layered.global_data)
-        win._agent_models_tab.collect(gbase)
-        mcp_tab.collect_global(gbase)
-        ok2, msg2 = layered.save_global(gbase)
+        if global_broken:
+            ok2, msg2 = False, "global file has invalid JSON — fix in Raw"
+        else:
+            gbase = dict(layered.global_data)
+            win._agent_models_tab.collect(gbase)
+            mcp_tab.collect_global(gbase)
+            ok2, msg2 = layered.save_global(gbase)
         tail = " + global"
     else:
         ok2, msg2, tail = True, "", ""
@@ -93,11 +152,15 @@ def _openclaude_save(win):
     ok3 = True
     msg3 = ""
     if mcp_tab.project_dirty():
-        ok3, msg3 = layered.save_project_mcp(mcp_tab.project_mcp_data())
+        if mcpjson_broken:
+            ok3, msg3 = False, ".mcp.json has invalid JSON — fix in Raw"
+        else:
+            ok3, msg3 = layered.save_project_mcp(mcp_tab.project_mcp_data())
         tail += " + .mcp.json"
 
     if ok1 and ok2 and ok3:
         win.status_bar.showMessage(f"Saved layer '{layer}'{tail}")
+        win.oc_form_dirty = False
     else:
         first_err = next((m for m in (msg1, msg2, msg3) if m), "")
         win.status_bar.showMessage(f"Save error: {first_err}")
