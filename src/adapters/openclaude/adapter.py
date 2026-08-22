@@ -11,18 +11,22 @@ def _openclaude_make_tabs(win):
     models_tab = OpenclaudeAgentModelsTab(win)
     mcp_tab = OpenclaudeMcpTab(win)
     plugins_tab = OpenclaudePluginsTab(win)
+    hooks_tab = OpenclaudeHooksTab(win)
     raw_tab = OpenclaudeRawTab(win)
-    win._agent_tabs = [settings_tab, models_tab, mcp_tab, plugins_tab, raw_tab]
+    win._agent_tabs = [settings_tab, models_tab, mcp_tab, plugins_tab,
+                       hooks_tab, raw_tab]
     win._agent_settings_tab = settings_tab
     win._agent_models_tab = models_tab
     win._agent_mcp_tab = mcp_tab
     win._agent_plugins_tab = plugins_tab
+    win._agent_hooks_tab = hooks_tab
     win._agent_raw_tab = raw_tab
     return [
         (settings_tab, "Settings", "settings"),
         (models_tab, "Agent Models", "settings"),
         (mcp_tab, "MCP", "settings"),
         (plugins_tab, "Plugins", "settings"),
+        (hooks_tab, "Hooks", "settings"),
         (raw_tab, "Raw (per layer)", None),
     ]
 
@@ -63,13 +67,14 @@ def _openclaude_save(win):
 
     # Form-based save:
     #  - Settings tab writes scalar keys into the selected settings layer
-    #  - Plugins tab writes enabledPlugins/marketplaces into the same layer
+    #  - Plugins/Hooks tabs write their settings keys into the same layer
     #  - Agent Models tab writes providerProfiles/routing into the global
     #  - MCP tab writes per-scope: user/local -> global, project -> .mcp.json
     layer = win.oc_layer
     base = dict(layered.layer(layer))
     win._agent_settings_tab.collect(base)
     win._agent_plugins_tab.collect(base)
+    win._agent_hooks_tab.collect(base)
     ok1, msg1 = layered.save_layer(layer, base)
 
     # Only rewrite the global file when a tab that owns global data was actually

@@ -26,7 +26,7 @@ def oc_win(qapp, tmp_path, monkeypatch):
 
 def test_openclaude_window_builds_with_adapter(oc_win):
     assert oc_win.adapter.name == "openclaude"
-    assert oc_win.tabs.count() == 5            # Settings + Agent Models + MCP + Plugins + Raw
+    assert oc_win.tabs.count() == 6            # Settings + Agent Models + MCP + Plugins + Hooks + Raw
     assert oc_win.oc_layered is not None       # initial_load hook ran
     assert oc_win.oc_layer == "project"
 
@@ -472,3 +472,117 @@ def test_mcp_viewing_scopes_does_not_create_files(oc_win, tmp_path):
         tab._shown_scope = scope
     oc_win._save()
     assert not (tmp_path / "proj" / ".mcp.json").exists()
+
+
+HOOKS_SAMPLE = {
+    "SessionStart": [
+        {"hooks": [{"type": "command",
+                    "command": "/opt/token.py"}]},
+        {"matcher": "*",
+         "hooks": [{"type": "command", "command": "/bin/orca-hook.sh",
+                    "timeout": 10, "asynchronous": True}]},
+    ],
+    "PreToolUse": [
+        {"matcher": "Bash",
+         "hooks": [{"type": "command", "command": "guard.sh", "timeout": 5}]},
+    ],
+    "Stop": [
+        {"hooks": [{"type": "command", "command": "/opt/token.py"}]},
+    ],
+}
+
+
+def _seed_user_layer(oc_win, tmp_path, extra=None):
+    cfg = tmp_path / "cfghome"
+    cfg.mkdir(parents=True, exist_ok=True)
+    data = {"model": "claude-opus-4.8", "hooks": json.loads(json.dumps(HOOKS_SAMPLE))}
+    if extra:
+        data.update(extra)
+    (cfg / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "user"
+    oc_win.refresh_tabs()
+    return json.loads((cfg / "settings.json").read_text())
+
+
+def _save_user_layer(oc_win, tmp_path):
+    oc_win._save()
+    return json.loads((tmp_path / "cfghome" / "settings.json").read_text())
+
+
+def test_hooks_tab_untouched_roundtrip_verbatim(oc_win, tmp_path):
+    """Loading a realistic hooks config and saving without edits must keep
+    hooks byte-identical (unknown entry keys like `asynchronous` survive)."""
+    before = _seed_user_layer(oc_win, tmp_path)
+    after = _save_user_layer(oc_win, tmp_path)
+    assert after["hooks"] == before["hooks"]
+    assert after["model"] == "claude-opus-4.8"
+
+
+def test_hooks_tab_rows_loaded(oc_win, tmp_path):
+    _seed_user_layer(oc_win, tmp_path)
+    tab = oc_win._agent_hooks_tab
+    rows = [(tab._cell(r, 0), tab._cell(r, 1), tab._cell(r, 2),
+             tab._cell(r, 4)) for r in range(tab.hooks_table.rowCount())]
+    assert rows == [
+        ("SessionStart", "", "command", ""),
+        ("SessionStart", "*", "command", "10"),
+        ("PreToolUse", "Bash", "command", "5"),
+        ("Stop", "", "command", ""),
+    ]
+
+
+def test_hooks_tab_edit_patches_only_touched(oc_win, tmp_path):
+    """Editing one entry's command must not disturb sibling entries/events."""
+    _seed_user_layer(oc_win, tmp_path)
+    tab = oc_win._agent_hooks_tab
+    row = next(r for r in range(tab.hooks_table.rowCount())
+               if tab._cell(r, 0) == "Stop")
+    tab.hooks_table.item(row, 3).setText("/new/hook.py")
+    after = _save_user_layer(oc_win, tmp_path)
+    assert after["hooks"]["Stop"] == [
+        {"hooks": [{"type": "command", "command": "/new/hook.py"}]}]
+    # untouched events byte-identical to the sample
+    assert after["hooks"]["SessionStart"] == HOOKS_SAMPLE["SessionStart"]
+    assert after["hooks"]["PreToolUse"] == HOOKS_SAMPLE["PreToolUse"]
+
+
+def test_hooks_tab_timeout_edit(oc_win, tmp_path):
+    _seed_user_layer(oc_win, tmp_path)
+    tab = oc_win._agent_hooks_tab
+    row = next(r for r in range(tab.hooks_table.rowCount())
+               if tab._cell(r, 0) == "PreToolUse")
+    tab.hooks_table.item(row, 4).setText("30")
+    after = _save_user_layer(oc_win, tmp_path)
+    grp = after["hooks"]["PreToolUse"][0]
+    assert grp["matcher"] == "Bash"
+    assert grp["hooks"][0]["timeout"] == 30
+    assert grp["hooks"][0]["command"] == "guard.sh"     # untouched field kept
+
+
+def test_hooks_tab_add_and_delete(oc_win, tmp_path):
+    _seed_user_layer(oc_win, tmp_path)
+    tab = oc_win._agent_hooks_tab
+    # add a hook under a NEW event
+    tab._add_row("Notification", "*", "command", "notify.sh", "15")
+    after = _save_user_layer(oc_win, tmp_path)
+    assert after["hooks"]["Notification"] == [
+        {"matcher": "*", "hooks": [{"type": "command", "command": "notify.sh",
+                                    "timeout": 15}]}]
+    # delete the PreToolUse entry -> event dropped entirely
+    row = next(r for r in range(tab.hooks_table.rowCount())
+               if tab._cell(r, 0) == "PreToolUse")
+    tab.hooks_table.selectRow(row)
+    tab._remove_hook_row()
+    after = _save_user_layer(oc_win, tmp_path)
+    assert "PreToolUse" not in after["hooks"]
+    assert "SessionStart" in after["hooks"]
+
+
+def test_hooks_tab_no_hooks_section_stays_absent(oc_win, tmp_path):
+    """A layer without hooks gains no empty hooks key from a casual visit."""
+    st = oc_win._agent_settings_tab
+    st.model_edit.setText("sonnet")     # unrelated edit on project layer
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert "hooks" not in proj

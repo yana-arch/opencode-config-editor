@@ -906,3 +906,247 @@ class OpenclaudePluginsTab(BaseTab):
             markets[name] = entry
         if "extraKnownMarketplaces" in data or markets:
             data["extraKnownMarketplaces"] = markets
+
+
+class OpenclaudeHooksTab(BaseTab):
+    """Structured editor for settings.json `hooks`.
+
+    Verified shape (binary schema + real configs):
+      hooks: {EventName: [ {matcher?: "*",
+                            hooks: [{type: "command", command, timeout?, ...},
+                                    ...]},
+                           ... ] }
+    One table row per hook ENTRY. Fidelity model:
+    - every row remembers its original (event, group-index, entry-index);
+    - untouched rows/events round-trip byte-for-byte (unknown group/entry
+      keys survive);
+    - editing patches only the touched fields; clearing removes them;
+    - deleting a row removes exactly that entry (its group too when emptied);
+    - new/moved rows append as fresh groups under their event, grouped by
+      matcher text.
+    """
+
+    KNOWN_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop",
+                    "StopFailure", "SubagentStart", "SubagentStop",
+                    "TeammateIdle", "PreToolUse", "PostToolUse",
+                    "PostToolUseFailure", "PermissionRequest", "Notification",
+                    "PreCompact")
+    TYPE_FIELDS = {"command": "command", "http": "url", "prompt": "prompt"}
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._loading = False
+        layout = QVBoxLayout(self)
+        info = QLabel("hooks — one row per hook entry. Events: "
+                      + ", ".join(self.KNOWN_EVENTS)
+                      + " (free text allowed). Unknown group/entry keys are "
+                        "preserved; edit exotic shapes in Raw.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self.hooks_table = QTableWidget(0, 5)
+        self.hooks_table.setHorizontalHeaderLabels(
+            ["event", "matcher", "type", "command / url / prompt", "timeout"])
+        self.hooks_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.hooks_table)
+        btns = QHBoxLayout()
+        add_b = QPushButton("Add hook")
+        add_b.clicked.connect(lambda: self._add_row("SessionStart"))
+        del_b = QPushButton("Remove selected")
+        del_b.clicked.connect(self._remove_hook_row)
+        btns.addWidget(add_b)
+        btns.addWidget(del_b)
+        btns.addStretch()
+        layout.addLayout(btns)
+        self.hooks_table.itemChanged.connect(self._edited)
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    def _add_row(self, event="", matcher="", typ="command", target="",
+                 timeout="", orig=None, gi=None, ei=None):
+        orig = orig if isinstance(orig, dict) else {"group": {}, "entry": {}}
+        r = self.hooks_table.rowCount()
+        self.hooks_table.insertRow(r)
+        item = QTableWidgetItem(event)
+        item.setData(Qt.UserRole, {"group": orig.get("group") or {},
+                                   "entry": orig.get("entry") or {}})
+        snapshot = {"event": event, "matcher": matcher, "type": typ,
+                    "target": target, "timeout": timeout,
+                    "gi": gi if gi is not None else -1,
+                    "ei": ei if ei is not None else -1}
+        item.setData(Qt.UserRole + 1, snapshot)
+        self.hooks_table.setItem(r, 0, item)
+        self.hooks_table.setItem(r, 1, QTableWidgetItem(matcher))
+        self.hooks_table.setItem(r, 2, QTableWidgetItem(typ))
+        self.hooks_table.setItem(r, 3, QTableWidgetItem(target))
+        self.hooks_table.setItem(r, 4, QTableWidgetItem(timeout))
+        self._edited()
+
+    def _remove_hook_row(self):
+        if self.remove_current(self.hooks_table):
+            self._edited()
+
+    def _cell(self, r, c):
+        return self.cell_text(self.hooks_table, r, c)
+
+    @staticmethod
+    def _entry_from_cells(typ, target, timeout):
+        entry = {"type": typ} if typ else {}
+        field = OpenclaudeHooksTab.TYPE_FIELDS.get(typ)
+        if target and field:
+            entry[field] = target
+        if timeout.strip().isdigit():
+            entry["timeout"] = int(timeout.strip())
+        return entry
+
+    def _rows_snapshot(self):
+        """Current cell values + stored metadata for every row, in table order."""
+        rows = []
+        for r in range(self.hooks_table.rowCount()):
+            item = self.hooks_table.item(r, 0)
+            if item is None:
+                continue
+            meta = item.data(Qt.UserRole + 1) or {}
+            rows.append({
+                "r": r,
+                "stored_event": str(meta.get("event", "")),
+                "cur_event": self._cell(r, 0),
+                "matcher": self._cell(r, 1),
+                "typ": self._cell(r, 2),
+                "target": self._cell(r, 3),
+                "timeout": self._cell(r, 4),
+                "meta": meta,
+                "orig": self.preserved(item),
+            })
+        return rows
+
+    @staticmethod
+    def _row_touched(row):
+        m = row["meta"]
+        return (row["cur_event"] != str(m.get("event", ""))
+                or row["matcher"] != str(m.get("matcher", ""))
+                or row["typ"] != str(m.get("type", ""))
+                or row["target"] != str(m.get("target", ""))
+                or row["timeout"] != str(m.get("timeout", "")))
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        self._loading = True
+        try:
+            self.hooks_table.setRowCount(0)
+            hooks = own.get("hooks") if isinstance(own.get("hooks"), dict) else {}
+            for ev, groups in hooks.items():
+                if not isinstance(groups, list):
+                    continue          # odd shapes stay verbatim via Raw/passthrough
+                for gi, grp in enumerate(groups):
+                    entries = grp.get("hooks") if isinstance(grp, dict) else None
+                    if not isinstance(entries, list):
+                        continue
+                    matcher = str(grp.get("matcher", "") or "")
+                    for ei, entry in enumerate(entries):
+                        if not isinstance(entry, dict):
+                            continue
+                        typ = str(entry.get("type", "command"))
+                        field = self.TYPE_FIELDS.get(typ, "command")
+                        target = str(entry.get(field, "") or "")
+                        timeout = (str(entry.get("timeout"))
+                                   if entry.get("timeout") is not None else "")
+                        self._add_row(str(ev), matcher, typ, target, timeout,
+                                      orig={"group": grp, "entry": entry},
+                                      gi=gi, ei=ei)
+        finally:
+            self._loading = False
+
+    def collect(self, data):
+        rows = self._rows_snapshot()
+        if "hooks" not in data and not rows:
+            return
+        orig_hooks = data.get("hooks") if isinstance(data.get("hooks"), dict) else {}
+        out = {}
+
+        def place_new(pending):
+            """Group brand-new/moved rows by matcher text into fresh groups."""
+            buckets = {}
+            for row in pending:
+                buckets.setdefault(row["matcher"], []).append(row)
+            groups = []
+            for mtext, rs in buckets.items():
+                grp = {}
+                if mtext:
+                    grp["matcher"] = mtext
+                grp["hooks"] = [
+                    self._entry_from_cells(x["typ"], x["target"], x["timeout"])
+                    for x in rs]
+                groups.append(grp)
+            return groups
+
+        for ev, groups in orig_hooks.items():
+            slot = {}
+            for row in rows:
+                if row["stored_event"] == ev and row["cur_event"] == ev:
+                    slot[(row["meta"].get("gi"), row["meta"].get("ei"))] = row
+            if not slot:
+                continue                     # event emptied or all rows moved
+            new_groups = []
+            for gi, grp in enumerate(groups):
+                entries = (grp.get("hooks")
+                           if isinstance(grp, dict) and isinstance(grp.get("hooks"), list)
+                           else None)
+                if entries is None:
+                    new_groups.append(grp)   # unknown shape: verbatim
+                    continue
+                kept = dict(grp)
+                live = []
+                matcher_new = None
+                for ei, entry in enumerate(entries):
+                    row = slot.get((gi, ei))
+                    if row is None:
+                        continue             # entry removed
+                    if not self._row_touched(row):
+                        live.append(entry)   # byte-verbatim
+                        continue
+                    e2 = dict(entry) if isinstance(entry, dict) else {}
+                    for f in self.TYPE_FIELDS.values():
+                        e2.pop(f, None)
+                    e2.update(self._entry_from_cells(row["typ"], row["target"],
+                                                     row["timeout"]))
+                    if not row["typ"]:
+                        e2.pop("type", None)
+                    if "timeout" not in e2:
+                        e2.pop("timeout", None)
+                    live.append(e2)
+                    if row["matcher"] != str(row["meta"].get("matcher", "")):
+                        matcher_new = row["matcher"]
+                if not live:
+                    continue                 # group emptied by removals
+                kept["hooks"] = live
+                if matcher_new is not None:
+                    if matcher_new:
+                        kept["matcher"] = matcher_new
+                    else:
+                        kept.pop("matcher", None)
+                new_groups.append(kept)
+            pending = [row for row in rows
+                       if row["cur_event"] == ev and row not in slot.values()]
+            new_groups.extend(place_new(pending))
+            if new_groups:
+                out[ev] = new_groups
+
+        # Rows added under events the file never had (or moved to new names);
+        # rows under existing events were already placed by the loop above.
+        pending = [row for row in rows
+                   if row["cur_event"] and row["cur_event"] not in orig_hooks]
+        pend_by_ev = {}
+        for row in pending:
+            pend_by_ev.setdefault(row["cur_event"], []).append(row)
+        for ev, rs in pend_by_ev.items():
+            merged = list(out.get(ev, []))
+            merged.extend(place_new(rs))
+            out[ev] = merged
+
+        if out or "hooks" in data:
+            data["hooks"] = out
