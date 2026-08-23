@@ -266,3 +266,86 @@ def test_every_key_the_editor_writes_is_known():
     assert written <= app.OPENCLAUDE_SETTINGS_KEYS
     assert {"providerProfiles", "activeProviderProfileId",
             "mcpServers"} <= app.OPENCLAUDE_GLOBAL_KEYS
+
+
+class _FakeSchemaError:
+    def __init__(self, message, path):
+        self.message = message
+        self.absolute_path = path
+
+
+class _FakeDraft7Validator:
+    def __init__(self, schema):
+        self.schema = schema
+
+    def iter_errors(self, data):
+        if not isinstance(data.get("model", ""), str):
+            yield _FakeSchemaError("5 is not of type 'string'", ["model"])
+
+
+class _FakeJsonschema:
+    Draft7Validator = _FakeDraft7Validator
+
+
+class _StubValidator:
+    """Stands in for core Validator; records what schema was asked for."""
+
+    def __init__(self, schema):
+        self._schema = schema
+        self.asked = None
+
+    def schema_from(self, url, cache_path, kind):
+        self.asked = (url, cache_path, kind)
+        return self._schema
+
+
+def test_findings_reports_schema_warnings(monkeypatch):
+    """The jsonschema branch is dead unless the dependency is installed, so
+    drive it with a stub to keep it honest."""
+    monkeypatch.setattr(app, "jsonschema", _FakeJsonschema, raising=False)
+    validator = _StubValidator({"type": "object"})
+    errors, warnings = app.openclaude_findings({"model": 5}, "user", validator)
+    assert errors == []
+    assert any("schema: 5 is not of type 'string'" in w and "path: model" in w
+               for w in warnings)
+    url, cache_path, kind = validator.asked
+    assert url == app.OPENCLAUDE_SCHEMA_URL
+    assert cache_path == app.OPENCLAUDE_SCHEMA_CACHE
+    assert kind == "openclaude-settings"
+
+
+def test_findings_survives_broken_schema_validator(monkeypatch):
+    class _Boom:
+        def __init__(self, schema):
+            raise RuntimeError("schema is malformed")
+
+    class _BoomModule:
+        Draft7Validator = _Boom
+
+    monkeypatch.setattr(app, "jsonschema", _BoomModule, raising=False)
+    errors, warnings = app.openclaude_findings(
+        {"model": "opus"}, "user", _StubValidator({"type": "object"}))
+    assert errors == []
+    assert any("schema error: schema is malformed" in w for w in warnings)
+
+
+def test_findings_skips_schema_when_shape_already_broken():
+    validator = _StubValidator({"type": "object"})
+    errors, _ = app.openclaude_findings({"hooks": []}, "user", validator)
+    assert errors
+    assert validator.asked is None       # no fetch when the file is malformed
+
+
+def test_schema_source_constants_are_openclaude_specific():
+    assert app.OPENCLAUDE_SCHEMA_URL.endswith("claude-code-settings.json")
+    assert app.OPENCLAUDE_SCHEMA_CACHE.name == "claude-code-settings-schema.json"
+    assert app.APP_NAME_OPENCLAUDE in str(app.OPENCLAUDE_SCHEMA_CACHE)
+
+
+def test_schema_from_is_offline_without_jsonschema():
+    """No jsonschema -> no network call, just None."""
+    if app.HAVE_JSONSCHEMA:
+        return
+    v = app.Validator()
+    assert v.schema_from(app.OPENCLAUDE_SCHEMA_URL,
+                         app.OPENCLAUDE_SCHEMA_CACHE, "openclaude-settings") is None
