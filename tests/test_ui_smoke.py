@@ -103,3 +103,15 @@ def test_fetch_dialog_marks_existing_models(qapp):
 def test_fetch_dialog_sync_hidden_without_providers(qapp):
     dlg = app.FetchProviderModelsDialog(None)
     assert dlg.sync_check.isHidden() is True
+
+
+def test_fetch_dialog_prefills_existing_provider_endpoint(qapp):
+    providers = {"myp": {"options": {"baseURL": "https://gw.example/v1",
+                                     "apiKey": "stored" + "-key"}}}
+    dlg = app.FetchProviderModelsDialog(None, provider_key="myp", providers=providers)
+    assert dlg.url_edit.text() == "https://gw.example/v1"
+    assert dlg.apikey_edit.text() == "stored" + "-key"
+    # a brand-new key stays untouched by defaults
+    dlg2 = app.FetchProviderModelsDialog(None, provider_key="fresh", providers=providers)
+    assert dlg2.url_edit.text().startswith("https://api.openai.com")
+    assert dlg2.apikey_edit.text() == ""

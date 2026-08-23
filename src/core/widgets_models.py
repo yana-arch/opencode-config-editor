@@ -181,6 +181,7 @@ class ModelsManagerDialog(QDialog):
         # Buttons
         button_layout = QHBoxLayout()
         for text, slot in [
+            ("Fetch from API", self._fetch_from_api),
             ("+ Add", self._add_model),
             ("Edit", self._edit_model),
             ("Remove", self._remove_model),
@@ -220,6 +221,59 @@ class ModelsManagerDialog(QDialog):
         layout.addWidget(button_box)
 
         self._update_table()
+
+    def _fetch_from_api(self):
+        """Fetch this provider's model list from its live API endpoint."""
+        self.app.snapshot_state()
+        # Write pending edits through so fetch preview/sync see what the user sees.
+        self.provider_cfg["models"] = dict(self.models)
+
+        scope = {self.provider_key: self.provider_cfg}
+        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog,
+                                        provider_key=self.provider_key,
+                                        providers=scope)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        selected = dlg.selected_models
+        if not selected:
+            QMessageBox.information(self, "Fetch", "No models selected.")
+            return
+
+        base_url = dlg.url_edit.text().strip()
+        prov, summary = apply_fetched_provider(
+            scope, self.provider_key, selected,
+            base_url=base_url,
+            api_key=dlg.apikey_edit.text().strip(),
+            save_api_key=dlg.save_apikey_check.isChecked(),
+            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+
+        removed = []
+        if dlg.sync_check.isChecked():
+            stale = stale_configured_models(
+                dict(self.models), set(dlg.fetched_models))
+            if stale:
+                shown = ", ".join(stale[:8])
+                if len(stale) > 8:
+                    shown += f", ... (+{len(stale) - 8} more)"
+                if _confirm(self, "Sync Models",
+                            f"Remove {len(stale)} configured model(s) the API no "
+                            f"longer lists?\n{shown}"):
+                    for mid in stale:
+                        prov["models"].pop(mid, None)
+                    removed = stale
+
+        self.models = dict(prov["models"])
+        self._update_table()
+        self.app.mark_dirty()
+
+        if summary["added"]:
+            self._match_models(set(summary["added"]))
+        note = f", removed {len(removed)} stale" if removed else ""
+        QMessageBox.information(
+            self, "Fetch Complete",
+            f"'{self.provider_key}': added {len(summary['added'])} new "
+            f"model(s), kept {len(summary['kept'])}{note}.")
 
     def _update_table(self):
         """Update table with current models"""

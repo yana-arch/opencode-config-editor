@@ -620,6 +620,22 @@ class FetchProviderModelsDialog(QDialog):
         layout.addWidget(self.buttons)
 
         self._on_format_change()
+        self._prefill_from_provider()
+
+    def _prefill_from_provider(self):
+        """Pre-fill URL/key from the target provider's saved options, so
+        re-fetching an existing provider starts from its real endpoint."""
+        if not isinstance(self.providers, dict):
+            return
+        prov = self.providers.get(self.provider_key)
+        opts = prov.get("options") if isinstance(prov, dict) else None
+        if not isinstance(opts, dict):
+            return
+        if opts.get("baseURL"):
+            self.url_edit.setText(str(opts["baseURL"]))
+        key = opts.get("apiKey")
+        if isinstance(key, str) and key:
+            self.apikey_edit.setText(key)
 
     def _current_adapter(self) -> str:
         return self.format_combo.currentData()
