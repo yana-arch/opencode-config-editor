@@ -84,3 +84,22 @@ def test_section_helper_used_by_providers_tab(qapp, catalog):
     fake = FakeApp(catalog)
     tab = app.ProvidersTab(fake)
     tab._update_table()  # must not raise with cfg=None
+
+
+def test_fetch_dialog_marks_existing_models(qapp):
+    providers = {"myp": {"models": {"m-old": {}}}}
+    dlg = app.FetchProviderModelsDialog(None, providers=providers)
+    dlg.key_edit.setText("myp")
+    dlg.fetched_models = {"m-old": {"name": "Old"}, "m-new": {"name": "New"}}
+    dlg._populate(dlg.fetched_models)
+    statuses = {dlg.table.item(r, 1).text(): dlg.table.item(r, 3).text()
+                for r in range(dlg.table.rowCount())}
+    assert statuses == {"m-old": "existing", "m-new": "new"}
+    assert dlg.sync_check.isHidden() is False      # offered when providers given
+    dlg.key_edit.setText("other")                  # re-evaluates on key change
+    assert {dlg.table.item(r, 3).text() for r in range(dlg.table.rowCount())} == {"new"}
+
+
+def test_fetch_dialog_sync_hidden_without_providers(qapp):
+    dlg = app.FetchProviderModelsDialog(None)
+    assert dlg.sync_check.isHidden() is True

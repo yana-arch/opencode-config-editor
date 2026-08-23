@@ -270,7 +270,9 @@ class ProvidersTab(QWidget):
 
         # Fill the dialog's Reference provider combo (silently loads bundled catalog).
         try_load_bundled_catalog(self.app.model_catalog)
-        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog)
+        providers = self.app.cfg.data.setdefault("provider", {})
+        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog,
+                                        providers=providers)
         if dlg.exec() != QDialog.Accepted:
             return
 
@@ -286,12 +288,32 @@ class ProvidersTab(QWidget):
 
         reference = dlg.reference_provider
 
-        providers = self.app.cfg.data.setdefault("provider", {})
-        prov = providers.setdefault(key, {"npm": "@ai-sdk/openai", "name": key, "models": {}})
-        if not isinstance(prov.get("models"), dict):
-            prov["models"] = {}
-        for mid, spec in selected.items():
-            prov["models"].setdefault(mid, dict(spec))
+        existing_cfg = providers.get(key)
+        existing_models = {}
+        if isinstance(existing_cfg, dict) and isinstance(existing_cfg.get("models"), dict):
+            existing_models = existing_cfg["models"]
+
+        base_url = dlg.url_edit.text().strip()
+        prov, summary = apply_fetched_provider(
+            providers, key, selected,
+            base_url=base_url,
+            api_key=dlg.apikey_edit.text().strip(),
+            save_api_key=dlg.save_apikey_check.isChecked(),
+            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+
+        removed = []
+        if dlg.sync_check.isChecked():
+            stale = stale_configured_models(existing_models, dlg.fetched_models)
+            if stale:
+                shown = ", ".join(stale[:8])
+                if len(stale) > 8:
+                    shown += f", ... (+{len(stale) - 8} more)"
+                if _confirm(self, "Sync Models",
+                            f"Remove {len(stale)} configured model(s) the API no "
+                            f"longer lists?\n{shown}"):
+                    for mid in stale:
+                        prov["models"].pop(mid, None)
+                    removed = stale
 
         self.app.mark_dirty()
         self._update_table()
@@ -301,7 +323,8 @@ class ProvidersTab(QWidget):
             if not self.app._ensure_catalog():
                 QMessageBox.information(
                     self, "Fetch Complete",
-                    f"Added {len(selected)} models to '{key}'. "
+                    f"'{key}': added {len(summary['added'])} new model(s), "
+                    f"kept {len(summary['kept'])} configured. "
                     "Catalog not loaded, skipped auto-match.")
                 return
 
@@ -347,7 +370,8 @@ class ProvidersTab(QWidget):
         if not any(e[2] is not None or e[3] == "ambiguous" for e in entries):
             QMessageBox.information(
                 self, "Fetch & Match",
-                f"Added {len(selected)} models to '{key}'. "
+                f"'{key}': added {len(summary['added'])} new model(s), "
+                f"kept {len(summary['kept'])} configured. "
                 "None matched the catalog.")
             return
 
@@ -376,9 +400,12 @@ class ProvidersTab(QWidget):
 
         self.app.mark_dirty()
         self._update_table()
+        sync_note = f", removed {len(removed)} stale" if removed else ""
         QMessageBox.information(
             self, "Fetch & Match Complete",
-            f"Added {len(selected)} models to '{key}', normalized {applied} from catalog."
+            f"'{key}': added {len(summary['added'])} new model(s), "
+            f"kept {len(summary['kept'])} configured{sync_note}, "
+            f"normalized {applied} from catalog."
         )
 
     def _export_providers(self):

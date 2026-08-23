@@ -67,6 +67,80 @@ FETCH_ADAPTERS = {
 }
 
 
+def stale_configured_models(existing_models, fetched_ids):
+    """Configured model ids that the API no longer lists (sorted)."""
+    if not isinstance(existing_models, dict):
+        return []
+    fetched = set(fetched_ids)
+    return sorted(m for m in existing_models if m not in fetched)
+
+
+def npm_for_fetch(adapter: str, base_url: str) -> str:
+    """Best AI-SDK npm package for a provider fetched from base_url.
+
+    The "openai" fetch format also serves OpenAI-compatible gateways
+    (OpenRouter, LiteLLM, vLLM...), which need @ai-sdk/openai-compatible;
+    only openai.com itself gets the dedicated package.
+    """
+    host = ""
+    if base_url:
+        host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    if adapter == "anthropic":
+        return "@ai-sdk/anthropic"
+    if adapter == "gemini":
+        return "@ai-sdk/google"
+    if adapter == "openai" and (host == "openai.com" or host.endswith(".openai.com")):
+        return "@ai-sdk/openai"
+    return "@ai-sdk/openai-compatible"
+
+
+def apply_fetched_provider(providers, key, selected, base_url="", api_key="",
+                           save_api_key=True, npm="@ai-sdk/openai",
+                           remove_missing=False):
+    """Merge fetched models into providers[key], persisting the endpoint config.
+
+    - creates the entry with `npm` when missing (an existing npm is kept)
+    - writes options.baseURL from the URL the models were fetched from
+    - writes options.apiKey only when save_api_key is true and a key was given;
+      an existing apiKey is never deleted
+    - existing model specs are never overwritten (API listings carry id/name
+      only; the catalog auto-match enriches specs separately)
+    - remove_missing=True also drops configured models absent from the fetch
+      result (opt-in sync; default keeps them)
+
+    Returns (provider_dict, summary) where summary has added/kept/removed ids.
+    """
+    prov = providers.get(key)
+    if not isinstance(prov, dict):
+        prov = {"npm": npm, "name": key, "models": {}}
+        providers[key] = prov
+    if not isinstance(prov.get("models"), dict):
+        prov["models"] = {}
+    added, kept = [], []
+    for mid, spec in selected.items():
+        if mid in prov["models"]:
+            kept.append(mid)
+        else:
+            added.append(mid)
+        prov["models"].setdefault(mid, dict(spec))
+    removed = []
+    if remove_missing:
+        for mid in sorted(prov["models"]):
+            if mid not in selected:
+                del prov["models"][mid]
+                removed.append(mid)
+    if base_url or (save_api_key and api_key):
+        opts = prov.get("options")
+        if not isinstance(opts, dict):
+            opts = {}
+            prov["options"] = opts
+        if base_url:
+            opts["baseURL"] = base_url
+        if save_api_key and api_key:
+            opts["apiKey"] = api_key
+    return prov, {"added": sorted(added), "kept": sorted(kept), "removed": removed}
+
+
 def _is_local_host(host: str) -> bool:
     """True if host is localhost or resolves to a private/loopback address."""
     if not host:

@@ -16,6 +16,15 @@ Hỗ trợ agent thứ hai: **openclaude** (settings.json phân lớp), qua tầ
 
 ### Added
 
+- **Fetch from API lưu endpoint + sync cho provider có sẵn**:
+  - Tự lưu `options.baseURL` (bắt buộc theo docs opencode) và `options.apiKey` (kèm checkbox
+    bật/tắt trong dialog) vào cấu hình provider.
+  - Chọn đúng package `npm` theo adapter/host (`@ai-sdk/openai-compatible` cho gateway
+    như OpenRouter/LiteLLM, `@ai-sdk/anthropic`, `@ai-sdk/google`...).
+  - Dùng lại được cho provider đã tồn tại: dialog có cột **Status** (`new`/`existing`),
+    spec đã cấu hình **không bao giờ bị ghi đè** bởi danh sách từ API (chỉ thêm mới), và
+    thêm checkbox **Sync** (opt-in) để tự động xoá các model không còn trên API sau khi
+    người dùng xác nhận.
 - **Adapter openclaude** — `build.py` giờ tạo **2 file chạy độc lập** từ cùng mã nguồn:
   `opencode-config-editor.py` (mặc định opencode) và `openclaude-config-editor.py`
   (mặc định openclaude). Đổi adapter khi chạy: `--adapter=openclaude` hoặc biến môi

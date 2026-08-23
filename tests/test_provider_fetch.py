@@ -186,3 +186,100 @@ def test_fetch_blocks_local_before_opener():
     with pytest.raises(app.FetchError):
         app.fetch_provider_models(spec, opener=fake_opener)
     assert called["n"] == 0  # guard fired before any fetch
+
+
+# --- apply_fetched_provider: persisting endpoint config after a fetch ---
+
+def test_apply_fetched_provider_persists_url_and_key():
+    providers = {}
+    prov, summary = app.apply_fetched_provider(
+        providers, "openrouter", {"openai/gpt-4o": {"name": "GPT-4o"}},
+        base_url="https://openrouter.ai/api/v1",
+        api_key="the" + "-key", save_api_key=True,
+        npm="@ai-sdk/openai-compatible")
+    assert prov["npm"] == "@ai-sdk/openai-compatible"
+    assert prov["name"] == "openrouter"
+    opts = prov["options"]
+    assert opts["baseURL"] == "https://openrouter.ai/api/v1"
+    assert opts["apiKey"] == "the" + "-key"
+    assert prov["models"] == {"openai/gpt-4o": {"name": "GPT-4o"}}
+    assert summary == {"added": ["openai/gpt-4o"], "kept": [], "removed": []}
+
+
+def test_apply_fetched_provider_unchecked_key_not_written():
+    providers = {}
+    prov, _ = app.apply_fetched_provider(
+        providers, "p", {"m": {}},
+        base_url="https://x/v1", api_key="the" + "-key", save_api_key=False)
+    assert prov["options"] == {"baseURL": "https://x/v1"}
+
+
+def test_apply_fetched_provider_keeps_existing_provider_fields():
+    providers = {"p": {"npm": "@my/custom", "name": "Pretty",
+                       "options": {"apiKey": "old" + "-key", "headers": {"X": "1"}},
+                       "models": {"old-model": {"name": "Old"}}}}
+    prov, summary = app.apply_fetched_provider(
+        providers, "p", {"new-model": {}},
+        base_url="https://new/v1", api_key="", save_api_key=True)
+    assert prov["npm"] == "@my/custom"           # existing npm kept
+    assert prov["name"] == "Pretty"
+    assert prov["options"]["baseURL"] == "https://new/v1"
+    assert prov["options"]["apiKey"] == "old" + "-key"   # empty field never wipes
+    assert prov["options"]["headers"] == {"X": "1"}
+    assert set(prov["models"]) == {"old-model", "new-model"}
+    assert prov["models"]["old-model"] == {"name": "Old"}  # not overwritten
+    assert summary == {"added": ["new-model"], "kept": [], "removed": []}
+
+
+def test_apply_fetched_provider_repairs_bad_options():
+    providers = {"p": {"options": "oops", "models": []}}
+    prov, _ = app.apply_fetched_provider(providers, "p", {"m": {}},
+                                         base_url="https://x/v1")
+    assert prov["options"] == {"baseURL": "https://x/v1"}
+    assert prov["models"] == {"m": {}}
+
+
+def test_apply_fetched_provider_summary_counts_and_never_overwrites_specs():
+    providers = {"p": {"models": {"kept-model": {"name": "UserEdited",
+                                                 "limit": {"context": 999}}}}}
+    fetched = {"kept-model": {"name": "FromAPI"}, "fresh": {"name": "Fresh"}}
+    prov, summary = app.apply_fetched_provider(providers, "p", fetched)
+    # existing spec survives untouched (API listings carry id/name only)
+    assert prov["models"]["kept-model"] == {"name": "UserEdited",
+                                            "limit": {"context": 999}}
+    assert prov["models"]["fresh"] == {"name": "Fresh"}
+    assert summary == {"added": ["fresh"], "kept": ["kept-model"], "removed": []}
+
+
+def test_apply_fetched_provider_remove_missing_syncs_list():
+    providers = {"p": {"models": {"alive": {}, "gone-a": {}, "gone-b": {}}}}
+    prov, summary = app.apply_fetched_provider(
+        providers, "p", {"alive": {}, "brand-new": {}}, remove_missing=True)
+    assert set(prov["models"]) == {"alive", "brand-new"}
+    assert summary == {"added": ["brand-new"], "kept": ["alive"],
+                       "removed": ["gone-a", "gone-b"]}
+
+
+def test_apply_fetched_provider_default_never_removes():
+    providers = {"p": {"models": {"custom-alias": {"name": "Mine"}}}}
+    prov, summary = app.apply_fetched_provider(providers, "p", {"other": {}})
+    assert "custom-alias" in prov["models"]     # add-only by default
+    assert summary["removed"] == []
+
+
+def test_stale_configured_models():
+    existing = {"a": {}, "b": {}, "c": {}}
+    assert app.stale_configured_models(existing, ["a", "c", "d"]) == ["b"]
+    assert app.stale_configured_models(existing, []) == ["a", "b", "c"]
+    assert app.stale_configured_models("not-a-dict", ["a"]) == []
+
+
+def test_npm_for_fetch_maps_by_adapter_and_host():
+    assert app.npm_for_fetch("anthropic", "https://api.anthropic.com") == "@ai-sdk/anthropic"
+    assert app.npm_for_fetch("gemini", "https://generativelanguage.googleapis.com") == "@ai-sdk/google"
+    assert app.npm_for_fetch("openai", "https://api.openai.com/v1") == "@ai-sdk/openai"
+    # an OpenAI-format gateway is NOT openai.com -> openai-compatible
+    assert app.npm_for_fetch("openai", "https://openrouter.ai/api/v1") == "@ai-sdk/openai-compatible"
+    assert app.npm_for_fetch("openai", "http://localhost:11434/v1") == "@ai-sdk/openai-compatible"
+    assert app.npm_for_fetch("generic", "https://anything") == "@ai-sdk/openai-compatible"
+    assert app.npm_for_fetch("models_dev", "") == "@ai-sdk/openai-compatible"

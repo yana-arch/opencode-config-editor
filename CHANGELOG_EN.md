@@ -16,6 +16,14 @@ Second agent supported: **openclaude** (layered settings.json), via a new adapte
 
 ### Added
 
+- **Fetch from API persists endpoint + syncs existing providers**:
+  - Automatically saves `options.baseURL` (required by opencode docs) and `options.apiKey`
+    (with an opt-in checkbox in the dialog) into the provider config.
+  - Selects the right `npm` package by adapter and host (`@ai-sdk/openai-compatible` for
+    gateways like OpenRouter/LiteLLM, `@ai-sdk/anthropic`, `@ai-sdk/google`...).
+  - Works safely for existing providers: a **Status** column marks rows `new`/`existing`,
+    configured specs are **never overwritten** by API listings (add-only by default), and
+    an opt-in **Sync** checkbox removes models the API no longer lists after confirmation.
 - **openclaude adapter** — `build.py` now emits **two standalone files** from the same
   source: `opencode-config-editor.py` (defaults to opencode) and
   `openclaude-config-editor.py` (defaults to openclaude). Switch at runtime with

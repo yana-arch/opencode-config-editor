@@ -1454,6 +1454,80 @@ FETCH_ADAPTERS = {
 }
 
 
+def stale_configured_models(existing_models, fetched_ids):
+    """Configured model ids that the API no longer lists (sorted)."""
+    if not isinstance(existing_models, dict):
+        return []
+    fetched = set(fetched_ids)
+    return sorted(m for m in existing_models if m not in fetched)
+
+
+def npm_for_fetch(adapter: str, base_url: str) -> str:
+    """Best AI-SDK npm package for a provider fetched from base_url.
+
+    The "openai" fetch format also serves OpenAI-compatible gateways
+    (OpenRouter, LiteLLM, vLLM...), which need @ai-sdk/openai-compatible;
+    only openai.com itself gets the dedicated package.
+    """
+    host = ""
+    if base_url:
+        host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    if adapter == "anthropic":
+        return "@ai-sdk/anthropic"
+    if adapter == "gemini":
+        return "@ai-sdk/google"
+    if adapter == "openai" and (host == "openai.com" or host.endswith(".openai.com")):
+        return "@ai-sdk/openai"
+    return "@ai-sdk/openai-compatible"
+
+
+def apply_fetched_provider(providers, key, selected, base_url="", api_key="",
+                           save_api_key=True, npm="@ai-sdk/openai",
+                           remove_missing=False):
+    """Merge fetched models into providers[key], persisting the endpoint config.
+
+    - creates the entry with `npm` when missing (an existing npm is kept)
+    - writes options.baseURL from the URL the models were fetched from
+    - writes options.apiKey only when save_api_key is true and a key was given;
+      an existing apiKey is never deleted
+    - existing model specs are never overwritten (API listings carry id/name
+      only; the catalog auto-match enriches specs separately)
+    - remove_missing=True also drops configured models absent from the fetch
+      result (opt-in sync; default keeps them)
+
+    Returns (provider_dict, summary) where summary has added/kept/removed ids.
+    """
+    prov = providers.get(key)
+    if not isinstance(prov, dict):
+        prov = {"npm": npm, "name": key, "models": {}}
+        providers[key] = prov
+    if not isinstance(prov.get("models"), dict):
+        prov["models"] = {}
+    added, kept = [], []
+    for mid, spec in selected.items():
+        if mid in prov["models"]:
+            kept.append(mid)
+        else:
+            added.append(mid)
+        prov["models"].setdefault(mid, dict(spec))
+    removed = []
+    if remove_missing:
+        for mid in sorted(prov["models"]):
+            if mid not in selected:
+                del prov["models"][mid]
+                removed.append(mid)
+    if base_url or (save_api_key and api_key):
+        opts = prov.get("options")
+        if not isinstance(opts, dict):
+            opts = {}
+            prov["options"] = opts
+        if base_url:
+            opts["baseURL"] = base_url
+        if save_api_key and api_key:
+            opts["apiKey"] = api_key
+    return prov, {"added": sorted(added), "kept": sorted(kept), "removed": removed}
+
+
 def _is_local_host(host: str) -> bool:
     """True if host is localhost or resolves to a private/loopback address."""
     if not host:
@@ -3139,12 +3213,14 @@ class _ModelFetchWorker(QThread):
 class FetchProviderModelsDialog(QDialog):
     """Fetch a provider's model list from its API and preview the results."""
 
-    def __init__(self, parent, provider_key: str = "new-provider", catalog=None):
+    def __init__(self, parent, provider_key: str = "new-provider", catalog=None,
+                 providers=None):
         super().__init__(parent)
         self.setWindowTitle("Fetch Provider Models from API")
         self.resize(720, 560)
         self.fetched_models = {}   # {model_id: spec}
         self.provider_key = provider_key
+        self.providers = providers  # full provider map, for existing-status display
         self._worker = None
 
         # Silently load the bundled catalog so the Reference combo can be filled.
@@ -3155,6 +3231,7 @@ class FetchProviderModelsDialog(QDialog):
 
         form = QFormLayout()
         self.key_edit = QLineEdit(provider_key)
+        self.key_edit.textChanged.connect(self._apply_status)
         form.addRow("Provider key:", self.key_edit)
 
         self.format_combo = QComboBox()
@@ -3180,8 +3257,15 @@ class FetchProviderModelsDialog(QDialog):
 
         self.apikey_edit = QLineEdit()
         self.apikey_edit.setEchoMode(QLineEdit.Password)
-        self.apikey_edit.setPlaceholderText("(sent as a header, never saved to config)")
+        self.apikey_edit.setPlaceholderText("(sent as a header to fetch the model list)")
         form.addRow("API key:", self.apikey_edit)
+
+        self.save_apikey_check = QCheckBox("Save API key to config (options.apiKey)")
+        self.save_apikey_check.setChecked(True)
+        self.save_apikey_check.setToolTip(
+            "Writes the key into opencode.json (provider options.apiKey), opencode's "
+            "documented mechanism. Uncheck to keep it out of the config file.")
+        form.addRow("", self.save_apikey_check)
 
         layout.addLayout(form)
 
@@ -3202,6 +3286,14 @@ class FetchProviderModelsDialog(QDialog):
         self.allow_local_check = QCheckBox("Allow local URL (Ollama / LM Studio / localhost)")
         layout.addWidget(self.allow_local_check)
 
+        self.sync_check = QCheckBox(
+            "Sync: also remove configured models that the API no longer lists")
+        self.sync_check.setToolTip(
+            "Only affects a provider key that already exists. Off = add-only, "
+            "every configured model is kept.")
+        self.sync_check.setVisible(providers is not None)
+        layout.addWidget(self.sync_check)
+
         # Fetch controls
         fetch_row = QHBoxLayout()
         self.fetch_btn = QPushButton("Fetch models")
@@ -3213,8 +3305,8 @@ class FetchProviderModelsDialog(QDialog):
 
         # Results table
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Add", "Model ID", "Name"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Add", "Model ID", "Name", "Status"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
 
@@ -3303,6 +3395,23 @@ class FetchProviderModelsDialog(QDialog):
             self.table.setCellWidget(row, 0, check)
             self.table.setItem(row, 1, QTableWidgetItem(mid))
             self.table.setItem(row, 2, QTableWidgetItem(spec.get("name", "")))
+        self._apply_status()
+
+    def _existing_model_ids(self) -> set:
+        if not isinstance(self.providers, dict):
+            return set()
+        prov = self.providers.get(self.key_edit.text().strip())
+        models = prov.get("models") if isinstance(prov, dict) else None
+        return set(models.keys()) if isinstance(models, dict) else set()
+
+    def _apply_status(self, *_):
+        existing = self._existing_model_ids()
+        for row in range(self.table.rowCount()):
+            mid_item = self.table.item(row, 1)
+            if mid_item is None:
+                continue
+            status = "existing" if mid_item.text() in existing else "new"
+            self.table.setItem(row, 3, QTableWidgetItem(status))
 
     def _set_all(self, checked: bool):
         for row in range(self.table.rowCount()):
@@ -4048,7 +4157,9 @@ class ProvidersTab(QWidget):
 
         # Fill the dialog's Reference provider combo (silently loads bundled catalog).
         try_load_bundled_catalog(self.app.model_catalog)
-        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog)
+        providers = self.app.cfg.data.setdefault("provider", {})
+        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog,
+                                        providers=providers)
         if dlg.exec() != QDialog.Accepted:
             return
 
@@ -4064,12 +4175,32 @@ class ProvidersTab(QWidget):
 
         reference = dlg.reference_provider
 
-        providers = self.app.cfg.data.setdefault("provider", {})
-        prov = providers.setdefault(key, {"npm": "@ai-sdk/openai", "name": key, "models": {}})
-        if not isinstance(prov.get("models"), dict):
-            prov["models"] = {}
-        for mid, spec in selected.items():
-            prov["models"].setdefault(mid, dict(spec))
+        existing_cfg = providers.get(key)
+        existing_models = {}
+        if isinstance(existing_cfg, dict) and isinstance(existing_cfg.get("models"), dict):
+            existing_models = existing_cfg["models"]
+
+        base_url = dlg.url_edit.text().strip()
+        prov, summary = apply_fetched_provider(
+            providers, key, selected,
+            base_url=base_url,
+            api_key=dlg.apikey_edit.text().strip(),
+            save_api_key=dlg.save_apikey_check.isChecked(),
+            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+
+        removed = []
+        if dlg.sync_check.isChecked():
+            stale = stale_configured_models(existing_models, dlg.fetched_models)
+            if stale:
+                shown = ", ".join(stale[:8])
+                if len(stale) > 8:
+                    shown += f", ... (+{len(stale) - 8} more)"
+                if _confirm(self, "Sync Models",
+                            f"Remove {len(stale)} configured model(s) the API no "
+                            f"longer lists?\n{shown}"):
+                    for mid in stale:
+                        prov["models"].pop(mid, None)
+                    removed = stale
 
         self.app.mark_dirty()
         self._update_table()
@@ -4079,7 +4210,8 @@ class ProvidersTab(QWidget):
             if not self.app._ensure_catalog():
                 QMessageBox.information(
                     self, "Fetch Complete",
-                    f"Added {len(selected)} models to '{key}'. "
+                    f"'{key}': added {len(summary['added'])} new model(s), "
+                    f"kept {len(summary['kept'])} configured. "
                     "Catalog not loaded, skipped auto-match.")
                 return
 
@@ -4125,7 +4257,8 @@ class ProvidersTab(QWidget):
         if not any(e[2] is not None or e[3] == "ambiguous" for e in entries):
             QMessageBox.information(
                 self, "Fetch & Match",
-                f"Added {len(selected)} models to '{key}'. "
+                f"'{key}': added {len(summary['added'])} new model(s), "
+                f"kept {len(summary['kept'])} configured. "
                 "None matched the catalog.")
             return
 
@@ -4154,9 +4287,12 @@ class ProvidersTab(QWidget):
 
         self.app.mark_dirty()
         self._update_table()
+        sync_note = f", removed {len(removed)} stale" if removed else ""
         QMessageBox.information(
             self, "Fetch & Match Complete",
-            f"Added {len(selected)} models to '{key}', normalized {applied} from catalog."
+            f"'{key}': added {len(summary['added'])} new model(s), "
+            f"kept {len(summary['kept'])} configured{sync_note}, "
+            f"normalized {applied} from catalog."
         )
 
     def _export_providers(self):

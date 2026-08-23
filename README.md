@@ -34,6 +34,10 @@ xác thực theo schema, import/export và nhiều tiện ích khác.
 - **Quản lý model nâng cao**: thêm/sửa/xóa model, chỉnh sửa hàng loạt (bulk edit), catalog model
   với preview và lọc.
 - **Import/Export** provider, MCP server và plugin, kèm giải quyết xung đột.
+- **Fetch model từ API của provider** (nút *Fetch from API* ở tab Providers): lấy danh sách
+  model trực tiếp từ endpoint, tự lưu `options.baseURL` + `options.apiKey` và chọn `npm`
+  phù hợp; dùng lại được cho provider đã có (cột **Status** đánh dấu `new`/`existing`, spec
+  đã cấu hình không bị ghi đè, và tuỳ chọn **Sync** để xoá model API không còn liệt kê).
 - **Undo/redo** cho mọi thao tác (giới hạn 100 bước).
 - **Bật/tắt hàng loạt** cho plugin và MCP server.
 

@@ -505,12 +505,14 @@ class _ModelFetchWorker(QThread):
 class FetchProviderModelsDialog(QDialog):
     """Fetch a provider's model list from its API and preview the results."""
 
-    def __init__(self, parent, provider_key: str = "new-provider", catalog=None):
+    def __init__(self, parent, provider_key: str = "new-provider", catalog=None,
+                 providers=None):
         super().__init__(parent)
         self.setWindowTitle("Fetch Provider Models from API")
         self.resize(720, 560)
         self.fetched_models = {}   # {model_id: spec}
         self.provider_key = provider_key
+        self.providers = providers  # full provider map, for existing-status display
         self._worker = None
 
         # Silently load the bundled catalog so the Reference combo can be filled.
@@ -521,6 +523,7 @@ class FetchProviderModelsDialog(QDialog):
 
         form = QFormLayout()
         self.key_edit = QLineEdit(provider_key)
+        self.key_edit.textChanged.connect(self._apply_status)
         form.addRow("Provider key:", self.key_edit)
 
         self.format_combo = QComboBox()
@@ -546,8 +549,15 @@ class FetchProviderModelsDialog(QDialog):
 
         self.apikey_edit = QLineEdit()
         self.apikey_edit.setEchoMode(QLineEdit.Password)
-        self.apikey_edit.setPlaceholderText("(sent as a header, never saved to config)")
+        self.apikey_edit.setPlaceholderText("(sent as a header to fetch the model list)")
         form.addRow("API key:", self.apikey_edit)
+
+        self.save_apikey_check = QCheckBox("Save API key to config (options.apiKey)")
+        self.save_apikey_check.setChecked(True)
+        self.save_apikey_check.setToolTip(
+            "Writes the key into opencode.json (provider options.apiKey), opencode's "
+            "documented mechanism. Uncheck to keep it out of the config file.")
+        form.addRow("", self.save_apikey_check)
 
         layout.addLayout(form)
 
@@ -568,6 +578,14 @@ class FetchProviderModelsDialog(QDialog):
         self.allow_local_check = QCheckBox("Allow local URL (Ollama / LM Studio / localhost)")
         layout.addWidget(self.allow_local_check)
 
+        self.sync_check = QCheckBox(
+            "Sync: also remove configured models that the API no longer lists")
+        self.sync_check.setToolTip(
+            "Only affects a provider key that already exists. Off = add-only, "
+            "every configured model is kept.")
+        self.sync_check.setVisible(providers is not None)
+        layout.addWidget(self.sync_check)
+
         # Fetch controls
         fetch_row = QHBoxLayout()
         self.fetch_btn = QPushButton("Fetch models")
@@ -579,8 +597,8 @@ class FetchProviderModelsDialog(QDialog):
 
         # Results table
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Add", "Model ID", "Name"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Add", "Model ID", "Name", "Status"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
 
@@ -669,6 +687,23 @@ class FetchProviderModelsDialog(QDialog):
             self.table.setCellWidget(row, 0, check)
             self.table.setItem(row, 1, QTableWidgetItem(mid))
             self.table.setItem(row, 2, QTableWidgetItem(spec.get("name", "")))
+        self._apply_status()
+
+    def _existing_model_ids(self) -> set:
+        if not isinstance(self.providers, dict):
+            return set()
+        prov = self.providers.get(self.key_edit.text().strip())
+        models = prov.get("models") if isinstance(prov, dict) else None
+        return set(models.keys()) if isinstance(models, dict) else set()
+
+    def _apply_status(self, *_):
+        existing = self._existing_model_ids()
+        for row in range(self.table.rowCount()):
+            mid_item = self.table.item(row, 1)
+            if mid_item is None:
+                continue
+            status = "existing" if mid_item.text() in existing else "new"
+            self.table.setItem(row, 3, QTableWidgetItem(status))
 
     def _set_all(self, checked: bool):
         for row in range(self.table.rowCount()):

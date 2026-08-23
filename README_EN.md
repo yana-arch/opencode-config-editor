@@ -33,6 +33,11 @@ featuring schema validation, import/export, and advanced model management.
 - **10 Specialized Tabs**: General, Runtime, Agents, Commands, Providers, MCP Servers, Plugins, Permissions, TUI, Raw JSON.
 - **Advanced Model Management**: Add/Edit/Remove models, bulk editing, and a model catalog with preview and filtering.
 - **Import/Export**: Easily import/export providers, MCP servers, and plugins with conflict resolution.
+- **Fetch models from a provider's API** (*Fetch from API* on the Providers tab): pulls the model
+  list straight from the endpoint, persists `options.baseURL` + `options.apiKey` and picks the
+  right `npm` package; works for existing providers too (a **Status** column marks each row
+  `new`/`existing`, configured specs are never overwritten, and an opt-in **Sync** checkbox
+  removes models the API no longer lists).
 - **Undo/Redo**: Full history support for all operations (100 steps limit).
 - **Bulk Operations**: Enable/disable plugins and MCP servers in batches.
 
