@@ -188,3 +188,81 @@ def test_save_project_mcp(tmp_path):
     assert ok
     saved = json.loads((tmp_path / "proj" / ".mcp.json").read_text())
     assert saved == {"mcpServers": {"a": {"command": "c"}}}
+
+
+def test_findings_unknown_key_warns_but_does_not_error():
+    errors, warnings = app.openclaude_findings(
+        {"model": "opus", "totallyMadeUp": 1}, "user")
+    assert errors == []
+    assert any("totallyMadeUp" in w for w in warnings)
+
+
+def test_findings_container_shapes_are_errors():
+    errors, _ = app.openclaude_findings({
+        "hooks": [],
+        "permissions": {"allow": "Bash(ls)"},
+        "modelLimits": {"m": 5},
+        "statusLine": 7,
+    }, "project")
+    joined = " | ".join(errors)
+    assert "'hooks' must be an object." in joined
+    assert "permissions.allow must be an array" in joined
+    assert "modelLimits['m'] must be an object." in joined
+    assert "'statusLine' must be an object or a boolean." in joined
+
+
+def test_findings_hook_event_must_be_array():
+    errors, _ = app.openclaude_findings(
+        {"hooks": {"Stop": {"command": "x"}}}, "user")
+    assert any("hooks['Stop']" in e for e in errors)
+
+
+def test_findings_env_non_string_value_warns():
+    errors, warnings = app.openclaude_findings({"env": {"PORT": 8080}}, "user")
+    assert errors == []
+    assert any("env['PORT']" in w for w in warnings)
+
+
+def test_findings_global_layer_ignores_app_state():
+    errors, warnings = app.openclaude_findings({
+        "numStartups": 42,
+        "tipsHistory": {"a": 1},
+        "providerProfiles": [{"id": "p1", "name": "x"}, {"name": "no-id"}],
+        "mcpServers": {"ok": {"type": "stdio", "command": "x", "args": ["a"]},
+                       "odd": {"type": "grpc"}},
+    }, "global")
+    assert errors == []
+    assert any("providerProfiles[1] has no 'id'" in w for w in warnings)
+    assert any("grpc" in w for w in warnings)
+    assert not any("numStartups" in w for w in warnings)
+
+
+def test_findings_global_layer_shape_errors():
+    errors, _ = app.openclaude_findings({
+        "mcpServers": [], "providerProfiles": {},
+    }, "global")
+    joined = " | ".join(errors)
+    assert "'mcpServers' must be an object." in joined
+    assert "'providerProfiles' must be an array." in joined
+
+
+def test_findings_project_mcp_unknown_key_warns():
+    _, warnings = app.openclaude_findings({
+        "mcpServers": {}, "allowedTools": [], "somethingElse": True,
+    }, "project-mcp")
+    assert any("somethingElse" in w for w in warnings)
+
+
+def test_every_key_the_editor_writes_is_known():
+    """The forms must never produce a key their own validator flags."""
+    written = {
+        "model", "effortLevel", "agent", "advisorModel", "statusLine",
+        "enableAllProjectMcpServers", "enabledMcpjsonServers",
+        "disabledMcpjsonServers", "skipDangerousModePermissionPrompt",
+        "skipFullAccessModePermissionPrompt", "enabledPlugins",
+        "extraKnownMarketplaces", "hooks", "permissions", "env", "modelLimits",
+        "agentModels", "agentRouting",
+    }
+    assert written <= app.OPENCLAUDE_SETTINGS_KEYS
+    assert {"providerProfiles", "activeProviderProfileId",
+            "mcpServers"} <= app.OPENCLAUDE_GLOBAL_KEYS

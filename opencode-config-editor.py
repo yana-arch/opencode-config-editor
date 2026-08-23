@@ -531,10 +531,17 @@ class Validator:
 
     def _load_schema(self, kind: str = "opencode") -> Optional[dict]:
         """Load schema (kind-aware) with caching and periodic refresh"""
+        url, cache_path = self._schema_source(kind)
+        return self.schema_from(url, cache_path, kind)
+
+    def schema_from(self, url: str, cache_path: Path, kind: str) -> Optional[dict]:
+        """Load any JSON Schema by url, cached in memory and on disk.
+
+        Adapters pass their own schema here so core stays agent-agnostic.
+        """
         if not HAVE_JSONSCHEMA:
             return None
 
-        url, cache_path = self._schema_source(kind)
         current_time = time.time()
         if self.schemas.get(kind) is not None and (current_time - self.last_schema_fetch) < self.schema_cache_duration:
             return self.schemas[kind]
@@ -6765,7 +6772,7 @@ OPENCLAUDE_SETTINGS_KEYS = {
     "prefersReducedMotion", "processWrapper", "promptSuggestionEnabled", "providerFallbackChain", "providerProfileModelPickerMode",
     "remote", "remoteControlAtStartup", "requireCoworkFullVmSandbox", "requiredMaximumVersion", "requiredMinimumVersion",
     "respectGitignore", "respondToBashCommands", "sandbox", "showClearContextOnPlanAccept", "showThinkingSummaries",
-    "showTurnDuration", "skillListingBudgetFraction", "skillListingMaxDescChars", "skillOverrides", "skipDangerousModePermissionPrompt",
+    "showTurnDuration", "skillListingBudgetFraction", "skillListingMaxDescChars", "skillOverrides", "skipDangerousModePermissionPrompt", "skipFullAccessModePermissionPrompt",
     "skipWebFetchPreflight", "skippedMarketplaces", "skippedPlugins", "smartRouting", "spinnerTipsEnabled",
     "spinnerTipsOverride", "spinnerVerbs", "sponsoredTipsEnabled", "sponsoredTipsFrequency", "sshConfigs",
     "sshHostAllowlist", "statusLine", "strictKnownMarketplaces", "strictPluginOnlyCustomization", "subagentStatusLine",
@@ -6792,6 +6799,19 @@ OPENCLAUDE_CONFIG_ENV = ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR")
 
 # MCP server scopes and where each is stored.
 OPENCLAUDE_MCP_SCOPES = ("user", "project", "local")
+
+# openclaude embeds the Claude Code settings schema; schemastore publishes the
+# same document. Findings are advisory only (openclaude adds keys of its own,
+# and the schema's top level allows extra properties).
+OPENCLAUDE_SCHEMA_URL = "https://json.schemastore.org/claude-code-settings.json"
+OPENCLAUDE_SCHEMA_CACHE = (Path.home() / ".cache" / APP_NAME_OPENCLAUDE
+                           / "claude-code-settings-schema.json")
+
+# Top-level keys of a project .mcp.json.
+OPENCLAUDE_PROJECT_MCP_KEYS = {"$schema", "mcpServers", "allowedTools", "mcpContextUris"}
+
+# Transports openclaude understands for an MCP server entry.
+OPENCLAUDE_MCP_TYPES = ("stdio", "http", "sse")
 # openclaude layered config model.
 #
 # openclaude merges three settings layers (user -> project -> local, later
@@ -6946,6 +6966,82 @@ def _openclaude_targets(cwd, config_dir=None):
         ("Project .mcp.json", cf.project_mcp_file, "project-mcp"),
         ("Managed settings (policy, read-only)", cf.managed_file, "managed"),
     ]
+
+
+def openclaude_findings(data, layer, validator=None):
+    """Check one openclaude layer: returns (errors, warnings).
+
+    Errors are container-shape problems openclaude itself would choke on.
+    Warnings are advisory: unknown keys and JSON-Schema findings never block a
+    save, because openclaude ships keys the published schema does not list.
+    """
+    errors, warnings = [], []
+    if not isinstance(data, dict):
+        return ["Root must be a JSON object."], []
+
+    def want(key, types, label):
+        val = data.get(key)
+        if key in data and not isinstance(val, types):
+            errors.append(f"'{key}' must be {label}.")
+            return None
+        return val
+
+    if layer in ("global", "project-mcp"):
+        servers = want("mcpServers", dict, "an object")
+        for name, spec in (servers or {}).items():
+            if not isinstance(spec, dict):
+                errors.append(f"mcpServers[{name!r}] must be an object.")
+                continue
+            stype = spec.get("type")
+            if stype is not None and stype not in OPENCLAUDE_MCP_TYPES:
+                warnings.append(f"mcpServers[{name!r}].type {stype!r} is not one of "
+                                + "/".join(OPENCLAUDE_MCP_TYPES))
+            if "args" in spec and not isinstance(spec["args"], list):
+                errors.append(f"mcpServers[{name!r}].args must be an array.")
+        profiles = want("providerProfiles", list, "an array")
+        for i, prof in enumerate(profiles or []):
+            if isinstance(prof, dict) and not prof.get("id"):
+                warnings.append(f"providerProfiles[{i}] has no 'id'; "
+                                "activeProviderProfileId cannot point at it")
+        if layer == "project-mcp":
+            unknown = sorted(k for k in data if k not in OPENCLAUDE_PROJECT_MCP_KEYS)
+            if unknown:
+                warnings.append("unknown .mcp.json key(s): " + ", ".join(unknown))
+        return errors, warnings
+
+    hooks = want("hooks", dict, "an object")
+    for event, groups in (hooks or {}).items():
+        if not isinstance(groups, list):
+            errors.append(f"hooks[{event!r}] must be an array of matcher groups.")
+    perms = want("permissions", dict, "an object")
+    for key in ("allow", "deny", "ask", "additionalDirectories"):
+        if isinstance(perms, dict) and key in perms and not isinstance(perms[key], list):
+            errors.append(f"permissions.{key} must be an array of strings.")
+    env = want("env", dict, "an object")
+    for name, val in (env or {}).items():
+        if not isinstance(val, str):
+            warnings.append(f"env[{name!r}] should be a string, got {type(val).__name__}")
+    limits = want("modelLimits", dict, "an object")
+    for model, spec in (limits or {}).items():
+        if not isinstance(spec, dict):
+            errors.append(f"modelLimits[{model!r}] must be an object.")
+    if "statusLine" in data and not isinstance(data["statusLine"], (dict, bool)):
+        errors.append("'statusLine' must be an object or a boolean.")
+
+    unknown = sorted(k for k in data if k not in OPENCLAUDE_SETTINGS_KEYS)
+    if unknown:
+        warnings.append("unknown settings key(s): " + ", ".join(unknown))
+
+    if validator is not None and not errors:
+        schema = validator.schema_from(OPENCLAUDE_SCHEMA_URL, OPENCLAUDE_SCHEMA_CACHE,
+                                      "openclaude-settings")
+        if schema is not None:
+            try:
+                for e in jsonschema.Draft7Validator(schema).iter_errors(data):
+                    warnings.append(f"schema: {e.message} (path: {_path_of(e)})")
+            except Exception as ex:
+                warnings.append(f"schema error: {ex}")
+    return errors, warnings
 # openclaude editor tabs. Minimal but functional: a Settings form (scalar keys)
 # and a per-layer Raw JSON editor. Both operate on the layer currently selected
 # on the window (win.oc_layer) via win.oc_layered (a LayeredConfigFile).
@@ -7130,6 +7226,14 @@ class OpenclaudeRawTab(BaseTab):
         self._modified = False
         layout.addWidget(self.editor)
 
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self._validate_timer = QTimer(self)
+        self._validate_timer.setSingleShot(True)
+        self._validate_timer.setInterval(400)
+        self._validate_timer.timeout.connect(self._validate)
+
     def _on_layer_change(self, *_):
         new_layer = self.layer_combo.currentData()
         old_layer = self._current_raw_layer()
@@ -7149,6 +7253,35 @@ class OpenclaudeRawTab(BaseTab):
     def _on_text(self, *_):
         self._modified = True
         self.app.status_bar.showMessage("Unsaved changes…")
+        self._validate_timer.start()
+
+    def _validate(self):
+        text = self.editor.toPlainText().strip()
+        if not text:
+            self._show_findings([], [])
+            return
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            self.status_label.setStyleSheet("color: #c0392b;")
+            self.status_label.setText(f"JSON error: {e}")
+            return
+        errors, warnings = openclaude_findings(
+            data, self._current_raw_layer(), getattr(self.app, "validator", None))
+        self._show_findings(errors, warnings)
+
+    def _show_findings(self, errors, warnings):
+        msgs = [f"error: {m}" for m in errors] + [f"warning: {m}" for m in warnings]
+        if not msgs:
+            self.status_label.setStyleSheet("color: gray;")
+            self.status_label.setText("Valid JSON")
+            return
+        shown = msgs[:5]
+        if len(msgs) > len(shown):
+            shown.append(f"... and {len(msgs) - len(shown)} more")
+        self.status_label.setStyleSheet(
+            "color: #c0392b;" if errors else "color: #b9770e;")
+        self.status_label.setText("\n".join(shown))
 
     def _current_raw_layer(self):
         return getattr(self, "_raw_layer", None) or self.layer_combo.currentData() or "project"
@@ -7166,6 +7299,7 @@ class OpenclaudeRawTab(BaseTab):
             data = layered.layer(layer)
         self._set_text(self.editor, json.dumps(data, indent=2, ensure_ascii=False))
         self._modified = False
+        self._validate()
 
     def parsed(self):
         """Return (layer, dict) from the editor, or (layer, None) if invalid."""
@@ -7190,6 +7324,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         super().__init__(app)
         self._dirty = False
         self._extra_profiles = []   # non-dict providerProfiles entries, kept verbatim
+        self.dupe_names = []        # duplicate profile names skipped by collect
         self._had_profiles = False  # global file already had a providerProfiles key
         self._had_agent_models = False
         self._had_active = False    # global file already had activeProviderProfileId
@@ -7346,10 +7481,14 @@ class OpenclaudeAgentModelsTab(BaseTab):
         profiles = list(self._extra_profiles)  # re-emit preserved non-dict entries
         legacy_models = {}
         seen_names = set()
+        dupes = set()
         for r in range(self.models_table.rowCount()):
             name_item = self.models_table.item(r, 0)
             name = name_item.text().strip() if name_item else ""
-            if not name or name in seen_names:
+            if not name:
+                continue
+            if name in seen_names:
+                dupes.add(name)      # reported below; first row wins
                 continue
             seen_names.add(name)
             orig = self.preserved(name_item) if name_item else {}
@@ -7405,6 +7544,9 @@ class OpenclaudeAgentModelsTab(BaseTab):
             if agent and key:
                 routing[agent] = key
         self._put(data, "agentRouting", routing, {})
+
+        # Reported by the save hook so the success message doesn't overwrite it.
+        self.dupe_names = sorted(dupes)
 
     def _cell(self, r, c):
         return self.cell_text(self.models_table, r, c)
@@ -8232,6 +8374,280 @@ class OpenclaudeHooksTab(BaseTab):
 
         if out or "hooks" in data:
             data["hooks"] = out
+
+
+class OpenclaudePermissionsTab(BaseTab):
+    """Editor for settings.json `permissions` on the selected layer.
+
+    Verified shape (claude-code-settings schema embedded by openclaude):
+      permissions: {allow[], deny[], ask[], additionalDirectories[],
+                    defaultMode: enum, disableBypassPermissionsMode?,
+                    disableAutoMode?}
+    Rules are plain strings (e.g. "Bash(ls)"), one per line here. Unknown
+    sub-keys of `permissions` are preserved on save.
+    """
+
+    MODES = ("", "default", "manual", "acceptEdits", "plan", "auto",
+             "delegate", "dontAsk", "bypassPermissions")
+    LISTS = (("allow", "allow — permitted operations"),
+             ("deny", "deny — blocked operations"),
+             ("ask", "ask — always confirm"),
+             ("additionalDirectories", "additionalDirectories — extra paths in scope"))
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._loading = False
+        self._orig = {}
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Edit layer:"))
+        self.layer_combo = QComboBox()
+        for lk in ("user", "project", "local"):
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        top.addWidget(self.layer_combo)
+        top.addWidget(QLabel("   defaultMode:"))
+        self.mode_combo = QComboBox()
+        for m in self.MODES:
+            self.mode_combo.addItem(m or "(unset)", m)
+        self.mode_combo.currentIndexChanged.connect(self._edited)
+        top.addWidget(self.mode_combo)
+        top.addStretch()
+        layout.addLayout(top)
+
+        info = QLabel("One rule per line, e.g. Bash(ls), Edit, WebFetch(domain:example.com). "
+                      "Unknown permissions sub-keys are preserved.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: gray;")
+        layout.addWidget(info)
+
+        self.editors = {}
+        for key, label in self.LISTS:
+            layout.addWidget(QLabel(label + ":"))
+            ed = QPlainTextEdit()
+            ed.setTabChangesFocus(True)
+            ed.textChanged.connect(self._edited)
+            self.editors[key] = ed
+            layout.addWidget(ed)
+
+        flags = QHBoxLayout()
+        self.no_bypass_chk = QCheckBox("disableBypassPermissionsMode")
+        self.no_auto_chk = QCheckBox("disableAutoMode")
+        for c in (self.no_bypass_chk, self.no_auto_chk):
+            c.stateChanged.connect(self._edited)
+            flags.addWidget(c)
+        flags.addStretch()
+        layout.addLayout(flags)
+
+    def _on_layer_change(self, *_):
+        _layer_change_guarded(self, self.layer_combo)
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.oc_form_dirty = True
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    @staticmethod
+    def _lines(text):
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        perms = own.get("permissions") if isinstance(own.get("permissions"), dict) else {}
+        self._loading = True
+        try:
+            self._set_combo(self.layer_combo, self.app.oc_layer, 0)
+            self._orig = dict(perms)
+            for key, _label in self.LISTS:
+                val = perms.get(key)
+                lines = [str(v) for v in val] if isinstance(val, list) else []
+                self._set_text(self.editors[key], "\n".join(lines))
+            mode = str(perms.get("defaultMode", "") or "")
+            if mode and self.mode_combo.findData(mode) < 0:
+                self.mode_combo.addItem(f"(current) {mode}", mode)
+            self._set_combo(self.mode_combo, mode, 0)
+            self._set_checked(self.no_bypass_chk, perms.get("disableBypassPermissionsMode"))
+            self._set_checked(self.no_auto_chk, perms.get("disableAutoMode"))
+        finally:
+            self._loading = False
+
+    def collect(self, data):
+        # Start from the layer's own permissions so unknown sub-keys survive.
+        base = data.get("permissions")
+        out = dict(base) if isinstance(base, dict) else {}
+        for key, _label in self.LISTS:
+            items = self._lines(self.editors[key].toPlainText())
+            if items:
+                out[key] = items
+            else:
+                out.pop(key, None)
+        mode = self.mode_combo.currentData() or ""
+        if mode:
+            out["defaultMode"] = mode
+        else:
+            out.pop("defaultMode", None)
+        for chk, key in ((self.no_bypass_chk, "disableBypassPermissionsMode"),
+                         (self.no_auto_chk, "disableAutoMode")):
+            if chk.isChecked():
+                out[key] = True
+            elif key in out:
+                out[key] = False
+        if out:
+            data["permissions"] = out
+        else:
+            data.pop("permissions", None)
+
+
+class OpenclaudeEnvLimitsTab(BaseTab):
+    """Editors for settings.json `env` and `modelLimits` on the selected layer.
+
+      env: {VAR: "string"}  — values are masked (they routinely hold API keys)
+      modelLimits: {model: {contextWindow: int, maxOutputTokens: int}}
+    Unknown per-model sub-keys are preserved.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._loading = False
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Edit layer:"))
+        self.layer_combo = QComboBox()
+        for lk in ("user", "project", "local"):
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        top.addWidget(self.layer_combo)
+        top.addStretch()
+        layout.addLayout(top)
+
+        layout.addWidget(QLabel("env — environment variables applied to every session "
+                                "(values masked; click the eye to reveal):"))
+        self.env_table = QTableWidget(0, 2)
+        self.env_table.setHorizontalHeaderLabels(["variable", "value"])
+        self.env_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.env_table)
+        ebtn = QHBoxLayout()
+        add_e = QPushButton("Add variable")
+        add_e.clicked.connect(lambda: self._add_env_row())
+        del_e = QPushButton("Remove selected")
+        del_e.clicked.connect(self._remove_env_row)
+        ebtn.addWidget(add_e)
+        ebtn.addWidget(del_e)
+        ebtn.addStretch()
+        layout.addLayout(ebtn)
+
+        layout.addWidget(QLabel("modelLimits — per-model context window / max output tokens "
+                                "(for OpenAI-compatible models missing from the catalog):"))
+        self.limits_table = QTableWidget(0, 3)
+        self.limits_table.setHorizontalHeaderLabels(
+            ["model", "contextWindow", "maxOutputTokens"])
+        self.limits_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.limits_table)
+        lbtn = QHBoxLayout()
+        add_l = QPushButton("Add model")
+        add_l.clicked.connect(lambda: self._add_limit_row())
+        del_l = QPushButton("Remove selected")
+        del_l.clicked.connect(self._remove_limit_row)
+        lbtn.addWidget(add_l)
+        lbtn.addWidget(del_l)
+        lbtn.addStretch()
+        layout.addLayout(lbtn)
+
+        self.env_table.itemChanged.connect(self._edited)
+        self.limits_table.itemChanged.connect(self._edited)
+
+    def _on_layer_change(self, *_):
+        _layer_change_guarded(self, self.layer_combo)
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.oc_form_dirty = True
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    # --- env rows ---
+    def _add_env_row(self, name="", value=""):
+        r = self.env_table.rowCount()
+        self.env_table.insertRow(r)
+        self.env_table.setItem(r, 0, QTableWidgetItem(name))
+        w = MaskedLineEdit(str(value), field_name="env-value",
+                           placeholder="value", secret=True)
+        w.textChanged.connect(self._edited)
+        self.env_table.setCellWidget(r, 1, w)
+        self._edited()
+
+    def _remove_env_row(self):
+        if self.remove_current(self.env_table):
+            self._edited()
+
+    # --- modelLimits rows ---
+    def _add_limit_row(self, model="", spec=None):
+        spec = spec if isinstance(spec, dict) else {}
+        r = self.limits_table.rowCount()
+        self.limits_table.insertRow(r)
+        item = QTableWidgetItem(model)
+        self.preserve(item, spec)          # keep unknown per-model sub-keys
+        self.limits_table.setItem(r, 0, item)
+        for col, key in ((1, "contextWindow"), (2, "maxOutputTokens")):
+            val = spec.get(key)
+            text = str(val) if isinstance(val, int) and not isinstance(val, bool) else ""
+            self.limits_table.setItem(r, col, QTableWidgetItem(text))
+        self._edited()
+
+    def _remove_limit_row(self):
+        if self.remove_current(self.limits_table):
+            self._edited()
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        self._loading = True
+        try:
+            self._set_combo(self.layer_combo, self.app.oc_layer, 0)
+            self._had_env = "env" in own
+            self._had_limits = "modelLimits" in own
+            self.env_table.setRowCount(0)
+            env = own.get("env") if isinstance(own.get("env"), dict) else {}
+            for k, v in env.items():
+                self._add_env_row(str(k), "" if v is None else str(v))
+            self.limits_table.setRowCount(0)
+            limits = own.get("modelLimits") if isinstance(own.get("modelLimits"), dict) else {}
+            for model, spec in limits.items():
+                self._add_limit_row(str(model), spec if isinstance(spec, dict) else {})
+        finally:
+            self._loading = False
+
+    def collect(self, data):
+        env = {}
+        for r in range(self.env_table.rowCount()):
+            name = self.cell_text(self.env_table, r, 0)
+            if not name:
+                continue
+            w = self.env_table.cellWidget(r, 1)
+            env[name] = w.value() if w else ""
+        if env or "env" in data:
+            data["env"] = env
+
+        limits = {}
+        for r in range(self.limits_table.rowCount()):
+            item = self.limits_table.item(r, 0)
+            model = item.text().strip() if item else ""
+            if not model:
+                continue
+            spec = self.preserved(item)     # unknown sub-keys survive
+            for col, key in ((1, "contextWindow"), (2, "maxOutputTokens")):
+                text = self.cell_text(self.limits_table, r, col)
+                if text.isdigit():
+                    spec[key] = int(text)
+                else:
+                    spec.pop(key, None)
+            limits[model] = spec
+        if limits or "modelLimits" in data:
+            data["modelLimits"] = limits
 # openclaude adapter registration + session hooks.
 #
 # openclaude's config topology (layered settings.json + a global file) differs
@@ -8246,14 +8662,18 @@ def _openclaude_make_tabs(win):
     mcp_tab = OpenclaudeMcpTab(win)
     plugins_tab = OpenclaudePluginsTab(win)
     hooks_tab = OpenclaudeHooksTab(win)
+    perms_tab = OpenclaudePermissionsTab(win)
+    envlim_tab = OpenclaudeEnvLimitsTab(win)
     raw_tab = OpenclaudeRawTab(win)
     win._agent_tabs = [settings_tab, models_tab, mcp_tab, plugins_tab,
-                       hooks_tab, raw_tab]
+                       hooks_tab, perms_tab, envlim_tab, raw_tab]
     win._agent_settings_tab = settings_tab
     win._agent_models_tab = models_tab
     win._agent_mcp_tab = mcp_tab
     win._agent_plugins_tab = plugins_tab
     win._agent_hooks_tab = hooks_tab
+    win._agent_perms_tab = perms_tab
+    win._agent_envlim_tab = envlim_tab
     win._agent_raw_tab = raw_tab
     return [
         (settings_tab, "Settings", "settings"),
@@ -8261,6 +8681,8 @@ def _openclaude_make_tabs(win):
         (mcp_tab, "MCP", "settings"),
         (plugins_tab, "Plugins", "settings"),
         (hooks_tab, "Hooks", "settings"),
+        (perms_tab, "Permissions", "settings"),
+        (envlim_tab, "Env & Limits", "settings"),
         (raw_tab, "Raw (per layer)", None),
     ]
 
@@ -8347,7 +8769,7 @@ def _openclaude_save(win):
 
     # Form-based save:
     #  - Settings tab writes scalar keys into the selected settings layer
-    #  - Plugins/Hooks tabs write their settings keys into the same layer
+    #  - Plugins/Hooks/Permissions/Env&Limits tabs write into the same layer
     #  - Agent Models tab writes providerProfiles/routing into the global
     #  - MCP tab writes per-scope: user/local -> global, project -> .mcp.json
     layer = win.oc_layer
@@ -8363,6 +8785,8 @@ def _openclaude_save(win):
     win._agent_settings_tab.collect(base)
     win._agent_plugins_tab.collect(base)
     win._agent_hooks_tab.collect(base)
+    win._agent_perms_tab.collect(base)
+    win._agent_envlim_tab.collect(base)
     ok1, msg1 = layered.save_layer(layer, base)
 
     # Only rewrite the global file when a tab that owns global data was actually
@@ -8393,7 +8817,18 @@ def _openclaude_save(win):
         tail += " + .mcp.json"
 
     if ok1 and ok2 and ok3:
-        win.status_bar.showMessage(f"Saved layer '{layer}'{tail}")
+        note = ""
+        dupes = getattr(win._agent_models_tab, "dupe_names", [])
+        if dupes:
+            note += (" — duplicate provider name(s) ignored: "
+                     + ", ".join(dupes) + " (rename to keep both)")
+        if raw._modified:
+            # The raw buffer was edited but wasn't the active tab, so this save
+            # ignored it. Say so instead of letting the user assume it landed.
+            note = (f" — note: unsaved Raw edits for layer "
+                    f"'{raw._current_raw_layer()}' were NOT saved "
+                    f"(open the Raw tab and save again)")
+        win.status_bar.showMessage(f"Saved layer '{layer}'{tail}{note}")
         win.oc_form_dirty = False
     else:
         first_err = next((m for m in (msg1, msg2, msg3) if m), "")

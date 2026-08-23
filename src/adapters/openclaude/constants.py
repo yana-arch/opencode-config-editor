@@ -49,7 +49,7 @@ OPENCLAUDE_SETTINGS_KEYS = {
     "prefersReducedMotion", "processWrapper", "promptSuggestionEnabled", "providerFallbackChain", "providerProfileModelPickerMode",
     "remote", "remoteControlAtStartup", "requireCoworkFullVmSandbox", "requiredMaximumVersion", "requiredMinimumVersion",
     "respectGitignore", "respondToBashCommands", "sandbox", "showClearContextOnPlanAccept", "showThinkingSummaries",
-    "showTurnDuration", "skillListingBudgetFraction", "skillListingMaxDescChars", "skillOverrides", "skipDangerousModePermissionPrompt",
+    "showTurnDuration", "skillListingBudgetFraction", "skillListingMaxDescChars", "skillOverrides", "skipDangerousModePermissionPrompt", "skipFullAccessModePermissionPrompt",
     "skipWebFetchPreflight", "skippedMarketplaces", "skippedPlugins", "smartRouting", "spinnerTipsEnabled",
     "spinnerTipsOverride", "spinnerVerbs", "sponsoredTipsEnabled", "sponsoredTipsFrequency", "sshConfigs",
     "sshHostAllowlist", "statusLine", "strictKnownMarketplaces", "strictPluginOnlyCustomization", "subagentStatusLine",
@@ -76,3 +76,16 @@ OPENCLAUDE_CONFIG_ENV = ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR")
 
 # MCP server scopes and where each is stored.
 OPENCLAUDE_MCP_SCOPES = ("user", "project", "local")
+
+# openclaude embeds the Claude Code settings schema; schemastore publishes the
+# same document. Findings are advisory only (openclaude adds keys of its own,
+# and the schema's top level allows extra properties).
+OPENCLAUDE_SCHEMA_URL = "https://json.schemastore.org/claude-code-settings.json"
+OPENCLAUDE_SCHEMA_CACHE = (Path.home() / ".cache" / APP_NAME_OPENCLAUDE
+                           / "claude-code-settings-schema.json")
+
+# Top-level keys of a project .mcp.json.
+OPENCLAUDE_PROJECT_MCP_KEYS = {"$schema", "mcpServers", "allowedTools", "mcpContextUris"}
+
+# Transports openclaude understands for an MCP server entry.
+OPENCLAUDE_MCP_TYPES = ("stdio", "http", "sse")

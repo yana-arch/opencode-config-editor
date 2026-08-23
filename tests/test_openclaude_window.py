@@ -26,7 +26,9 @@ def oc_win(qapp, tmp_path, monkeypatch):
 
 def test_openclaude_window_builds_with_adapter(oc_win):
     assert oc_win.adapter.name == "openclaude"
-    assert oc_win.tabs.count() == 6            # Settings + Agent Models + MCP + Plugins + Hooks + Raw
+    assert [oc_win.tabs.tabText(i) for i in range(oc_win.tabs.count())] == [
+        "Settings", "Agent Models", "MCP", "Plugins", "Hooks",
+        "Permissions", "Env & Limits", "Raw (per layer)"]
     assert oc_win.oc_layered is not None       # initial_load hook ran
     assert oc_win.oc_layer == "project"
 
@@ -752,3 +754,117 @@ def test_layer_switch_prompts_before_discarding(oc_win, tmp_path, monkeypatch):
     plugins_tab.layer_combo.setCurrentIndex(idx_p)
     layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
     assert layer["model"] == "saved-on-switch"
+
+
+def test_permissions_tab_roundtrip(oc_win, tmp_path):
+    cfg = tmp_path / "cfghome"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps({"permissions": {
+        "allow": ["Bash(ls)", "Read"],
+        "deny": ["Bash(rm -rf /)"],
+        "defaultMode": "acceptEdits",
+        "additionalDirectories": ["~/projects"],
+        "someFutureKey": {"keep": True},
+    }}), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "user"
+    oc_win.refresh_tabs()
+    tab = oc_win._agent_perms_tab
+    assert tab.editors["allow"].toPlainText() == "Bash(ls)\nRead"
+    assert tab.mode_combo.currentData() == "acceptEdits"
+
+    tab.editors["ask"].setPlainText("WebFetch(domain:example.com)")
+    tab.no_bypass_chk.setChecked(True)
+    oc_win._save()
+    perms = json.loads((cfg / "settings.json").read_text())["permissions"]
+    assert perms["ask"] == ["WebFetch(domain:example.com)"]
+    assert perms["allow"] == ["Bash(ls)", "Read"]
+    assert perms["disableBypassPermissionsMode"] is True
+    assert perms["someFutureKey"] == {"keep": True}
+
+
+def test_permissions_tab_absent_stays_absent(oc_win, tmp_path):
+    oc_win._agent_settings_tab.model_edit.setText("sonnet")
+    oc_win._save()
+    proj = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert "permissions" not in proj
+
+
+def test_env_and_model_limits_roundtrip(oc_win, tmp_path):
+    cfg = tmp_path / "cfghome"
+    cfg.mkdir(parents=True, exist_ok=True)
+    (cfg / "settings.json").write_text(json.dumps({
+        "env": {"ANTHROPIC_API_KEY": "sk-secret-env"},
+        "modelLimits": {
+            "假流式-gemini-2.5-pro-search": {"contextWindow": 1048576,
+                                             "maxOutputTokens": 65536,
+                                             "vendorNote": "keep me"},
+        },
+    }), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.oc_layer = "user"
+    oc_win.refresh_tabs()
+    tab = oc_win._agent_envlim_tab
+
+    w = tab.env_table.cellWidget(0, 1)
+    assert "sk-secret-env" not in w.edit.text()      # masked on screen
+    assert w.value() == "sk-secret-env"
+    assert tab.cell_text(tab.limits_table, 0, 1) == "1048576"
+
+    tab._add_env_row("OPENAI_BASE_URL", "https://api.example/v1")
+    tab.limits_table.item(0, 0).setText("假流式-gemini-2.5-pro-search")
+    tab._add_limit_row("new-model", {})
+    r = tab.limits_table.rowCount() - 1
+    tab.limits_table.item(r, 1).setText("200000")
+    tab.limits_table.item(r, 2).setText("8192")
+    oc_win._save()
+
+    saved = json.loads((cfg / "settings.json").read_text())
+    assert saved["env"] == {"ANTHROPIC_API_KEY": "sk-secret-env",
+                            "OPENAI_BASE_URL": "https://api.example/v1"}
+    cjk = saved["modelLimits"]["假流式-gemini-2.5-pro-search"]
+    assert cjk["contextWindow"] == 1048576
+    assert cjk["vendorNote"] == "keep me"
+    assert saved["modelLimits"]["new-model"] == {"contextWindow": 200000,
+                                                 "maxOutputTokens": 8192}
+
+
+def test_duplicate_provider_name_warns(oc_win, tmp_path):
+    tab = oc_win._agent_models_tab
+    tab._add_model_row({"name": "dup", "model": "m1"})
+    tab._add_model_row({"name": "dup", "model": "m2"})
+    oc_win._save()
+    saved = json.loads((tmp_path / "cfghome.json").read_text())
+    names = [p["name"] for p in saved["providerProfiles"]]
+    assert names == ["dup"]                       # first row wins
+    assert "duplicate provider name" in oc_win.status_bar.currentMessage().lower()
+
+
+def test_raw_pending_edits_warned_on_form_save(oc_win, tmp_path):
+    raw = oc_win._agent_raw_tab
+    raw.editor.setPlainText('{"model": "typed-in-raw"}')   # marks _modified
+    oc_win.tabs.setCurrentIndex(0)                          # form tab active
+    oc_win._agent_settings_tab.model_edit.setText("from-form")
+    oc_win._save()
+    assert "Raw edits" in oc_win.status_bar.currentMessage()
+    layer = json.loads((tmp_path / "proj" / ".openclaude" / "settings.json").read_text())
+    assert layer["model"] == "from-form"
+
+
+def test_raw_tab_reports_json_errors_and_warnings(oc_win, tmp_path):
+    raw = oc_win._agent_raw_tab
+    raw.editor.setPlainText("{broken")
+    raw._validate()
+    assert raw.status_label.text().startswith("JSON error:")
+
+    raw.editor.setPlainText('{"model": "opus", "totallyMadeUp": 1}')
+    raw._validate()
+    assert "totallyMadeUp" in raw.status_label.text()
+
+    raw.editor.setPlainText('{"hooks": []}')
+    raw._validate()
+    assert raw.status_label.text().startswith("error:")
+
+    raw.editor.setPlainText('{"model": "opus"}')
+    raw._validate()
+    assert raw.status_label.text() == "Valid JSON"

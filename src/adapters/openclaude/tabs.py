@@ -182,6 +182,14 @@ class OpenclaudeRawTab(BaseTab):
         self._modified = False
         layout.addWidget(self.editor)
 
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self._validate_timer = QTimer(self)
+        self._validate_timer.setSingleShot(True)
+        self._validate_timer.setInterval(400)
+        self._validate_timer.timeout.connect(self._validate)
+
     def _on_layer_change(self, *_):
         new_layer = self.layer_combo.currentData()
         old_layer = self._current_raw_layer()
@@ -201,6 +209,35 @@ class OpenclaudeRawTab(BaseTab):
     def _on_text(self, *_):
         self._modified = True
         self.app.status_bar.showMessage("Unsaved changes…")
+        self._validate_timer.start()
+
+    def _validate(self):
+        text = self.editor.toPlainText().strip()
+        if not text:
+            self._show_findings([], [])
+            return
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            self.status_label.setStyleSheet("color: #c0392b;")
+            self.status_label.setText(f"JSON error: {e}")
+            return
+        errors, warnings = openclaude_findings(
+            data, self._current_raw_layer(), getattr(self.app, "validator", None))
+        self._show_findings(errors, warnings)
+
+    def _show_findings(self, errors, warnings):
+        msgs = [f"error: {m}" for m in errors] + [f"warning: {m}" for m in warnings]
+        if not msgs:
+            self.status_label.setStyleSheet("color: gray;")
+            self.status_label.setText("Valid JSON")
+            return
+        shown = msgs[:5]
+        if len(msgs) > len(shown):
+            shown.append(f"... and {len(msgs) - len(shown)} more")
+        self.status_label.setStyleSheet(
+            "color: #c0392b;" if errors else "color: #b9770e;")
+        self.status_label.setText("\n".join(shown))
 
     def _current_raw_layer(self):
         return getattr(self, "_raw_layer", None) or self.layer_combo.currentData() or "project"
@@ -218,6 +255,7 @@ class OpenclaudeRawTab(BaseTab):
             data = layered.layer(layer)
         self._set_text(self.editor, json.dumps(data, indent=2, ensure_ascii=False))
         self._modified = False
+        self._validate()
 
     def parsed(self):
         """Return (layer, dict) from the editor, or (layer, None) if invalid."""
@@ -242,6 +280,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         super().__init__(app)
         self._dirty = False
         self._extra_profiles = []   # non-dict providerProfiles entries, kept verbatim
+        self.dupe_names = []        # duplicate profile names skipped by collect
         self._had_profiles = False  # global file already had a providerProfiles key
         self._had_agent_models = False
         self._had_active = False    # global file already had activeProviderProfileId
@@ -398,10 +437,14 @@ class OpenclaudeAgentModelsTab(BaseTab):
         profiles = list(self._extra_profiles)  # re-emit preserved non-dict entries
         legacy_models = {}
         seen_names = set()
+        dupes = set()
         for r in range(self.models_table.rowCount()):
             name_item = self.models_table.item(r, 0)
             name = name_item.text().strip() if name_item else ""
-            if not name or name in seen_names:
+            if not name:
+                continue
+            if name in seen_names:
+                dupes.add(name)      # reported below; first row wins
                 continue
             seen_names.add(name)
             orig = self.preserved(name_item) if name_item else {}
@@ -457,6 +500,9 @@ class OpenclaudeAgentModelsTab(BaseTab):
             if agent and key:
                 routing[agent] = key
         self._put(data, "agentRouting", routing, {})
+
+        # Reported by the save hook so the success message doesn't overwrite it.
+        self.dupe_names = sorted(dupes)
 
     def _cell(self, r, c):
         return self.cell_text(self.models_table, r, c)
@@ -1284,3 +1330,277 @@ class OpenclaudeHooksTab(BaseTab):
 
         if out or "hooks" in data:
             data["hooks"] = out
+
+
+class OpenclaudePermissionsTab(BaseTab):
+    """Editor for settings.json `permissions` on the selected layer.
+
+    Verified shape (claude-code-settings schema embedded by openclaude):
+      permissions: {allow[], deny[], ask[], additionalDirectories[],
+                    defaultMode: enum, disableBypassPermissionsMode?,
+                    disableAutoMode?}
+    Rules are plain strings (e.g. "Bash(ls)"), one per line here. Unknown
+    sub-keys of `permissions` are preserved on save.
+    """
+
+    MODES = ("", "default", "manual", "acceptEdits", "plan", "auto",
+             "delegate", "dontAsk", "bypassPermissions")
+    LISTS = (("allow", "allow — permitted operations"),
+             ("deny", "deny — blocked operations"),
+             ("ask", "ask — always confirm"),
+             ("additionalDirectories", "additionalDirectories — extra paths in scope"))
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._loading = False
+        self._orig = {}
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Edit layer:"))
+        self.layer_combo = QComboBox()
+        for lk in ("user", "project", "local"):
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        top.addWidget(self.layer_combo)
+        top.addWidget(QLabel("   defaultMode:"))
+        self.mode_combo = QComboBox()
+        for m in self.MODES:
+            self.mode_combo.addItem(m or "(unset)", m)
+        self.mode_combo.currentIndexChanged.connect(self._edited)
+        top.addWidget(self.mode_combo)
+        top.addStretch()
+        layout.addLayout(top)
+
+        info = QLabel("One rule per line, e.g. Bash(ls), Edit, WebFetch(domain:example.com). "
+                      "Unknown permissions sub-keys are preserved.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: gray;")
+        layout.addWidget(info)
+
+        self.editors = {}
+        for key, label in self.LISTS:
+            layout.addWidget(QLabel(label + ":"))
+            ed = QPlainTextEdit()
+            ed.setTabChangesFocus(True)
+            ed.textChanged.connect(self._edited)
+            self.editors[key] = ed
+            layout.addWidget(ed)
+
+        flags = QHBoxLayout()
+        self.no_bypass_chk = QCheckBox("disableBypassPermissionsMode")
+        self.no_auto_chk = QCheckBox("disableAutoMode")
+        for c in (self.no_bypass_chk, self.no_auto_chk):
+            c.stateChanged.connect(self._edited)
+            flags.addWidget(c)
+        flags.addStretch()
+        layout.addLayout(flags)
+
+    def _on_layer_change(self, *_):
+        _layer_change_guarded(self, self.layer_combo)
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.oc_form_dirty = True
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    @staticmethod
+    def _lines(text):
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        perms = own.get("permissions") if isinstance(own.get("permissions"), dict) else {}
+        self._loading = True
+        try:
+            self._set_combo(self.layer_combo, self.app.oc_layer, 0)
+            self._orig = dict(perms)
+            for key, _label in self.LISTS:
+                val = perms.get(key)
+                lines = [str(v) for v in val] if isinstance(val, list) else []
+                self._set_text(self.editors[key], "\n".join(lines))
+            mode = str(perms.get("defaultMode", "") or "")
+            if mode and self.mode_combo.findData(mode) < 0:
+                self.mode_combo.addItem(f"(current) {mode}", mode)
+            self._set_combo(self.mode_combo, mode, 0)
+            self._set_checked(self.no_bypass_chk, perms.get("disableBypassPermissionsMode"))
+            self._set_checked(self.no_auto_chk, perms.get("disableAutoMode"))
+        finally:
+            self._loading = False
+
+    def collect(self, data):
+        # Start from the layer's own permissions so unknown sub-keys survive.
+        base = data.get("permissions")
+        out = dict(base) if isinstance(base, dict) else {}
+        for key, _label in self.LISTS:
+            items = self._lines(self.editors[key].toPlainText())
+            if items:
+                out[key] = items
+            else:
+                out.pop(key, None)
+        mode = self.mode_combo.currentData() or ""
+        if mode:
+            out["defaultMode"] = mode
+        else:
+            out.pop("defaultMode", None)
+        for chk, key in ((self.no_bypass_chk, "disableBypassPermissionsMode"),
+                         (self.no_auto_chk, "disableAutoMode")):
+            if chk.isChecked():
+                out[key] = True
+            elif key in out:
+                out[key] = False
+        if out:
+            data["permissions"] = out
+        else:
+            data.pop("permissions", None)
+
+
+class OpenclaudeEnvLimitsTab(BaseTab):
+    """Editors for settings.json `env` and `modelLimits` on the selected layer.
+
+      env: {VAR: "string"}  — values are masked (they routinely hold API keys)
+      modelLimits: {model: {contextWindow: int, maxOutputTokens: int}}
+    Unknown per-model sub-keys are preserved.
+    """
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._loading = False
+        layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Edit layer:"))
+        self.layer_combo = QComboBox()
+        for lk in ("user", "project", "local"):
+            self.layer_combo.addItem(lk, lk)
+        self.layer_combo.currentIndexChanged.connect(self._on_layer_change)
+        top.addWidget(self.layer_combo)
+        top.addStretch()
+        layout.addLayout(top)
+
+        layout.addWidget(QLabel("env — environment variables applied to every session "
+                                "(values masked; click the eye to reveal):"))
+        self.env_table = QTableWidget(0, 2)
+        self.env_table.setHorizontalHeaderLabels(["variable", "value"])
+        self.env_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.env_table)
+        ebtn = QHBoxLayout()
+        add_e = QPushButton("Add variable")
+        add_e.clicked.connect(lambda: self._add_env_row())
+        del_e = QPushButton("Remove selected")
+        del_e.clicked.connect(self._remove_env_row)
+        ebtn.addWidget(add_e)
+        ebtn.addWidget(del_e)
+        ebtn.addStretch()
+        layout.addLayout(ebtn)
+
+        layout.addWidget(QLabel("modelLimits — per-model context window / max output tokens "
+                                "(for OpenAI-compatible models missing from the catalog):"))
+        self.limits_table = QTableWidget(0, 3)
+        self.limits_table.setHorizontalHeaderLabels(
+            ["model", "contextWindow", "maxOutputTokens"])
+        self.limits_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        layout.addWidget(self.limits_table)
+        lbtn = QHBoxLayout()
+        add_l = QPushButton("Add model")
+        add_l.clicked.connect(lambda: self._add_limit_row())
+        del_l = QPushButton("Remove selected")
+        del_l.clicked.connect(self._remove_limit_row)
+        lbtn.addWidget(add_l)
+        lbtn.addWidget(del_l)
+        lbtn.addStretch()
+        layout.addLayout(lbtn)
+
+        self.env_table.itemChanged.connect(self._edited)
+        self.limits_table.itemChanged.connect(self._edited)
+
+    def _on_layer_change(self, *_):
+        _layer_change_guarded(self, self.layer_combo)
+
+    def _edited(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        self.app.oc_form_dirty = True
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    # --- env rows ---
+    def _add_env_row(self, name="", value=""):
+        r = self.env_table.rowCount()
+        self.env_table.insertRow(r)
+        self.env_table.setItem(r, 0, QTableWidgetItem(name))
+        w = MaskedLineEdit(str(value), field_name="env-value",
+                           placeholder="value", secret=True)
+        w.textChanged.connect(self._edited)
+        self.env_table.setCellWidget(r, 1, w)
+        self._edited()
+
+    def _remove_env_row(self):
+        if self.remove_current(self.env_table):
+            self._edited()
+
+    # --- modelLimits rows ---
+    def _add_limit_row(self, model="", spec=None):
+        spec = spec if isinstance(spec, dict) else {}
+        r = self.limits_table.rowCount()
+        self.limits_table.insertRow(r)
+        item = QTableWidgetItem(model)
+        self.preserve(item, spec)          # keep unknown per-model sub-keys
+        self.limits_table.setItem(r, 0, item)
+        for col, key in ((1, "contextWindow"), (2, "maxOutputTokens")):
+            val = spec.get(key)
+            text = str(val) if isinstance(val, int) and not isinstance(val, bool) else ""
+            self.limits_table.setItem(r, col, QTableWidgetItem(text))
+        self._edited()
+
+    def _remove_limit_row(self):
+        if self.remove_current(self.limits_table):
+            self._edited()
+
+    def refresh(self):
+        layered = getattr(self.app, "oc_layered", None)
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        self._loading = True
+        try:
+            self._set_combo(self.layer_combo, self.app.oc_layer, 0)
+            self._had_env = "env" in own
+            self._had_limits = "modelLimits" in own
+            self.env_table.setRowCount(0)
+            env = own.get("env") if isinstance(own.get("env"), dict) else {}
+            for k, v in env.items():
+                self._add_env_row(str(k), "" if v is None else str(v))
+            self.limits_table.setRowCount(0)
+            limits = own.get("modelLimits") if isinstance(own.get("modelLimits"), dict) else {}
+            for model, spec in limits.items():
+                self._add_limit_row(str(model), spec if isinstance(spec, dict) else {})
+        finally:
+            self._loading = False
+
+    def collect(self, data):
+        env = {}
+        for r in range(self.env_table.rowCount()):
+            name = self.cell_text(self.env_table, r, 0)
+            if not name:
+                continue
+            w = self.env_table.cellWidget(r, 1)
+            env[name] = w.value() if w else ""
+        if env or "env" in data:
+            data["env"] = env
+
+        limits = {}
+        for r in range(self.limits_table.rowCount()):
+            item = self.limits_table.item(r, 0)
+            model = item.text().strip() if item else ""
+            if not model:
+                continue
+            spec = self.preserved(item)     # unknown sub-keys survive
+            for col, key in ((1, "contextWindow"), (2, "maxOutputTokens")):
+                text = self.cell_text(self.limits_table, r, col)
+                if text.isdigit():
+                    spec[key] = int(text)
+                else:
+                    spec.pop(key, None)
+            limits[model] = spec
+        if limits or "modelLimits" in data:
+            data["modelLimits"] = limits

@@ -222,10 +222,17 @@ class Validator:
 
     def _load_schema(self, kind: str = "opencode") -> Optional[dict]:
         """Load schema (kind-aware) with caching and periodic refresh"""
+        url, cache_path = self._schema_source(kind)
+        return self.schema_from(url, cache_path, kind)
+
+    def schema_from(self, url: str, cache_path: Path, kind: str) -> Optional[dict]:
+        """Load any JSON Schema by url, cached in memory and on disk.
+
+        Adapters pass their own schema here so core stays agent-agnostic.
+        """
         if not HAVE_JSONSCHEMA:
             return None
 
-        url, cache_path = self._schema_source(kind)
         current_time = time.time()
         if self.schemas.get(kind) is not None and (current_time - self.last_schema_fetch) < self.schema_cache_duration:
             return self.schemas[kind]

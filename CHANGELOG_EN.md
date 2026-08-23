@@ -10,6 +10,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/en/2.0.0/).
 
+## [4.4.0] - 2026-08-23
+
+Second agent supported: **openclaude** (layered settings.json), via a new adapter layer.
+
+### Added
+
+- **openclaude adapter** — `build.py` now emits **two standalone files** from the same
+  source: `opencode-config-editor.py` (defaults to opencode) and
+  `openclaude-config-editor.py` (defaults to openclaude). Switch at runtime with
+  `--adapter=openclaude` or the `CONFIG_EDITOR_ADAPTER` environment variable.
+- **Layered config**: user → project → local (later wins), plus a **read-only policy
+  layer** `managed-settings.json` (+ `managed-settings.d/*.json` drop-ins) with the
+  highest precedence. Text fields show inherited values as grey placeholders.
+- **8 openclaude tabs**: Settings, Agent Models, MCP, Plugins, Hooks, Permissions,
+  Env & Limits, Raw (per layer).
+- **All four MCP scopes**: `user` → `~/.openclaude.json`, `project` → `.mcp.json`,
+  `local` → `projects[<path>].mcpServers`, `policy` → `managed-mcp.json` (read-only).
+  Edit stdio/http transport, command/url, args, env and headers.
+- **Plugins/marketplaces**: `enabledPlugins`, `extraKnownMarketplaces`
+  (github/git/url/file/directory/npm with ref, autoUpdate), cached-marketplace listing.
+- **Structured hooks**: one row per hook entry (event · matcher · type ·
+  command/url/prompt · timeout); untouched events round-trip byte-for-byte.
+- **Provider profiles**: `providerProfiles` with masked apiKey, active-provider picker
+  (`activeProviderProfileId`), fallback chain, agent routing.
+- **Secret masking for MCP env/headers** — they usually carry API keys; masked by
+  default, click 👁 to reveal.
+- **Unsaved-work guard**: switching config layers with pending edits prompts
+  Save / Discard / Cancel (also covers the Raw tab buffer).
+- **`permissions` editor**: four rule lists (`allow`/`deny`/`ask`/
+  `additionalDirectories`), `defaultMode` (including the undocumented
+  `manual`/`delegate`/`dontAsk` modes), and the `disableBypassPermissionsMode`/
+  `disableAutoMode` flags; unknown sub-keys are preserved.
+- **`env` and `modelLimits` editors**: env values are masked; modelLimits edits
+  per-model `contextWindow`/`maxOutputTokens` while preserving unknown sub-keys.
+- **Live checking in the Raw tab**: shape errors (red) plus unknown-key and official
+  `claude-code-settings.json` schema warnings (amber), per layer — `~/.openclaude.json`
+  is exempt from unknown-key warnings since it is mostly app state. Warnings never
+  block a save.
+- **Corrupt-JSON write guard**: a file that exists but fails to parse is never
+  overwritten with `{}` — the save is refused and points at the Raw tab.
+
+### Changed
+
+- **Shared adapter layer** (`core/adapter.py`): `AdapterSpec` + registry for targets,
+  tabs, known keys and session hooks (initial_load / refresh / save). opencode now goes
+  through the same layer with no behavior change.
+- `BaseTab` gained shared helpers: `_set_text`, `cell_text`, `remove_current`,
+  `preserve`/`preserved` — consolidating duplicated tab code.
+- `atomic_write_json()` extracted into `core/config.py` and shared by `ConfigFile.save`
+  and the layered writer; the temp file is cleaned up on failure.
+- The openclaude key vocabulary is derived from `SettingsSchema` in the openclaude
+  v0.28.0 binary and the official `claude-code-settings.json` schema (159 keys).
+
+### Fixed
+
+- App state in `~/.openclaude.json` (`numStartups`, `tipsHistory`, `projects`, …) is no
+  longer clobbered when saving providers/MCP.
+- `MaskedLineEdit` no longer swallows text typed while masked, and the 👁 toggle no
+  longer overwrites in-progress edits.
+- Hooks: newly added rows are no longer lost to value-based row matching; deleting every
+  original entry and adding a new one no longer drops the whole event.
+- Removed a leftover duplicate MCP editor in the Agent Models tab (it could clobber
+  servers edited in the dedicated MCP tab).
+- Editing cells of existing table rows now marks the document dirty — such changes could
+  previously be skipped on save.
+- Duplicate provider names are now reported in the status bar instead of dropped silently.
+- A form save while the Raw tab holds unsaved text now says the Raw edits were NOT saved.
+- Added `skipFullAccessModePermissionPrompt` to the known-key set (it is real in the
+  binary) — the editor's own output was previously flagged as an unknown key.
+
 ## [4.3.1] - 2026-08-20
 
 ### Changed

@@ -152,3 +152,79 @@ def _openclaude_targets(cwd, config_dir=None):
         ("Project .mcp.json", cf.project_mcp_file, "project-mcp"),
         ("Managed settings (policy, read-only)", cf.managed_file, "managed"),
     ]
+
+
+def openclaude_findings(data, layer, validator=None):
+    """Check one openclaude layer: returns (errors, warnings).
+
+    Errors are container-shape problems openclaude itself would choke on.
+    Warnings are advisory: unknown keys and JSON-Schema findings never block a
+    save, because openclaude ships keys the published schema does not list.
+    """
+    errors, warnings = [], []
+    if not isinstance(data, dict):
+        return ["Root must be a JSON object."], []
+
+    def want(key, types, label):
+        val = data.get(key)
+        if key in data and not isinstance(val, types):
+            errors.append(f"'{key}' must be {label}.")
+            return None
+        return val
+
+    if layer in ("global", "project-mcp"):
+        servers = want("mcpServers", dict, "an object")
+        for name, spec in (servers or {}).items():
+            if not isinstance(spec, dict):
+                errors.append(f"mcpServers[{name!r}] must be an object.")
+                continue
+            stype = spec.get("type")
+            if stype is not None and stype not in OPENCLAUDE_MCP_TYPES:
+                warnings.append(f"mcpServers[{name!r}].type {stype!r} is not one of "
+                                + "/".join(OPENCLAUDE_MCP_TYPES))
+            if "args" in spec and not isinstance(spec["args"], list):
+                errors.append(f"mcpServers[{name!r}].args must be an array.")
+        profiles = want("providerProfiles", list, "an array")
+        for i, prof in enumerate(profiles or []):
+            if isinstance(prof, dict) and not prof.get("id"):
+                warnings.append(f"providerProfiles[{i}] has no 'id'; "
+                                "activeProviderProfileId cannot point at it")
+        if layer == "project-mcp":
+            unknown = sorted(k for k in data if k not in OPENCLAUDE_PROJECT_MCP_KEYS)
+            if unknown:
+                warnings.append("unknown .mcp.json key(s): " + ", ".join(unknown))
+        return errors, warnings
+
+    hooks = want("hooks", dict, "an object")
+    for event, groups in (hooks or {}).items():
+        if not isinstance(groups, list):
+            errors.append(f"hooks[{event!r}] must be an array of matcher groups.")
+    perms = want("permissions", dict, "an object")
+    for key in ("allow", "deny", "ask", "additionalDirectories"):
+        if isinstance(perms, dict) and key in perms and not isinstance(perms[key], list):
+            errors.append(f"permissions.{key} must be an array of strings.")
+    env = want("env", dict, "an object")
+    for name, val in (env or {}).items():
+        if not isinstance(val, str):
+            warnings.append(f"env[{name!r}] should be a string, got {type(val).__name__}")
+    limits = want("modelLimits", dict, "an object")
+    for model, spec in (limits or {}).items():
+        if not isinstance(spec, dict):
+            errors.append(f"modelLimits[{model!r}] must be an object.")
+    if "statusLine" in data and not isinstance(data["statusLine"], (dict, bool)):
+        errors.append("'statusLine' must be an object or a boolean.")
+
+    unknown = sorted(k for k in data if k not in OPENCLAUDE_SETTINGS_KEYS)
+    if unknown:
+        warnings.append("unknown settings key(s): " + ", ".join(unknown))
+
+    if validator is not None and not errors:
+        schema = validator.schema_from(OPENCLAUDE_SCHEMA_URL, OPENCLAUDE_SCHEMA_CACHE,
+                                      "openclaude-settings")
+        if schema is not None:
+            try:
+                for e in jsonschema.Draft7Validator(schema).iter_errors(data):
+                    warnings.append(f"schema: {e.message} (path: {_path_of(e)})")
+            except Exception as ex:
+                warnings.append(f"schema error: {ex}")
+    return errors, warnings

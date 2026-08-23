@@ -12,14 +12,18 @@ def _openclaude_make_tabs(win):
     mcp_tab = OpenclaudeMcpTab(win)
     plugins_tab = OpenclaudePluginsTab(win)
     hooks_tab = OpenclaudeHooksTab(win)
+    perms_tab = OpenclaudePermissionsTab(win)
+    envlim_tab = OpenclaudeEnvLimitsTab(win)
     raw_tab = OpenclaudeRawTab(win)
     win._agent_tabs = [settings_tab, models_tab, mcp_tab, plugins_tab,
-                       hooks_tab, raw_tab]
+                       hooks_tab, perms_tab, envlim_tab, raw_tab]
     win._agent_settings_tab = settings_tab
     win._agent_models_tab = models_tab
     win._agent_mcp_tab = mcp_tab
     win._agent_plugins_tab = plugins_tab
     win._agent_hooks_tab = hooks_tab
+    win._agent_perms_tab = perms_tab
+    win._agent_envlim_tab = envlim_tab
     win._agent_raw_tab = raw_tab
     return [
         (settings_tab, "Settings", "settings"),
@@ -27,6 +31,8 @@ def _openclaude_make_tabs(win):
         (mcp_tab, "MCP", "settings"),
         (plugins_tab, "Plugins", "settings"),
         (hooks_tab, "Hooks", "settings"),
+        (perms_tab, "Permissions", "settings"),
+        (envlim_tab, "Env & Limits", "settings"),
         (raw_tab, "Raw (per layer)", None),
     ]
 
@@ -113,7 +119,7 @@ def _openclaude_save(win):
 
     # Form-based save:
     #  - Settings tab writes scalar keys into the selected settings layer
-    #  - Plugins/Hooks tabs write their settings keys into the same layer
+    #  - Plugins/Hooks/Permissions/Env&Limits tabs write into the same layer
     #  - Agent Models tab writes providerProfiles/routing into the global
     #  - MCP tab writes per-scope: user/local -> global, project -> .mcp.json
     layer = win.oc_layer
@@ -129,6 +135,8 @@ def _openclaude_save(win):
     win._agent_settings_tab.collect(base)
     win._agent_plugins_tab.collect(base)
     win._agent_hooks_tab.collect(base)
+    win._agent_perms_tab.collect(base)
+    win._agent_envlim_tab.collect(base)
     ok1, msg1 = layered.save_layer(layer, base)
 
     # Only rewrite the global file when a tab that owns global data was actually
@@ -159,7 +167,18 @@ def _openclaude_save(win):
         tail += " + .mcp.json"
 
     if ok1 and ok2 and ok3:
-        win.status_bar.showMessage(f"Saved layer '{layer}'{tail}")
+        note = ""
+        dupes = getattr(win._agent_models_tab, "dupe_names", [])
+        if dupes:
+            note += (" — duplicate provider name(s) ignored: "
+                     + ", ".join(dupes) + " (rename to keep both)")
+        if raw._modified:
+            # The raw buffer was edited but wasn't the active tab, so this save
+            # ignored it. Say so instead of letting the user assume it landed.
+            note = (f" — note: unsaved Raw edits for layer "
+                    f"'{raw._current_raw_layer()}' were NOT saved "
+                    f"(open the Raw tab and save again)")
+        win.status_bar.showMessage(f"Saved layer '{layer}'{tail}{note}")
         win.oc_form_dirty = False
     else:
         first_err = next((m for m in (msg1, msg2, msg3) if m), "")
