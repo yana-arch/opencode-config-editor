@@ -11,7 +11,7 @@ Graphical User Interface (GUI) for coding-agent configuration files. Two agents 
 This application provides a visual way to manage your settings, instead of manual JSON editing,
 featuring schema validation, import/export, and advanced model management.
 
-![Version](https://img.shields.io/badge/version-4.3.1-blue)
+![Version](https://img.shields.io/badge/version-4.4.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8+-blue)
 ![GUI](https://img.shields.io/badge/GUI-PySide6-green)
 

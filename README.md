@@ -11,7 +11,7 @@ Trình chỉnh sửa đồ họa (GUI) cho file cấu hình của các coding ag
 Ứng dụng giúp chỉnh sửa cấu hình một cách trực quan, thay vì phải sửa JSON thủ công, với hỗ trợ
 xác thực theo schema, import/export và nhiều tiện ích khác.
 
-![Version](https://img.shields.io/badge/version-4.3.1-blue)
+![Version](https://img.shields.io/badge/version-4.4.0-blue)
 ![Python](https://img.shields.io/badge/python-3.8+-blue)
 ![GUI](https://img.shields.io/badge/GUI-PySide6-green)
 
