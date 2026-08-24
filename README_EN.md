@@ -11,7 +11,7 @@ Graphical User Interface (GUI) for coding-agent configuration files. Two agents 
 This application provides a visual way to manage your settings, instead of manual JSON editing,
 featuring schema validation, import/export, and advanced model management.
 
-![Version](https://img.shields.io/badge/version-4.4.0-blue)
+![Version](https://img.shields.io/badge/version-4.4.1-blue)
 ![Python](https://img.shields.io/badge/python-3.8+-blue)
 ![GUI](https://img.shields.io/badge/GUI-PySide6-green)
 
@@ -33,13 +33,17 @@ featuring schema validation, import/export, and advanced model management.
 - **10 Specialized Tabs**: General, Runtime, Agents, Commands, Providers, MCP Servers, Plugins, Permissions, TUI, Raw JSON.
 - **Advanced Model Management**: Add/Edit/Remove models, bulk editing, and a model catalog with preview and filtering.
 - **Import/Export**: Easily import/export providers, MCP servers, and plugins with conflict resolution.
-- **Fetch models from a provider's API** (the *Fetch from API* button inside each provider's
-  **Models** dialog, opened via *Models...* on the Providers tab): pulls the model list
-  straight from the endpoint, persists `options.baseURL` + `options.apiKey` and picks the
-  right `npm` package; works for existing providers too (a **Status** column marks each row
-  `new`/`existing`, configured specs are never overwritten, an opt-in **Sync** checkbox
-  removes models the API no longer lists, and freshly added models are catalog-normalized
-  immediately).
+- **Fetch models from a provider's API** — two entry points:
+  - The *+ Fetch from API* button on the **Providers** toolbar: **adds a brand-new provider**
+    by pulling its model list from the endpoint (the provider key is editable in the dialog),
+    followed by a single catalog auto-match review (with reference-provider and saved-mapping
+    fallback).
+  - The *Fetch from API* button inside a provider's **Models** dialog (opened via *Models...*):
+    **updates an existing provider's models**, pre-filling `baseURL`/`apiKey` from its config.
+  Both persist `options.baseURL` + `options.apiKey` and pick the right `npm` package; a
+  **Status** column marks each row `new`/`existing`, configured specs are never overwritten,
+  an opt-in **Sync** checkbox removes models the API no longer lists, and freshly added models
+  are catalog-normalized immediately.
 - **Undo/Redo**: Full history support for all operations (100 steps limit).
 - **Bulk Operations**: Enable/disable plugins and MCP servers in batches.
 

@@ -19,6 +19,7 @@ class ProvidersTab(QWidget):
 
         for text, slot in [
             ("+ Add", self._add_provider),
+            ("+ Fetch from API", self._fetch_new_provider),
             ("Import", self._import_providers),
             ("Export", self._export_providers),
             ("Enable All", lambda: self._set_all_enabled(True)),
@@ -261,6 +262,157 @@ class ProvidersTab(QWidget):
         QMessageBox.information(
             self, "Import Complete",
             f"Added {added} new providers, updated {updated} existing providers"
+        )
+
+    def _fetch_new_provider(self):
+        """Add a NEW provider by fetching its model list from an API, then
+        auto-match the fetched models against the catalog.
+
+        Updating an existing provider's models lives in that provider's
+        Models... dialog ("Fetch from API"); this toolbar entry is for
+        bringing in a provider that isn't in the config yet (the provider
+        key is editable in the dialog).
+        """
+        self.app.snapshot_state()
+
+        # Fill the dialog's reference-provider combo (silently loads bundled catalog).
+        try_load_bundled_catalog(self.app.model_catalog)
+        providers = self.app.cfg.data.setdefault("provider", {})
+        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog,
+                                        providers=providers)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        key = dlg.key_edit.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Fetch", "Provider key cannot be empty.")
+            return
+
+        selected = dlg.selected_models
+        if not selected:
+            QMessageBox.information(self, "Fetch", "No models selected.")
+            return
+
+        reference = dlg.reference_provider
+
+        existing_cfg = providers.get(key)
+        existing_models = {}
+        if isinstance(existing_cfg, dict) and isinstance(existing_cfg.get("models"), dict):
+            existing_models = existing_cfg["models"]
+
+        base_url = dlg.url_edit.text().strip()
+        prov, summary = apply_fetched_provider(
+            providers, key, selected,
+            base_url=base_url,
+            api_key=dlg.apikey_edit.text().strip(),
+            save_api_key=dlg.save_apikey_check.isChecked(),
+            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+
+        removed = []
+        if dlg.sync_check.isChecked():
+            stale = stale_configured_models(existing_models, dlg.fetched_models)
+            if stale:
+                shown = ", ".join(stale[:8])
+                if len(stale) > 8:
+                    shown += f", ... (+{len(stale) - 8} more)"
+                if _confirm(self, "Sync Models",
+                            f"Remove {len(stale)} configured model(s) the API no "
+                            f"longer lists?\n{shown}"):
+                    for mid in stale:
+                        prov["models"].pop(mid, None)
+                    removed = stale
+
+        self.app.mark_dirty()
+        self._update_table()
+
+        # Auto-match against the catalog in ONE review dialog (no per-model prompts).
+        if not self.app.model_catalog.loaded():
+            if not self.app._ensure_catalog():
+                QMessageBox.information(
+                    self, "Fetch Complete",
+                    f"'{key}': added {len(summary['added'])} new model(s), "
+                    f"kept {len(summary['kept'])} configured. "
+                    "Catalog not loaded, skipped auto-match.")
+                return
+
+        catalog = self.app.model_catalog
+        settings = SettingsManager()
+        mappings = settings.get_reference_mappings()
+        entries = []       # (model_id, old_spec, new_spec|None, status)
+        ambiguous_data = {}
+        fallback_data = {}  # {model_id: ModelFormat}
+
+        for mid in sorted(prov["models"]):
+            matches = catalog.find_model(mid)
+            if not matches:
+                fmt = None
+                # 1. Previously persisted manual/auto mapping wins.
+                saved = mappings.get(f"{key}/{mid}")
+                if saved:
+                    saved_matches = catalog.find_model(saved)
+                    if saved_matches:
+                        fmt = _sort_matches(saved_matches, reference or key)[0]
+                # 2. Reference provider / normalized-id / prefix fallback.
+                if fmt is None:
+                    fmt = _find_fallback(mid, reference, catalog)
+                if fmt is not None:
+                    merged = _merge_model_spec(
+                        prov["models"][mid], build_spec_from_format(fmt), overwrite=False)
+                    entries.append((mid, dict(prov["models"][mid]), merged,
+                                    f"fallback:{fmt.provider}"))
+                    fallback_data[mid] = fmt
+                else:
+                    entries.append((mid, dict(prov["models"][mid]), None, "unknown"))
+                continue
+            chosen = _resolve_match(matches, key, mid)
+            if chosen is None:
+                entries.append((mid, dict(prov["models"][mid]), None, "ambiguous"))
+                ambiguous_data[mid] = (key, matches)
+                continue
+            merged = _merge_model_spec(
+                prov["models"][mid], build_spec_from_format(chosen), overwrite=False)
+            status = "matched" if merged != (prov["models"][mid] or {}) else "unchanged"
+            entries.append((mid, dict(prov["models"][mid]), merged, status))
+
+        if not any(e[2] is not None or e[3] == "ambiguous" for e in entries):
+            QMessageBox.information(
+                self, "Fetch & Match",
+                f"'{key}': added {len(summary['added'])} new model(s), "
+                f"kept {len(summary['kept'])} configured. "
+                "None matched the catalog.")
+            return
+
+        preview = MatchFormatPreviewDialog(
+            self, entries, ambiguous_data, fallback_data=fallback_data, catalog=catalog)
+        if preview.exec() != QDialog.Accepted:
+            return
+
+        applied = 0
+        for mid, old_spec, new_spec, status in preview.selected_entries:
+            if status == "ambiguous":
+                new_spec = preview.resolved_specs.get(mid, new_spec)
+            elif status == "mapped":
+                new_spec = preview.mapped_specs.get(mid, new_spec)
+                if mid in preview.mapped_ids:
+                    settings.add_reference_mapping(key, mid, preview.mapped_ids[mid])
+            elif status.startswith("fallback:"):
+                fmt = fallback_data.get(mid)
+                if fmt is not None:
+                    settings.add_reference_mapping(key, mid, fmt.model_id)
+            if new_spec is None:
+                continue
+            prov["models"][mid] = _merge_model_spec(
+                prov["models"][mid], new_spec, overwrite=False)
+            applied += 1
+
+        self.app.mark_dirty()
+        self._update_table()
+        sync_note = f", removed {len(removed)} stale" if removed else ""
+        QMessageBox.information(
+            self, "Fetch & Match Complete",
+            f"'{key}': added {len(summary['added'])} new model(s), "
+            f"kept {len(summary['kept'])} configured{sync_note}, "
+            f"normalized {applied} from catalog."
         )
 
     def _export_providers(self):

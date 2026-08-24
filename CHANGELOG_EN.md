@@ -10,6 +10,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/en/2.0.0/).
 
+
+## [4.4.1] - 2026-08-24
+
+### Added
+- **Restored + Fetch from API button**: Re-added the toolbar button to create brand-new providers from API (supporting the full catalog normalization flow).
+- **Aliases support in Model Catalog**: Models can now be matched via aliases defined in the catalog.
+
+### Changed
+- **Enhanced Model Catalog Matching**: Smarter fuzzy matching that automatically strips prefixes (google/, zh-...) and suffixes (-thinking, -vision, date-codes...) for better accuracy.
+- **Separate Fetch entry points**: The Fetch button inside the Models dialog is for updates; the toolbar button is for adding new providers.
+
 ## [4.4.0] - 2026-08-23
 
 Second agent supported: **openclaude** (layered settings.json), via a new adapter layer.

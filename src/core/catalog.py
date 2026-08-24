@@ -10,6 +10,7 @@ class ModelCatalog:
         self.last_updated = None
         self._formats_cache = None
         self._model_index = {}  # model_id -> [provider_id, ...]
+        self.normalized_index = {} # normalized_id -> [model_id, ...]
 
     def loaded(self) -> bool:
         """Check if catalog is loaded"""
@@ -63,9 +64,27 @@ class ModelCatalog:
         self.raw, self.by_provider, self.flat = data, by_provider, flat
         self._formats_cache = None
         self._model_index = {}
+        self.normalized_index = {}
         for pid, models in by_provider.items():
-            for mid in models:
+            for mid, spec in models.items():
                 self._model_index.setdefault(mid, []).append(pid)
+                # Phase 2: Aliases
+                if isinstance(spec, dict) and "aliases" in spec:
+                    for alias in spec["aliases"]:
+                        self._model_index.setdefault(alias, []).append(pid)
+
+        for mid in self.flat:
+            norm_id = _normalize_model_id(mid)
+            if norm_id:
+                self.normalized_index.setdefault(norm_id, []).append(mid)
+            
+            # Phase 2: Aliases in normalized index
+            spec = self.flat[mid]
+            if isinstance(spec, dict) and "aliases" in spec:
+                for alias in spec["aliases"]:
+                    norm_alias = _normalize_model_id(alias)
+                    if norm_alias:
+                        self.normalized_index.setdefault(norm_alias, []).append(mid)
 
     def models_for(self, provider_key: str, npm: str = None) -> dict:
         """Get models for provider"""
@@ -106,11 +125,33 @@ class ModelCatalog:
 
     def find_model(self, model_id: str) -> List["ModelFormat"]:
         """Match a model id across the whole catalog (may match many providers)."""
-        providers = self._model_index.get(model_id)
-        if not providers:
+        matches = set()
+
+        # Exact match
+        if model_id in self._model_index:
+            matches.add(model_id)
+
+        # Normalized match
+        normalized_id = _normalize_model_id(model_id)
+        if normalized_id in self.normalized_index:
+            for original_id in self.normalized_index[normalized_id]:
+                matches.add(original_id)
+
+        if not matches:
             return []
+
+        # Collect all unique ModelFormat objects
+        found_formats = {}
         fmts = self.formats()
-        return [fmts[p][model_id] for p in providers if model_id in fmts.get(p, {})]
+        for mid in matches:
+            providers = self._model_index.get(mid, [])
+            for p in providers:
+                if mid in fmts.get(p, {}):
+                    fmt = fmts[p][mid]
+                    # Use a tuple key to handle the same format object appearing for different providers
+                    found_formats[(fmt.provider, fmt.model_id)] = fmt
+
+        return list(found_formats.values())
 
 def try_load_bundled_catalog(catalog) -> bool:
     """Silently load the bundled models.dev catalog into `catalog` if present.
@@ -481,20 +522,54 @@ def _sort_matches(matches, prov_name):
 
 
 _VERSION_SUFFIX = re.compile(
-    r'[-_](\d{4}[-_]\d{2}[-_]\d{2}'
-    r'|\d{4}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'
+    r'[-_](\d{4}[-_]\d{2}[-_]\d{2}'                   # YYYY-MM-DD
+    r'|\d{4}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'     # YYYYMMDD
+    r'|(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'          # MMDD (common for preview models)
     r'|v\d+(\.\d+)*|latest|preview|stable)$',
     re.IGNORECASE)
 
+# Prefixes and suffixes to strip during normalization. Order matters for suffixes.
+_NORM_PREFIXES = ("google/", "google:", "anthropic.", "openai:", "zh-", "en-")
+_NORM_SUFFIXES = (
+    "-thinking",
+    "-online",
+    "-tool-use", "-tool_use", "-tools",
+    "-preview", "-rc", "-beta", "-alpha", "-canary",
+    "-latest", "-stable",
+    "-chat", "-instruct", "-completions", "-completion",
+    "-code", "-text",
+    "-with-vision", "-vision", "-with",
+)
+
 
 def _normalize_model_id(mid: str) -> str:
-    """Normalize a model id for fuzzy fallback: lowercase, underscores to
-    hyphens, and trailing version/date suffixes stripped."""
+    """Normalize a model id for fuzzy matching: lowercase, hyphens,
+    and trailing version/date/general suffixes stripped."""
     s = str(mid).strip().lower().replace("_", "-")
-    prev = None
-    while prev != s:
-        prev = s
-        s = _VERSION_SUFFIX.sub("", s)
+
+    # Strip prefixes
+    for prefix in _NORM_PREFIXES:
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+
+    # Iteratively strip version/date and general suffixes
+    changed = True
+    while changed:
+        changed = False
+        # Try version/date regex first
+        new_s = _VERSION_SUFFIX.sub("", s)
+        if new_s != s:
+            s = new_s
+            changed = True
+            continue
+        # Try general suffixes
+        for suffix in _NORM_SUFFIXES:
+            if s.endswith(suffix):
+                s = s[:-len(suffix)]
+                changed = True
+                break
+
     return s.strip("-") or str(mid).strip().lower()
 
 

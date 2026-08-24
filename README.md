@@ -11,7 +11,7 @@ Trình chỉnh sửa đồ họa (GUI) cho file cấu hình của các coding ag
 Ứng dụng giúp chỉnh sửa cấu hình một cách trực quan, thay vì phải sửa JSON thủ công, với hỗ trợ
 xác thực theo schema, import/export và nhiều tiện ích khác.
 
-![Version](https://img.shields.io/badge/version-4.4.0-blue)
+![Version](https://img.shields.io/badge/version-4.4.1-blue)
 ![Python](https://img.shields.io/badge/python-3.8+-blue)
 ![GUI](https://img.shields.io/badge/GUI-PySide6-green)
 
@@ -34,12 +34,15 @@ xác thực theo schema, import/export và nhiều tiện ích khác.
 - **Quản lý model nâng cao**: thêm/sửa/xóa model, chỉnh sửa hàng loạt (bulk edit), catalog model
   với preview và lọc.
 - **Import/Export** provider, MCP server và plugin, kèm giải quyết xung đột.
-- **Fetch model từ API của provider** (nút *Fetch from API* trong dialog **Models** của
-  từng provider, mở bằng nút *Models...* ở tab Providers): lấy danh sách model trực tiếp
-  từ endpoint, tự lưu `options.baseURL` + `options.apiKey` và chọn `npm` phù hợp; dùng lại
-  được cho provider đã có (cột **Status** đánh dấu `new`/`existing`, spec đã cấu hình không
-  bị ghi đè, và tuỳ chọn **Sync** để xoá model API không còn liệt kê; model mới được
-  normalize theo catalog ngay sau khi thêm).
+- **Fetch model từ API của provider** — hai điểm vào:
+  - Nút *+ Fetch from API* trên thanh công cụ tab **Providers**: **thêm provider mới** bằng
+    cách nhập danh sách model từ endpoint (khoá provider có thể chỉnh trong dialog), kèm
+    auto-match catalog qua một dialog xem trước (hỗ trợ reference provider + mapping đã lưu).
+  - Nút *Fetch from API* trong dialog **Models** của từng provider (mở bằng *Models...*):
+    **cập nhật model cho provider đã có**, điền sẵn `baseURL`/`apiKey` từ cấu hình.
+  Cả hai đều tự lưu `options.baseURL` + `options.apiKey` và chọn `npm` phù hợp; cột **Status**
+  đánh dấu `new`/`existing`, spec đã cấu hình không bị ghi đè, tuỳ chọn **Sync** để xoá model
+  API không còn liệt kê, và model mới được normalize theo catalog ngay sau khi thêm.
 - **Undo/redo** cho mọi thao tác (giới hạn 100 bước).
 - **Bật/tắt hàng loạt** cho plugin và MCP server.
 

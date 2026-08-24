@@ -87,7 +87,7 @@ except ImportError:
 
 # Constants
 APP_NAME = "opencode-config-editor"
-APP_VERSION = "4.4.0"
+APP_VERSION = "4.4.1"
 SCHEMA_URL = "https://opencode.ai/config.json"
 TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
 SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"
@@ -842,6 +842,7 @@ class ModelCatalog:
         self.last_updated = None
         self._formats_cache = None
         self._model_index = {}  # model_id -> [provider_id, ...]
+        self.normalized_index = {} # normalized_id -> [model_id, ...]
 
     def loaded(self) -> bool:
         """Check if catalog is loaded"""
@@ -895,9 +896,27 @@ class ModelCatalog:
         self.raw, self.by_provider, self.flat = data, by_provider, flat
         self._formats_cache = None
         self._model_index = {}
+        self.normalized_index = {}
         for pid, models in by_provider.items():
-            for mid in models:
+            for mid, spec in models.items():
                 self._model_index.setdefault(mid, []).append(pid)
+                # Phase 2: Aliases
+                if isinstance(spec, dict) and "aliases" in spec:
+                    for alias in spec["aliases"]:
+                        self._model_index.setdefault(alias, []).append(pid)
+
+        for mid in self.flat:
+            norm_id = _normalize_model_id(mid)
+            if norm_id:
+                self.normalized_index.setdefault(norm_id, []).append(mid)
+            
+            # Phase 2: Aliases in normalized index
+            spec = self.flat[mid]
+            if isinstance(spec, dict) and "aliases" in spec:
+                for alias in spec["aliases"]:
+                    norm_alias = _normalize_model_id(alias)
+                    if norm_alias:
+                        self.normalized_index.setdefault(norm_alias, []).append(mid)
 
     def models_for(self, provider_key: str, npm: str = None) -> dict:
         """Get models for provider"""
@@ -938,11 +957,33 @@ class ModelCatalog:
 
     def find_model(self, model_id: str) -> List["ModelFormat"]:
         """Match a model id across the whole catalog (may match many providers)."""
-        providers = self._model_index.get(model_id)
-        if not providers:
+        matches = set()
+
+        # Exact match
+        if model_id in self._model_index:
+            matches.add(model_id)
+
+        # Normalized match
+        normalized_id = _normalize_model_id(model_id)
+        if normalized_id in self.normalized_index:
+            for original_id in self.normalized_index[normalized_id]:
+                matches.add(original_id)
+
+        if not matches:
             return []
+
+        # Collect all unique ModelFormat objects
+        found_formats = {}
         fmts = self.formats()
-        return [fmts[p][model_id] for p in providers if model_id in fmts.get(p, {})]
+        for mid in matches:
+            providers = self._model_index.get(mid, [])
+            for p in providers:
+                if mid in fmts.get(p, {}):
+                    fmt = fmts[p][mid]
+                    # Use a tuple key to handle the same format object appearing for different providers
+                    found_formats[(fmt.provider, fmt.model_id)] = fmt
+
+        return list(found_formats.values())
 
 def try_load_bundled_catalog(catalog) -> bool:
     """Silently load the bundled models.dev catalog into `catalog` if present.
@@ -1313,20 +1354,54 @@ def _sort_matches(matches, prov_name):
 
 
 _VERSION_SUFFIX = re.compile(
-    r'[-_](\d{4}[-_]\d{2}[-_]\d{2}'
-    r'|\d{4}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'
+    r'[-_](\d{4}[-_]\d{2}[-_]\d{2}'                   # YYYY-MM-DD
+    r'|\d{4}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'     # YYYYMMDD
+    r'|(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])'          # MMDD (common for preview models)
     r'|v\d+(\.\d+)*|latest|preview|stable)$',
     re.IGNORECASE)
 
+# Prefixes and suffixes to strip during normalization. Order matters for suffixes.
+_NORM_PREFIXES = ("google/", "google:", "anthropic.", "openai:", "zh-", "en-")
+_NORM_SUFFIXES = (
+    "-thinking",
+    "-online",
+    "-tool-use", "-tool_use", "-tools",
+    "-preview", "-rc", "-beta", "-alpha", "-canary",
+    "-latest", "-stable",
+    "-chat", "-instruct", "-completions", "-completion",
+    "-code", "-text",
+    "-with-vision", "-vision", "-with",
+)
+
 
 def _normalize_model_id(mid: str) -> str:
-    """Normalize a model id for fuzzy fallback: lowercase, underscores to
-    hyphens, and trailing version/date suffixes stripped."""
+    """Normalize a model id for fuzzy matching: lowercase, hyphens,
+    and trailing version/date/general suffixes stripped."""
     s = str(mid).strip().lower().replace("_", "-")
-    prev = None
-    while prev != s:
-        prev = s
-        s = _VERSION_SUFFIX.sub("", s)
+
+    # Strip prefixes
+    for prefix in _NORM_PREFIXES:
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+
+    # Iteratively strip version/date and general suffixes
+    changed = True
+    while changed:
+        changed = False
+        # Try version/date regex first
+        new_s = _VERSION_SUFFIX.sub("", s)
+        if new_s != s:
+            s = new_s
+            changed = True
+            continue
+        # Try general suffixes
+        for suffix in _NORM_SUFFIXES:
+            if s.endswith(suffix):
+                s = s[:-len(suffix)]
+                changed = True
+                break
+
     return s.strip("-") or str(mid).strip().lower()
 
 
@@ -3976,6 +4051,7 @@ class ProvidersTab(QWidget):
 
         for text, slot in [
             ("+ Add", self._add_provider),
+            ("+ Fetch from API", self._fetch_new_provider),
             ("Import", self._import_providers),
             ("Export", self._export_providers),
             ("Enable All", lambda: self._set_all_enabled(True)),
@@ -4218,6 +4294,157 @@ class ProvidersTab(QWidget):
         QMessageBox.information(
             self, "Import Complete",
             f"Added {added} new providers, updated {updated} existing providers"
+        )
+
+    def _fetch_new_provider(self):
+        """Add a NEW provider by fetching its model list from an API, then
+        auto-match the fetched models against the catalog.
+
+        Updating an existing provider's models lives in that provider's
+        Models... dialog ("Fetch from API"); this toolbar entry is for
+        bringing in a provider that isn't in the config yet (the provider
+        key is editable in the dialog).
+        """
+        self.app.snapshot_state()
+
+        # Fill the dialog's reference-provider combo (silently loads bundled catalog).
+        try_load_bundled_catalog(self.app.model_catalog)
+        providers = self.app.cfg.data.setdefault("provider", {})
+        dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog,
+                                        providers=providers)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        key = dlg.key_edit.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Fetch", "Provider key cannot be empty.")
+            return
+
+        selected = dlg.selected_models
+        if not selected:
+            QMessageBox.information(self, "Fetch", "No models selected.")
+            return
+
+        reference = dlg.reference_provider
+
+        existing_cfg = providers.get(key)
+        existing_models = {}
+        if isinstance(existing_cfg, dict) and isinstance(existing_cfg.get("models"), dict):
+            existing_models = existing_cfg["models"]
+
+        base_url = dlg.url_edit.text().strip()
+        prov, summary = apply_fetched_provider(
+            providers, key, selected,
+            base_url=base_url,
+            api_key=dlg.apikey_edit.text().strip(),
+            save_api_key=dlg.save_apikey_check.isChecked(),
+            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+
+        removed = []
+        if dlg.sync_check.isChecked():
+            stale = stale_configured_models(existing_models, dlg.fetched_models)
+            if stale:
+                shown = ", ".join(stale[:8])
+                if len(stale) > 8:
+                    shown += f", ... (+{len(stale) - 8} more)"
+                if _confirm(self, "Sync Models",
+                            f"Remove {len(stale)} configured model(s) the API no "
+                            f"longer lists?\n{shown}"):
+                    for mid in stale:
+                        prov["models"].pop(mid, None)
+                    removed = stale
+
+        self.app.mark_dirty()
+        self._update_table()
+
+        # Auto-match against the catalog in ONE review dialog (no per-model prompts).
+        if not self.app.model_catalog.loaded():
+            if not self.app._ensure_catalog():
+                QMessageBox.information(
+                    self, "Fetch Complete",
+                    f"'{key}': added {len(summary['added'])} new model(s), "
+                    f"kept {len(summary['kept'])} configured. "
+                    "Catalog not loaded, skipped auto-match.")
+                return
+
+        catalog = self.app.model_catalog
+        settings = SettingsManager()
+        mappings = settings.get_reference_mappings()
+        entries = []       # (model_id, old_spec, new_spec|None, status)
+        ambiguous_data = {}
+        fallback_data = {}  # {model_id: ModelFormat}
+
+        for mid in sorted(prov["models"]):
+            matches = catalog.find_model(mid)
+            if not matches:
+                fmt = None
+                # 1. Previously persisted manual/auto mapping wins.
+                saved = mappings.get(f"{key}/{mid}")
+                if saved:
+                    saved_matches = catalog.find_model(saved)
+                    if saved_matches:
+                        fmt = _sort_matches(saved_matches, reference or key)[0]
+                # 2. Reference provider / normalized-id / prefix fallback.
+                if fmt is None:
+                    fmt = _find_fallback(mid, reference, catalog)
+                if fmt is not None:
+                    merged = _merge_model_spec(
+                        prov["models"][mid], build_spec_from_format(fmt), overwrite=False)
+                    entries.append((mid, dict(prov["models"][mid]), merged,
+                                    f"fallback:{fmt.provider}"))
+                    fallback_data[mid] = fmt
+                else:
+                    entries.append((mid, dict(prov["models"][mid]), None, "unknown"))
+                continue
+            chosen = _resolve_match(matches, key, mid)
+            if chosen is None:
+                entries.append((mid, dict(prov["models"][mid]), None, "ambiguous"))
+                ambiguous_data[mid] = (key, matches)
+                continue
+            merged = _merge_model_spec(
+                prov["models"][mid], build_spec_from_format(chosen), overwrite=False)
+            status = "matched" if merged != (prov["models"][mid] or {}) else "unchanged"
+            entries.append((mid, dict(prov["models"][mid]), merged, status))
+
+        if not any(e[2] is not None or e[3] == "ambiguous" for e in entries):
+            QMessageBox.information(
+                self, "Fetch & Match",
+                f"'{key}': added {len(summary['added'])} new model(s), "
+                f"kept {len(summary['kept'])} configured. "
+                "None matched the catalog.")
+            return
+
+        preview = MatchFormatPreviewDialog(
+            self, entries, ambiguous_data, fallback_data=fallback_data, catalog=catalog)
+        if preview.exec() != QDialog.Accepted:
+            return
+
+        applied = 0
+        for mid, old_spec, new_spec, status in preview.selected_entries:
+            if status == "ambiguous":
+                new_spec = preview.resolved_specs.get(mid, new_spec)
+            elif status == "mapped":
+                new_spec = preview.mapped_specs.get(mid, new_spec)
+                if mid in preview.mapped_ids:
+                    settings.add_reference_mapping(key, mid, preview.mapped_ids[mid])
+            elif status.startswith("fallback:"):
+                fmt = fallback_data.get(mid)
+                if fmt is not None:
+                    settings.add_reference_mapping(key, mid, fmt.model_id)
+            if new_spec is None:
+                continue
+            prov["models"][mid] = _merge_model_spec(
+                prov["models"][mid], new_spec, overwrite=False)
+            applied += 1
+
+        self.app.mark_dirty()
+        self._update_table()
+        sync_note = f", removed {len(removed)} stale" if removed else ""
+        QMessageBox.information(
+            self, "Fetch & Match Complete",
+            f"'{key}': added {len(summary['added'])} new model(s), "
+            f"kept {len(summary['kept'])} configured{sync_note}, "
+            f"normalized {applied} from catalog."
         )
 
     def _export_providers(self):

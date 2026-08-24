@@ -10,6 +10,17 @@ Tất cả các thay đổi đáng chú ý của dự án được ghi lại tro
 Định dạng dựa trên [Keep a Changelog](https://keepachangelog.com/vi/1.1.0/),
 và dự án tuân theo [Semantic Versioning](https://semver.org/lang/vi/).
 
+
+## [4.4.1] - 2026-08-24
+
+### Added
+- **Khôi phục nút + Fetch from API**: Đưa nút tạo provider mới từ API trở lại thanh công cụ tab Providers (hỗ trợ quy trình chuẩn hóa catalog đầy đủ).
+- **Hỗ trợ Aliases trong Model Catalog**: Cho phép tìm kiếm model qua bí danh định nghĩa trong catalog.
+
+### Changed
+- **Nâng cấp Model Catalog Matching**: Cơ chế fuzzy matching thông minh hơn, tự động bóc tách tiền tố (google/, zh-...) và hậu tố (-thinking, -vision, date-codes...) để khớp chính xác hơn.
+- **Tách biệt luồng Fetch**: Nút Fetch trong dialog Models chuyên dùng để cập nhật, nút trên toolbar chuyên dùng để thêm mới.
+
 ## [4.4.0] - 2026-08-23
 
 Hỗ trợ agent thứ hai: **openclaude** (settings.json phân lớp), qua tầng adapter mới.

@@ -115,3 +115,45 @@ def test_fetch_dialog_prefills_existing_provider_endpoint(qapp):
     dlg2 = app.FetchProviderModelsDialog(None, provider_key="fresh", providers=providers)
     assert dlg2.url_edit.text().startswith("https://api.openai.com")
     assert dlg2.apikey_edit.text() == ""
+
+
+def test_providers_tab_add_from_api_creates_new_provider(qapp, catalog, monkeypatch):
+    """The toolbar 'Fetch from API' entry must still be able to add a brand-new
+    provider (the flow that was lost when fetch moved into the Models dialog)."""
+    class Cfg:
+        def __init__(self):
+            self.data = {}
+
+    fake = FakeApp(catalog)
+    fake.cfg = Cfg()
+    fake.status_bar = type("S", (), {"showMessage": lambda s, *a, **k: None})()
+    tab = app.ProvidersTab(fake)
+
+    assert hasattr(tab, "_fetch_new_provider")
+
+    # Stub the fetch dialog: user picks key "brand-new" and two models, accepts.
+    class StubDialog:
+        def __init__(self, *a, **kw):
+            self.key_edit = type("E", (), {"text": lambda s: "brand-new"})()
+            self.url_edit = type("E", (), {"text": lambda s: "https://api.x.test/v1"})()
+            self.apikey_edit = type("E", (), {"text": lambda s: ""})()
+            self.save_apikey_check = type("C", (), {"isChecked": lambda s: False})()
+            self.sync_check = type("C", (), {"isChecked": lambda s: False})()
+            self.selected_models = {"m-a": {"name": "A"}, "m-b": {"name": "B"}}
+            self.fetched_models = dict(self.selected_models)
+            self.reference_provider = None
+        def _current_adapter(self):
+            return "openai"
+        def exec(self):
+            return app.QDialog.Accepted
+
+    monkeypatch.setattr(app, "FetchProviderModelsDialog", StubDialog)
+    # No catalog matches for these ids -> skip the review dialog quietly.
+    monkeypatch.setattr(app.QMessageBox, "information", lambda *a, **k: None)
+
+    tab._fetch_new_provider()
+
+    providers = app.section(fake.cfg.data, "provider")
+    assert "brand-new" in providers
+    assert set(providers["brand-new"]["models"]) == {"m-a", "m-b"}
+

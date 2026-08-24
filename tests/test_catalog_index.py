@@ -59,6 +59,7 @@ def test_real_bundled_catalog_index_and_lookup():
     assert matches, "glm-5.2 should exist in the catalog"
     providers = {m.provider for m in matches}
     assert "zhipuai" in providers
-    assert all(m.model_id == "glm-5.2" for m in matches)
+    # With normalization, we might match variations, so we check if the normalized ID matches
+    assert all(app._normalize_model_id(m.model_id) == app._normalize_model_id("glm-5.2") for m in matches)
     # Unknown id returns empty without error.
     assert cat.find_model("definitely-not-a-real-model-xyz") == []
