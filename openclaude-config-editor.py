@@ -4030,6 +4030,50 @@ class ApplyCatalogDialog(QDialog):
         )
         return report
 
+def match_models_against_catalog(key, models_dict, catalog, reference_provider=None):
+    """Build a list of potential catalog matches for the given models.
+    Returns (entries, ambiguous_data, fallback_data).
+    """
+    settings = SettingsManager()
+    mappings = settings.get_reference_mappings()
+    entries = []       # (model_id, old_spec, new_spec|None, status)
+    ambiguous_data = {}
+    fallback_data = {}  # {model_id: ModelFormat}
+
+    for mid in sorted(models_dict):
+        matches = catalog.find_model(mid)
+        if not matches:
+            fmt = None
+            # 1. Previously persisted manual/auto mapping wins.
+            saved = mappings.get(f"{key}/{mid}")
+            if saved:
+                saved_matches = catalog.find_model(saved)
+                if saved_matches:
+                    fmt = _sort_matches(saved_matches, reference_provider or key)[0]
+            # 2. Reference provider / normalized-id / prefix fallback.
+            if fmt is None:
+                fmt = _find_fallback(mid, reference_provider, catalog)
+            if fmt is not None:
+                merged = _merge_model_spec(
+                    models_dict[mid], build_spec_from_format(fmt), overwrite=False)
+                entries.append((mid, dict(models_dict[mid]), merged,
+                                f"fallback:{fmt.provider}"))
+                fallback_data[mid] = fmt
+            else:
+                entries.append((mid, dict(models_dict[mid]), None, "unknown"))
+            continue
+        chosen = _resolve_match(matches, key, mid)
+        if chosen is None:
+            entries.append((mid, dict(models_dict[mid]), None, "ambiguous"))
+            ambiguous_data[mid] = (key, matches)
+            continue
+        merged = _merge_model_spec(
+            models_dict[mid], build_spec_from_format(chosen), overwrite=False)
+        status = "matched" if merged != (models_dict[mid] or {}) else "unchanged"
+        entries.append((mid, dict(models_dict[mid]), merged, status))
+    return entries, ambiguous_data, fallback_data
+
+
 # Providers tab
 class ProvidersTab(QWidget):
     """Enhanced providers tab with search and bulk operations"""
@@ -7334,7 +7378,36 @@ def openclaude_findings(data, layer, validator=None):
 # and a per-layer Raw JSON editor. Both operate on the layer currently selected
 # on the window (win.oc_layer) via win.oc_layered (a LayeredConfigFile).
 
-class OpenclaudeSettingsTab(BaseTab):
+class OpenclaudeTab(BaseTab):
+    """Shared base for openclaude layer-aware tabs.
+
+    Centralizes two idioms every openclaude tab repeated inline: the
+    mark-dirty/status-message slot, and the (layered, own-layer) lookup.
+    """
+
+    def _mark_edited(self):
+        """Flag the openclaude doc dirty and show the standard status message."""
+        self.app.oc_form_dirty = True
+        self.app.status_bar.showMessage("Unsaved changes\u2026")
+
+    def _edited(self, *_):
+        """Default edit slot: no-op while the tab is (re)loading, else mark dirty."""
+        if getattr(self, "_loading", False):
+            return
+        self._mark_edited()
+
+    def _layered(self):
+        """The window's LayeredConfigFile, or None before one is loaded."""
+        return getattr(self.app, "oc_layered", None)
+
+    def _own_layer(self):
+        """Return (layered, own) with `own` = the selected layer's own dict."""
+        layered = self._layered()
+        own = layered.layer(self.app.oc_layer) if layered else {}
+        return layered, own
+
+
+class OpenclaudeSettingsTab(OpenclaudeTab):
     """Form for common scalar settings of the selected layer."""
 
     EFFORTS = ["", "low", "medium", "high", "xhigh", "max"]
@@ -7404,13 +7477,8 @@ class OpenclaudeSettingsTab(BaseTab):
     def _on_layer_change(self, *_):
         _layer_change_guarded(self, self.layer_combo)
 
-    def _edited(self, *_):
-        self.app.oc_form_dirty = True
-        self.app.status_bar.showMessage("Unsaved changes…")
-
     def refresh(self):
-        layered = getattr(self.app, "oc_layered", None)
-        own = layered.layer(self.app.oc_layer) if layered else {}
+        layered, own = self._own_layer()
         eff = layered.effective() if layered else {}
         self._set_combo(self.layer_combo, self.app.oc_layer, 0)
 
@@ -7489,7 +7557,7 @@ class OpenclaudeSettingsTab(BaseTab):
                       self.skip_fullaccess_chk.isChecked(), None)
 
 
-class OpenclaudeRawTab(BaseTab):
+class OpenclaudeRawTab(OpenclaudeTab):
     """Raw JSON editor for the selected layer (full fidelity, incl. secrets)."""
 
     def __init__(self, app):
@@ -7575,7 +7643,7 @@ class OpenclaudeRawTab(BaseTab):
         return getattr(self, "_raw_layer", None) or self.layer_combo.currentData() or "project"
 
     def refresh(self):
-        layered = getattr(self.app, "oc_layered", None)
+        layered = self._layered()
         layer = self._current_raw_layer()
         if layered is None:
             return
@@ -7597,7 +7665,7 @@ class OpenclaudeRawTab(BaseTab):
             return self._current_raw_layer(), None
 
 
-class OpenclaudeAgentModelsTab(BaseTab):
+class OpenclaudeAgentModelsTab(OpenclaudeTab):
     """Editor for provider connections in the global ~/.openclaude.json.
 
     OpenClaude stores providers as a `providerProfiles` list of
@@ -7673,8 +7741,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
         if getattr(self, "_loading", False):
             return
         self._dirty = True
-        self.app.oc_form_dirty = True
-        self.app.status_bar.showMessage("Unsaved changes\u2026")
+        self._mark_edited()
 
     # --- provider rows (providerProfiles) ---
     def _add_model_row(self, profile=None):
@@ -7710,7 +7777,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
             self._edited()
 
     def refresh(self):
-        layered = getattr(self.app, "oc_layered", None)
+        layered = self._layered()
         # Providers/routing live in the global ~/.openclaude.json file.
         data = layered.global_data if layered else {}
 
@@ -7847,7 +7914,7 @@ class OpenclaudeAgentModelsTab(BaseTab):
             d.pop(k, None)
 
 
-class OpenclaudeMcpTab(BaseTab):
+class OpenclaudeMcpTab(OpenclaudeTab):
     """MCP servers across user/project/local scopes (+ policy read-only).
 
     Verified openclaude v0.28.0 storage:
@@ -8025,11 +8092,10 @@ class OpenclaudeMcpTab(BaseTab):
         scope = getattr(self, "_shown_scope", None)
         if scope:
             self._dirty_scopes.add(scope)
-            self.app.oc_form_dirty = True
-            self.app.status_bar.showMessage("Unsaved changes\u2026")
+            self._mark_edited()
 
     def refresh(self):
-        layered = getattr(self.app, "oc_layered", None)
+        layered = self._layered()
         self._loading = True
         try:
             if layered:
@@ -8074,7 +8140,7 @@ class OpenclaudeMcpTab(BaseTab):
             else:
                 gdata.pop("mcpServers", None)
         if "local" in self._dirty_scopes:
-            layered = getattr(self.app, "oc_layered", None)
+            layered = self._layered()
             if layered is None:
                 return
             projects = gdata.get("projects")
@@ -8102,7 +8168,7 @@ class OpenclaudeMcpTab(BaseTab):
         return base
 
 
-class OpenclaudePluginsTab(BaseTab):
+class OpenclaudePluginsTab(OpenclaudeTab):
     """Plugin + marketplace settings keys (settings.json of the selected layer).
 
     Shapes verified against openclaude v0.28.0 SettingsSchema:
@@ -8178,12 +8244,6 @@ class OpenclaudePluginsTab(BaseTab):
     def _on_layer_change(self, *_):
         _layer_change_guarded(self, self.layer_combo)
 
-    def _edited(self, *_):
-        if getattr(self, "_loading", False):
-            return
-        self.app.oc_form_dirty = True
-        self.app.status_bar.showMessage("Unsaved changes\u2026")
-
     # --- plugins rows ---
     def _add_plugin_row(self, pid=""):
         r = self.plugins_table.rowCount()
@@ -8237,8 +8297,7 @@ class OpenclaudePluginsTab(BaseTab):
         return self.cell_text(self.market_table, r, c)
 
     def refresh(self):
-        layered = getattr(self.app, "oc_layered", None)
-        own = layered.layer(self.app.oc_layer) if layered else {}
+        layered, own = self._own_layer()
         self._loading = True
         try:
             self._set_combo(self.layer_combo, self.app.oc_layer, 0)
@@ -8364,7 +8423,7 @@ class OpenclaudePluginsTab(BaseTab):
             data["extraKnownMarketplaces"] = markets
 
 
-class OpenclaudeHooksTab(BaseTab):
+class OpenclaudeHooksTab(OpenclaudeTab):
     """Structured editor for settings.json `hooks`.
 
     Verified shape (binary schema + real configs):
@@ -8463,12 +8522,6 @@ class OpenclaudeHooksTab(BaseTab):
                    " — switch 'Edit layer' above."
         self.empty_hint.setText(msg)
 
-    def _edited(self, *_):
-        if getattr(self, "_loading", False):
-            return
-        self.app.oc_form_dirty = True
-        self.app.status_bar.showMessage("Unsaved changes\u2026")
-
     def _add_row(self, event="", matcher="", typ="command", target="",
                  timeout="", orig=None, gi=None, ei=None):
         orig = orig if isinstance(orig, dict) else {"group": {}, "entry": {}}
@@ -8537,8 +8590,7 @@ class OpenclaudeHooksTab(BaseTab):
                 or row["timeout"] != str(m.get("timeout", "")))
 
     def refresh(self):
-        layered = getattr(self.app, "oc_layered", None)
-        own = layered.layer(self.app.oc_layer) if layered else {}
+        layered, own = self._own_layer()
         self._loading = True
         try:
             self._set_combo(self.layer_combo, self.app.oc_layer, 0)
@@ -8664,7 +8716,7 @@ class OpenclaudeHooksTab(BaseTab):
             data["hooks"] = out
 
 
-class OpenclaudePermissionsTab(BaseTab):
+class OpenclaudePermissionsTab(OpenclaudeTab):
     """Editor for settings.json `permissions` on the selected layer.
 
     Verified shape (claude-code-settings schema embedded by openclaude):
@@ -8731,19 +8783,12 @@ class OpenclaudePermissionsTab(BaseTab):
     def _on_layer_change(self, *_):
         _layer_change_guarded(self, self.layer_combo)
 
-    def _edited(self, *_):
-        if getattr(self, "_loading", False):
-            return
-        self.app.oc_form_dirty = True
-        self.app.status_bar.showMessage("Unsaved changes\u2026")
-
     @staticmethod
     def _lines(text):
         return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
     def refresh(self):
-        layered = getattr(self.app, "oc_layered", None)
-        own = layered.layer(self.app.oc_layer) if layered else {}
+        layered, own = self._own_layer()
         perms = own.get("permissions") if isinstance(own.get("permissions"), dict) else {}
         self._loading = True
         try:
@@ -8789,7 +8834,7 @@ class OpenclaudePermissionsTab(BaseTab):
             data.pop("permissions", None)
 
 
-class OpenclaudeEnvLimitsTab(BaseTab):
+class OpenclaudeEnvLimitsTab(OpenclaudeTab):
     """Editors for settings.json `env` and `modelLimits` on the selected layer.
 
       env: {VAR: "string"}  — values are masked (they routinely hold API keys)
@@ -8851,12 +8896,6 @@ class OpenclaudeEnvLimitsTab(BaseTab):
     def _on_layer_change(self, *_):
         _layer_change_guarded(self, self.layer_combo)
 
-    def _edited(self, *_):
-        if getattr(self, "_loading", False):
-            return
-        self.app.oc_form_dirty = True
-        self.app.status_bar.showMessage("Unsaved changes\u2026")
-
     # --- env rows ---
     def _add_env_row(self, name="", value=""):
         r = self.env_table.rowCount()
@@ -8891,8 +8930,7 @@ class OpenclaudeEnvLimitsTab(BaseTab):
             self._edited()
 
     def refresh(self):
-        layered = getattr(self.app, "oc_layered", None)
-        own = layered.layer(self.app.oc_layer) if layered else {}
+        layered, own = self._own_layer()
         self._loading = True
         try:
             self._set_combo(self.layer_combo, self.app.oc_layer, 0)

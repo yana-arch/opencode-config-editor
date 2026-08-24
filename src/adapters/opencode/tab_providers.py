@@ -1,3 +1,47 @@
+def match_models_against_catalog(key, models_dict, catalog, reference_provider=None):
+    """Build a list of potential catalog matches for the given models.
+    Returns (entries, ambiguous_data, fallback_data).
+    """
+    settings = SettingsManager()
+    mappings = settings.get_reference_mappings()
+    entries = []       # (model_id, old_spec, new_spec|None, status)
+    ambiguous_data = {}
+    fallback_data = {}  # {model_id: ModelFormat}
+
+    for mid in sorted(models_dict):
+        matches = catalog.find_model(mid)
+        if not matches:
+            fmt = None
+            # 1. Previously persisted manual/auto mapping wins.
+            saved = mappings.get(f"{key}/{mid}")
+            if saved:
+                saved_matches = catalog.find_model(saved)
+                if saved_matches:
+                    fmt = _sort_matches(saved_matches, reference_provider or key)[0]
+            # 2. Reference provider / normalized-id / prefix fallback.
+            if fmt is None:
+                fmt = _find_fallback(mid, reference_provider, catalog)
+            if fmt is not None:
+                merged = _merge_model_spec(
+                    models_dict[mid], build_spec_from_format(fmt), overwrite=False)
+                entries.append((mid, dict(models_dict[mid]), merged,
+                                f"fallback:{fmt.provider}"))
+                fallback_data[mid] = fmt
+            else:
+                entries.append((mid, dict(models_dict[mid]), None, "unknown"))
+            continue
+        chosen = _resolve_match(matches, key, mid)
+        if chosen is None:
+            entries.append((mid, dict(models_dict[mid]), None, "ambiguous"))
+            ambiguous_data[mid] = (key, matches)
+            continue
+        merged = _merge_model_spec(
+            models_dict[mid], build_spec_from_format(chosen), overwrite=False)
+        status = "matched" if merged != (models_dict[mid] or {}) else "unchanged"
+        entries.append((mid, dict(models_dict[mid]), merged, status))
+    return entries, ambiguous_data, fallback_data
+
+
 # Providers tab
 class ProvidersTab(QWidget):
     """Enhanced providers tab with search and bulk operations"""
