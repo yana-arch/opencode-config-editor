@@ -81,8 +81,7 @@ OPENCLAUDE_MCP_SCOPES = ("user", "project", "local")
 # same document. Findings are advisory only (openclaude adds keys of its own,
 # and the schema's top level allows extra properties).
 OPENCLAUDE_SCHEMA_URL = "https://json.schemastore.org/claude-code-settings.json"
-OPENCLAUDE_SCHEMA_CACHE = (Path.home() / ".cache" / APP_NAME_OPENCLAUDE
-                           / "claude-code-settings-schema.json")
+OPENCLAUDE_SCHEMA_CACHE = USER_CONFIG_DIR / "openclaude-settings-schema.json"
 
 # Top-level keys of a project .mcp.json.
 OPENCLAUDE_PROJECT_MCP_KEYS = {"$schema", "mcpServers", "allowedTools", "mcpContextUris"}

@@ -88,12 +88,14 @@ except ImportError:
 # Constants
 APP_NAME = "opencode-config-editor"
 APP_VERSION = "4.4.1"
+USER_CONFIG_DIR = Path.home() / ".config" / APP_NAME
 SCHEMA_URL = "https://opencode.ai/config.json"
 TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
-SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"
-TUI_SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "tui-schema.json"
-PLUGIN_STATE_CACHE = Path.home() / ".cache" / APP_NAME / "plugin-state.json"
-SETTINGS_FILE = Path.home() / ".config" / APP_NAME / "settings.ini"
+SCHEMA_CACHE = USER_CONFIG_DIR / "config-schema.json"
+TUI_SCHEMA_CACHE = USER_CONFIG_DIR / "tui-schema.json"
+PLUGIN_STATE_CACHE = USER_CONFIG_DIR / "plugin-state.json"
+SETTINGS_FILE = USER_CONFIG_DIR / "settings.ini"
+CATALOG_CACHE = USER_CONFIG_DIR / "catalog.json"
 UNDO_LIMIT = 100
 
 # Configuration keys (derived from https://opencode.ai/config.json and /tui.json)
@@ -420,7 +422,7 @@ class ConfigFile:
         self.kind = kind
         self.data = {}
         self.error = None
-        self.backup_dir = Path.home() / ".cache" / APP_NAME / "backups"
+        self.backup_dir = USER_CONFIG_DIR / "backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -695,7 +697,7 @@ class TuiPluginStateStore:
     storing its full entry so re-enabling restores tuple-form options verbatim."""
 
     def __init__(self):
-        self.path = Path.home() / ".cache" / APP_NAME / "tui-plugin-state.json"
+        self.path = USER_CONFIG_DIR / "tui-plugin-state.json"
         self._data = {}
         self._load()
 
@@ -992,6 +994,11 @@ def try_load_bundled_catalog(catalog) -> bool:
     if catalog is None or catalog.loaded():
         return catalog is not None and catalog.loaded()
     try:
+        # 1. User config dir (~/.config/opencode-config-editor/catalog.json)
+        if CATALOG_CACHE.exists():
+            catalog.load(CATALOG_CACHE)
+            return True
+        # 2. Local bundled relative to main script
         bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
         if bundled.exists():
             catalog.load(bundled)
@@ -7136,8 +7143,7 @@ OPENCLAUDE_MCP_SCOPES = ("user", "project", "local")
 # same document. Findings are advisory only (openclaude adds keys of its own,
 # and the schema's top level allows extra properties).
 OPENCLAUDE_SCHEMA_URL = "https://json.schemastore.org/claude-code-settings.json"
-OPENCLAUDE_SCHEMA_CACHE = (Path.home() / ".cache" / APP_NAME_OPENCLAUDE
-                           / "claude-code-settings-schema.json")
+OPENCLAUDE_SCHEMA_CACHE = USER_CONFIG_DIR / "openclaude-settings-schema.json"
 
 # Top-level keys of a project .mcp.json.
 OPENCLAUDE_PROJECT_MCP_KEYS = {"$schema", "mcpServers", "allowedTools", "mcpContextUris"}
@@ -10031,6 +10037,17 @@ class MainWindow(QMainWindow):
 
     def _ensure_catalog(self) -> bool:
         """Load the bundled models.dev catalog if present, else ask the user."""
+        # 1. Try ~/.config/opencode-config-editor/catalog.json
+        if CATALOG_CACHE.exists():
+            try:
+                self.model_catalog.load(CATALOG_CACHE)
+                self._update_catalog_status()
+                self.status_bar.showMessage(f"Loaded catalog: {CATALOG_CACHE}")
+                return True
+            except (OSError, ValueError) as e:
+                QMessageBox.warning(self, "Catalog Error", f"Failed to load user catalog: {e}")
+
+        # 2. Try bundled relative to main script
         bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
         if bundled.exists():
             try:

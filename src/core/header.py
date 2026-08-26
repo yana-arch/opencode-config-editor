@@ -88,12 +88,14 @@ except ImportError:
 # Constants
 APP_NAME = "opencode-config-editor"
 APP_VERSION = "4.4.1"
+USER_CONFIG_DIR = Path.home() / ".config" / APP_NAME
 SCHEMA_URL = "https://opencode.ai/config.json"
 TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
-SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "config-schema.json"
-TUI_SCHEMA_CACHE = Path.home() / ".cache" / APP_NAME / "tui-schema.json"
-PLUGIN_STATE_CACHE = Path.home() / ".cache" / APP_NAME / "plugin-state.json"
-SETTINGS_FILE = Path.home() / ".config" / APP_NAME / "settings.ini"
+SCHEMA_CACHE = USER_CONFIG_DIR / "config-schema.json"
+TUI_SCHEMA_CACHE = USER_CONFIG_DIR / "tui-schema.json"
+PLUGIN_STATE_CACHE = USER_CONFIG_DIR / "plugin-state.json"
+SETTINGS_FILE = USER_CONFIG_DIR / "settings.ini"
+CATALOG_CACHE = USER_CONFIG_DIR / "catalog.json"
 UNDO_LIMIT = 100
 
 # Configuration keys (derived from https://opencode.ai/config.json and /tui.json)

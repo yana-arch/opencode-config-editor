@@ -160,6 +160,11 @@ def try_load_bundled_catalog(catalog) -> bool:
     if catalog is None or catalog.loaded():
         return catalog is not None and catalog.loaded()
     try:
+        # 1. User config dir (~/.config/opencode-config-editor/catalog.json)
+        if CATALOG_CACHE.exists():
+            catalog.load(CATALOG_CACHE)
+            return True
+        # 2. Local bundled relative to main script
         bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
         if bundled.exists():
             catalog.load(bundled)

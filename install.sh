@@ -154,6 +154,25 @@ install_files() {
     cp "$src" "$INSTALL_DIR/main.py"
     chmod +x "$INSTALL_DIR/main.py"
 
+    # XDG-style config directory for the app
+    # If run via sudo, SUDO_USER gives the original user
+    local target_user="${SUDO_USER:-$USER}"
+    local user_home
+    user_home=$(getent passwd "$target_user" | cut -d: -f6)
+    local config_dir="$user_home/.config/opencode-config-editor"
+
+    echo "Đang khởi tạo thư mục cấu hình tại $config_dir ..."
+    mkdir -p "$config_dir"
+    chown -R "$target_user:$target_user" "$config_dir" 2>/dev/null || true
+
+    # Copy catalog nếu có sẵn trong repo
+    local cat_src="models/models.dev.catalog.json"
+    if [[ -f "$cat_src" ]]; then
+        echo "Đang cài đặt model catalog..."
+        cp "$cat_src" "$config_dir/catalog.json"
+        chown "$target_user:$target_user" "$config_dir/catalog.json" 2>/dev/null || true
+    fi
+
     # Wrapper
     cat > /usr/local/bin/$BIN_NAME <<EOF
 #!/bin/bash

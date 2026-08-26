@@ -338,8 +338,9 @@ def test_findings_skips_schema_when_shape_already_broken():
 
 def test_schema_source_constants_are_openclaude_specific():
     assert app.OPENCLAUDE_SCHEMA_URL.endswith("claude-code-settings.json")
-    assert app.OPENCLAUDE_SCHEMA_CACHE.name == "claude-code-settings-schema.json"
-    assert app.APP_NAME_OPENCLAUDE in str(app.OPENCLAUDE_SCHEMA_CACHE)
+    assert app.OPENCLAUDE_SCHEMA_CACHE.name == "openclaude-settings-schema.json"
+    # Unified config dir used for both
+    assert "opencode-config-editor" in str(app.OPENCLAUDE_SCHEMA_CACHE)
 
 
 def test_schema_from_is_offline_without_jsonschema():

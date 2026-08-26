@@ -846,6 +846,17 @@ class MainWindow(QMainWindow):
 
     def _ensure_catalog(self) -> bool:
         """Load the bundled models.dev catalog if present, else ask the user."""
+        # 1. Try ~/.config/opencode-config-editor/catalog.json
+        if CATALOG_CACHE.exists():
+            try:
+                self.model_catalog.load(CATALOG_CACHE)
+                self._update_catalog_status()
+                self.status_bar.showMessage(f"Loaded catalog: {CATALOG_CACHE}")
+                return True
+            except (OSError, ValueError) as e:
+                QMessageBox.warning(self, "Catalog Error", f"Failed to load user catalog: {e}")
+
+        # 2. Try bundled relative to main script
         bundled = Path(__file__).resolve().parent / "models" / "models.dev.catalog.json"
         if bundled.exists():
             try:

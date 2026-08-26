@@ -111,7 +111,7 @@ class ConfigFile:
         self.kind = kind
         self.data = {}
         self.error = None
-        self.backup_dir = Path.home() / ".cache" / APP_NAME / "backups"
+        self.backup_dir = USER_CONFIG_DIR / "backups"
         self.backup_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -386,7 +386,7 @@ class TuiPluginStateStore:
     storing its full entry so re-enabling restores tuple-form options verbatim."""
 
     def __init__(self):
-        self.path = Path.home() / ".cache" / APP_NAME / "tui-plugin-state.json"
+        self.path = USER_CONFIG_DIR / "tui-plugin-state.json"
         self._data = {}
         self._load()
 
