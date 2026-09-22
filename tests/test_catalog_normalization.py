@@ -43,6 +43,12 @@ def catalog():
     ("zh-special-model-chat", "special-model"),
     ("claude-2.1", "claude-2.1"),
     ("llama-3-70b-instruct", "llama-3-70b"),
+    # Namespace/provider prefixes collapsed to the bare model id
+    ("df/claude-opus-4.8", "claude-opus-4.8"),
+    ("anthropic/claude-opus-4", "claude-opus-4"),
+    ("deepseek/deepseek-v4-flash", "deepseek-v4-flash"),
+    ("openai:gpt-4.1", "gpt-4.1"),
+    ("df/anthropic/claude-3-opus", "claude-3-opus"),
 ])
 def test_normalize_model_id(input_id, expected_normalized_id):
     assert app._normalize_model_id(input_id) == expected_normalized_id
@@ -95,3 +101,73 @@ def test_find_model_with_normalization(catalog):
     # No match
     matches = catalog.find_model("no-such-model-exists")
     assert len(matches) == 0
+
+
+@pytest.fixture
+def namespaced_catalog():
+    c = app.ModelCatalog()
+    c.load_text(json.dumps({
+        "anthropic": {
+            "models": {
+                "anthropic/claude-opus-4": {"name": "Claude Opus 4"},
+                "anthropic/claude-sonnet-4": {"name": "Claude Sonnet 4"},
+            }
+        },
+        "deepseek": {
+            "models": {
+                "deepseek/deepseek-v4-flash": {"name": "DeepSeek V4 Flash"},
+            }
+        },
+    }))
+    return c
+
+
+def test_find_model_across_namespaces(namespaced_catalog):
+    # A config id carrying an arbitrary namespace + dotted version should still
+    # resolve to the catalog entry stored under a different namespace.
+    matches = namespaced_catalog.find_model("df/claude-opus-4.8")
+    assert len(matches) == 1
+    assert matches[0].model_id == "anthropic/claude-opus-4"
+
+    # Namespace-less query resolves to the namespaced catalog entry.
+    matches = namespaced_catalog.find_model("claude-opus-4")
+    assert len(matches) == 1
+    assert matches[0].model_id == "anthropic/claude-opus-4"
+
+    # Dotted version on a fully namespaced query.
+    matches = namespaced_catalog.find_model("df/deepseek-v4-flash-1.0")
+    assert len(matches) == 1
+    assert matches[0].model_id == "deepseek/deepseek-v4-flash"
+
+
+@pytest.mark.parametrize("input_id, expected_label", [
+    ("glm-5.3-flash", "GLM 5.3 Flash"),
+    ("claude-opus-4.8-thinking", "Claude Opus 4.8 Thinking"),
+    ("claude-opus-4.8", "Claude Opus 4.8"),
+    ("gpt-4.1", "GPT 4.1"),
+    ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash"),
+    ("df/claude-opus-4.8-thinking", "Claude Opus 4.8 Thinking"),
+    ("llama-3-70b-instruct", "Llama 3 70B Instruct"),
+    ("my-model-20240229", "My Model 20240229"),
+    ("", ""),
+])
+def test_humanize_model_id(input_id, expected_label):
+    assert app.humanize_model_id(input_id) == expected_label
+
+
+def test_build_spec_from_format_derives_name_for_target_model_id():
+    # If a model matches a different catalog model format, spec name must be derived from target model id
+    fmt = app.ModelFormat.from_spec("zhipu", "glm-4-flash", {"name": "GLM 4 Flash", "attachment": True})
+    spec = app.build_spec_from_format(fmt, "glm-5.3-flash")
+    assert spec["name"] == "GLM 5.3 Flash"
+    assert spec["attachment"] is True
+
+
+def test_from_spec_uses_humanized_name_when_missing():
+    fmt = app.ModelFormat.from_spec("prov", "claude-opus-4.8-thinking", {})
+    assert fmt.name == "Claude Opus 4.8 Thinking"
+
+    # An explicit name always wins.
+    fmt = app.ModelFormat.from_spec("prov", "claude-opus-4.8-thinking",
+                                    {"name": "My Custom Name"})
+    assert fmt.name == "My Custom Name"

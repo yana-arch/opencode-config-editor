@@ -41,6 +41,58 @@ class JSONHighlighter(QSyntaxHighlighter):
                 start, end = match.span()
                 self.setFormat(start, end - start, fmt)
 
+def strip_jsonc(text: str) -> str:
+    """Strip JavaScript-style comments (//... and /*...*/) and trailing commas
+    from a JSON string without breaking string literals."""
+    if not text:
+        return ""
+    out = []
+    i = 0
+    n = len(text)
+    in_string = False
+    escape = False
+
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+        else:
+            if c == '"':
+                in_string = True
+                out.append(c)
+                i += 1
+            elif c == '/' and i + 1 < n and text[i + 1] == '/':
+                i += 2
+                while i < n and text[i] != '\n':
+                    i += 1
+            elif c == '/' and i + 1 < n and text[i + 1] == '*':
+                i += 2
+                while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
+                    i += 1
+                i += 2
+            else:
+                out.append(c)
+                i += 1
+
+    clean = "".join(out)
+    clean = re.sub(r',\s*(\}|\])', r'\1', clean)
+    return clean
+
+
+def loads_jsonc(text: str):
+    """Parse a JSON or JSONC string, accepting comments and trailing commas."""
+    if not isinstance(text, str):
+        raise TypeError(f"Expected string, got {type(text)}")
+    return json.loads(strip_jsonc(text))
+
+
 def section(cfg_data, key: str) -> dict:
     """Return cfg_data[key] when it is a dict, else an empty dict."""
     v = cfg_data.get(key) if isinstance(cfg_data, dict) else None
@@ -144,7 +196,7 @@ class ConfigFile:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 raw = f.read()
-            self.data = json.loads(raw)
+            self.data = loads_jsonc(raw)
             self.error = None
             return True
         except FileNotFoundError:
@@ -345,7 +397,8 @@ def _path_of(e) -> str:
         return "?"
 
 class PluginStateStore:
-    """Enhanced plugin state store with persistence"""
+    """Remember disabled opencode plugins in the editor cache, keying each by name and
+    storing its full entry so re-enabling restores tuple-form options verbatim."""
 
     def __init__(self):
         self.path = PLUGIN_STATE_CACHE
@@ -356,7 +409,7 @@ class PluginStateStore:
         """Load plugin state from cache"""
         try:
             if self.path.exists():
-                self._data = json.loads(self.path.read_text())
+                self._data = loads_jsonc(self.path.read_text(encoding="utf-8"))
         except Exception:
             self._data = {}
 
@@ -364,21 +417,77 @@ class PluginStateStore:
         """Save plugin state to cache"""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._data, indent=2))
+            self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
         except OSError:
             pass
 
-    def get_disabled(self, cfg_path: Path) -> set:
-        """Get disabled plugins for config file"""
-        return set(self._data.get(str(cfg_path), []))
+    def get_entries(self, cfg_path: Path) -> dict:
+        """Get dict of {plugin_name: full_entry} for disabled plugins for config file."""
+        raw = self._data.get(str(cfg_path), {})
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, list):
+            out = {}
+            for item in raw:
+                if isinstance(item, str):
+                    out[item] = item
+                elif isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
+                    out[item[0]] = item
+            return out
+        return {}
 
-    def set_disabled(self, cfg_path: Path, disabled: set):
-        """Set disabled plugins for config file"""
+    def get_disabled(self, cfg_path: Path) -> set:
+        """Get set of disabled plugin names for backward compatibility."""
+        return set(self.get_entries(cfg_path).keys())
+
+    def set_entry(self, cfg_path: Path, name: str, entry):
         key = str(cfg_path)
-        if disabled:
-            self._data[key] = sorted(disabled)
-        else:
+        if key not in self._data or not isinstance(self._data[key], dict):
+            self._data[key] = {}
+        self._data[key][name] = entry
+        self._save()
+
+    def remove_entry(self, cfg_path: Path, name: str):
+        key = str(cfg_path)
+        d = self._data.get(key)
+        if isinstance(d, dict) and name in d:
+            d.pop(name, None)
+            if not d:
+                self._data.pop(key, None)
+            self._save()
+
+    def clear(self, cfg_path: Path, names=None):
+        key = str(cfg_path)
+        d = self._data.get(key)
+        if isinstance(d, dict):
+            if names is None:
+                d = {}
+            else:
+                for n in names:
+                    d.pop(n, None)
+            if d:
+                self._data[key] = d
+            else:
+                self._data.pop(key, None)
+            self._save()
+
+    def set_disabled(self, cfg_path: Path, disabled):
+        """Set disabled plugins (accepts set/list of names or dict of {name: entry})."""
+        key = str(cfg_path)
+        if not disabled:
             self._data.pop(key, None)
+            self._save()
+            return
+        if isinstance(disabled, dict):
+            self._data[key] = disabled
+        elif isinstance(disabled, (set, list, tuple)):
+            d = {}
+            for item in disabled:
+                if isinstance(item, str):
+                    d[item] = item
+                elif isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
+                    d[item[0]] = item
+            self._data[key] = d
         self._save()
 
 class TuiPluginStateStore:

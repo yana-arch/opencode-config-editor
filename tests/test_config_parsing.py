@@ -223,3 +223,67 @@ def test_config_home_falls_back_to_legacy_env(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "legacy"))
     home = app.config_home("~/.openclaude", ("OPENCLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR"))
     assert home == (tmp_path / "legacy")
+
+
+# --- JSONC & Plugin tests --------------------------------------------------
+
+def test_strip_jsonc_line_comments():
+    raw = """{
+        // Line comment
+        "key": "value", // inline comment
+        "url": "http://example.com/api" // url with slashes
+    }"""
+    clean = app.strip_jsonc(raw)
+    parsed = app.loads_jsonc(raw)
+    assert parsed == {"key": "value", "url": "http://example.com/api"}
+
+
+def test_strip_jsonc_block_comments_and_trailing_commas():
+    raw = """{
+        /* Multi-line
+           block comment */
+        "plugin": [
+            "plugin-a",
+            [
+                "plugin-b",
+                {
+                    "lang": "vi",
+                    "model": "gemini", // nested comment
+                },
+            ],
+        ],
+    }"""
+    parsed = app.loads_jsonc(raw)
+    assert parsed["plugin"] == [
+        "plugin-a",
+        ["plugin-b", {"lang": "vi", "model": "gemini"}]
+    ]
+
+
+def test_plugin_name_and_opts_extractors():
+    assert app._name_of_plugin("plugin-a") == "plugin-a"
+    assert app._opts_of_plugin("plugin-a") is None
+
+    tuple_entry = ["opencode-translate", {"lang": "Vietnamese", "direction": "inbound"}]
+    assert app._name_of_plugin(tuple_entry) == "opencode-translate"
+    assert app._opts_of_plugin(tuple_entry) == {"lang": "Vietnamese", "direction": "inbound"}
+
+
+def test_plugin_state_store_preserves_options(tmp_path):
+    store = app.PluginStateStore()
+    store.path = tmp_path / "plugin-state.json"
+    cfg_file = tmp_path / "opencode.json"
+
+    entry_a = "plain-plugin"
+    entry_b = ["custom-plugin", {"opt1": "val1"}]
+
+    store.set_entry(cfg_file, "plain-plugin", entry_a)
+    store.set_entry(cfg_file, "custom-plugin", entry_b)
+
+    entries = store.get_entries(cfg_file)
+    assert entries["plain-plugin"] == "plain-plugin"
+    assert entries["custom-plugin"] == ["custom-plugin", {"opt1": "val1"}]
+
+    disabled_names = store.get_disabled(cfg_file)
+    assert disabled_names == {"plain-plugin", "custom-plugin"}
+

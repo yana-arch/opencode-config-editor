@@ -23,7 +23,7 @@ def match_models_against_catalog(key, models_dict, catalog, reference_provider=N
                 fmt = _find_fallback(mid, reference_provider, catalog)
             if fmt is not None:
                 merged = _merge_model_spec(
-                    models_dict[mid], build_spec_from_format(fmt), overwrite=False)
+                    models_dict[mid], build_spec_from_format(fmt, mid), overwrite=False)
                 entries.append((mid, dict(models_dict[mid]), merged,
                                 f"fallback:{fmt.provider}"))
                 fallback_data[mid] = fmt
@@ -36,7 +36,7 @@ def match_models_against_catalog(key, models_dict, catalog, reference_provider=N
             ambiguous_data[mid] = (key, matches)
             continue
         merged = _merge_model_spec(
-            models_dict[mid], build_spec_from_format(chosen), overwrite=False)
+            models_dict[mid], build_spec_from_format(chosen, mid), overwrite=False)
         status = "matched" if merged != (models_dict[mid] or {}) else "unchanged"
         entries.append((mid, dict(models_dict[mid]), merged, status))
     return entries, ambiguous_data, fallback_data
@@ -401,7 +401,7 @@ class ProvidersTab(QWidget):
                     fmt = _find_fallback(mid, reference, catalog)
                 if fmt is not None:
                     merged = _merge_model_spec(
-                        prov["models"][mid], build_spec_from_format(fmt), overwrite=False)
+                        prov["models"][mid], build_spec_from_format(fmt, mid), overwrite=False)
                     entries.append((mid, dict(prov["models"][mid]), merged,
                                     f"fallback:{fmt.provider}"))
                     fallback_data[mid] = fmt
@@ -414,7 +414,7 @@ class ProvidersTab(QWidget):
                 ambiguous_data[mid] = (key, matches)
                 continue
             merged = _merge_model_spec(
-                prov["models"][mid], build_spec_from_format(chosen), overwrite=False)
+                prov["models"][mid], build_spec_from_format(chosen, mid), overwrite=False)
             status = "matched" if merged != (prov["models"][mid] or {}) else "unchanged"
             entries.append((mid, dict(prov["models"][mid]), merged, status))
 

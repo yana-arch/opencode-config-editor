@@ -24,7 +24,12 @@ class MaskedLineEdit(QWidget):
         self.edit = QLineEdit()
         self.edit.setPlaceholderText(placeholder)
         self.edit.setText(self._display_value())
-        self.edit.textChanged.connect(self.textChanged.emit)
+        # QLineEdit.textChanged carries a str, but our own textChanged is
+        # declared arg-less, so it must NOT be used as the slot directly:
+        # PySide6 raises "textChanged() only accepts 0 argument(s), 1 given!"
+        # inside the emit and the signal never reaches downstream slots (the
+        # dirty flag then stays False and the edit is silently dropped on save).
+        self.edit.textChanged.connect(self._relay_text_changed)
         layout.addWidget(self.edit)
 
         if self.is_secret:
@@ -33,6 +38,10 @@ class MaskedLineEdit(QWidget):
             self.toggle_btn.setFixedWidth(30)
             self.toggle_btn.toggled.connect(self._toggle_visibility)
             layout.addWidget(self.toggle_btn)
+
+    def _relay_text_changed(self, _text=""):
+        """Re-emit QLineEdit's str-carrying textChanged as our arg-less one."""
+        self.textChanged.emit()
 
     def _revealed(self) -> bool:
         return self.toggle_btn is not None and self.toggle_btn.isChecked()
@@ -191,9 +200,139 @@ class JsonImportDialog(QDialog):
     def _accept(self):
         """Validate and accept"""
         try:
-            self.result_data = json.loads(self.editor.toPlainText())
+            self.result_data = loads_jsonc(self.editor.toPlainText())
             self.accept()
         except json.JSONDecodeError as e:
             QMessageBox.warning(self, "Invalid JSON", str(e))
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid Data", str(e))
+
+
+class PluginOptionsDialog(QDialog):
+    """Dialog to edit/view JSON options for a plugin."""
+
+    def __init__(self, parent, plugin_name: str, options: Optional[dict] = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Plugin Options: {plugin_name}")
+        self.resize(600, 420)
+        self.result_options = None
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(f"Configure custom options for <b>{_esc_html(plugin_name)}</b> in JSON format:")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # Toolbar
+        tb_layout = QHBoxLayout()
+        format_btn = QPushButton("Format JSON")
+        format_btn.clicked.connect(self._format_json)
+        clear_btn = QPushButton("Clear Options")
+        clear_btn.clicked.connect(self._clear_options)
+        tb_layout.addWidget(format_btn)
+        tb_layout.addWidget(clear_btn)
+        tb_layout.addStretch()
+        layout.addLayout(tb_layout)
+
+        # Editor
+        self.editor = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = JSONHighlighter(self.editor.document())
+
+        initial_text = json.dumps(options, indent=2, ensure_ascii=False) if options else "{\n  \n}"
+        self.editor.setPlainText(initial_text)
+        layout.addWidget(self.editor)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _format_json(self):
+        text = self.editor.toPlainText().strip()
+        if not text:
+            return
+        try:
+            parsed = loads_jsonc(text)
+            self.editor.setPlainText(json.dumps(parsed, indent=2, ensure_ascii=False))
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid JSON", f"Cannot format invalid JSON: {e}")
+
+    def _clear_options(self):
+        self.editor.setPlainText("")
+
+    def _accept(self):
+        text = self.editor.toPlainText().strip()
+        if not text or text == "{}":
+            self.result_options = None
+            self.accept()
+            return
+
+        try:
+            parsed = loads_jsonc(text)
+            if not isinstance(parsed, dict):
+                QMessageBox.warning(self, "Invalid Type", "Plugin options must be a JSON object ({...}) or empty.")
+                return
+            self.result_options = parsed if parsed else None
+            self.accept()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid JSON", f"Error parsing JSON options: {e}")
+
+
+class AddPluginDialog(QDialog):
+    """Dialog to add a new plugin with name and optional initial options."""
+
+    def __init__(self, parent, default_name: str = "@opencode/plugin-example"):
+        super().__init__(parent)
+        self.setWindowTitle("Add Plugin")
+        self.resize(550, 380)
+        self.plugin_name = ""
+        self.plugin_options = None
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Plugin specifier (npm package or local path):"))
+        self.name_edit = QLineEdit(default_name)
+        layout.addWidget(self.name_edit)
+
+        layout.addWidget(QLabel("Options (JSON object, optional):"))
+        self.options_edit = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.options_edit.setFont(font)
+        self.options_edit.setPlaceholderText('{\n  "key": "value"\n}')
+        self.highlighter = JSONHighlighter(self.options_edit.document())
+        layout.addWidget(self.options_edit)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _accept(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing Name", "Plugin specifier cannot be empty.")
+            return
+
+        opts_text = self.options_edit.toPlainText().strip()
+        opts = None
+        if opts_text and opts_text != "{}":
+            try:
+                parsed = loads_jsonc(opts_text)
+                if not isinstance(parsed, dict):
+                    QMessageBox.warning(self, "Invalid Options", "Options must be a JSON object ({...}).")
+                    return
+                opts = parsed
+            except Exception as e:
+                QMessageBox.warning(self, "Invalid JSON", f"Error parsing options JSON: {e}")
+                return
+
+        self.plugin_name = name
+        self.plugin_options = opts
+        self.accept()
 
 

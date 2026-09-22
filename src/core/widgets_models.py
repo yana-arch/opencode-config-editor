@@ -286,7 +286,7 @@ class ModelsManagerDialog(QDialog):
             self.table.setItem(row, 0, QTableWidgetItem(model_id))
 
             # Name
-            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name", "")))
+            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name") or humanize_model_id(model_id)))
 
             # Attachment
             self.table.setItem(row, 2, QTableWidgetItem("✓" if spec.get("attachment") else ""))
@@ -347,7 +347,7 @@ class ModelsManagerDialog(QDialog):
                 spec = {}
 
             self.table.setItem(row, 0, QTableWidgetItem(model_id))
-            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name", "")))
+            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name") or humanize_model_id(model_id)))
             self.table.setItem(row, 2, QTableWidgetItem("✓" if spec.get("attachment") else ""))
             self.table.setItem(row, 3, QTableWidgetItem("✓" if spec.get("reasoning") else ""))
 
@@ -565,7 +565,7 @@ class ModelsManagerDialog(QDialog):
                 ambiguous_data[mid] = (self.provider_key, matches)
                 continue
             merged = _merge_model_spec(
-                self.models[mid], build_spec_from_format(chosen), overwrite=False)
+                self.models[mid], build_spec_from_format(chosen, mid), overwrite=False)
             status = "matched" if merged != (self.models[mid] or {}) else "unchanged"
             entries.append((mid, dict(self.models[mid]), merged, status))
 

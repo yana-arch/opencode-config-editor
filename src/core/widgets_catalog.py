@@ -377,7 +377,7 @@ class MatchFormatPreviewDialog(QDialog):
                 combo.currentIndexChanged.connect(
                     lambda _, r=row, mm=mid: self._on_combo_change(r, mm))
                 # reflect the default selection now
-                self.resolved_specs[mid] = build_spec_from_format(combo.currentData())
+                self.resolved_specs[mid] = build_spec_from_format(combo.currentData(), mid)
                 self._refresh_new_cell(row, mid)
             else:
                 combo.setEnabled(False)
@@ -403,7 +403,7 @@ class MatchFormatPreviewDialog(QDialog):
                 continue
             for m in matches:
                 counts[m.provider] = counts.get(m.provider, 0) + 1
-        self.bulk_combo.clear()
+            self.bulk_combo.clear()
         for prov, _n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
             self.bulk_combo.addItem(prov)
         n_ambiguous = sum(1 for e in self.entries if e[3] == "ambiguous")
@@ -429,7 +429,7 @@ class MatchFormatPreviewDialog(QDialog):
         if dlg.exec() != QDialog.Accepted or dlg.selected_format is None:
             return
         fmt = dlg.selected_format
-        spec = build_spec_from_format(fmt)
+        spec = build_spec_from_format(fmt, mid)
         self.mapped_specs[mid] = spec
         self.mapped_ids[mid] = fmt.model_id
         # Update the entry in place so selected_entries carries the new spec.
@@ -462,7 +462,7 @@ class MatchFormatPreviewDialog(QDialog):
         combo = self.table.cellWidget(row, 5).findChild(QComboBox)
         fmt = combo.currentData()
         if fmt is not None:
-            self.resolved_specs[mid] = build_spec_from_format(fmt)
+            self.resolved_specs[mid] = build_spec_from_format(fmt, mid)
             self._refresh_new_cell(row, mid)
             check = self.table.cellWidget(row, 0)
             if check is not None:
@@ -1123,7 +1123,7 @@ class ApplyCatalogDialog(QDialog):
                                       ", ".join(m.provider for m in matches),
                                       "ambiguous", "", ""])
                     continue
-                spec = build_spec_from_format(chosen)
+                spec = build_spec_from_format(chosen, mid)
                 merged = _merge_model_spec(models[mid], spec, overwrite)
                 status = "matched" if merged != (models[mid] or {}) else "unchanged"
                 self.rows.append([mid, prov_name, chosen.provider, status,

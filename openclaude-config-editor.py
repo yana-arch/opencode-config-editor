@@ -352,6 +352,58 @@ class JSONHighlighter(QSyntaxHighlighter):
                 start, end = match.span()
                 self.setFormat(start, end - start, fmt)
 
+def strip_jsonc(text: str) -> str:
+    """Strip JavaScript-style comments (//... and /*...*/) and trailing commas
+    from a JSON string without breaking string literals."""
+    if not text:
+        return ""
+    out = []
+    i = 0
+    n = len(text)
+    in_string = False
+    escape = False
+
+    while i < n:
+        c = text[i]
+        if in_string:
+            out.append(c)
+            if escape:
+                escape = False
+            elif c == '\\':
+                escape = True
+            elif c == '"':
+                in_string = False
+            i += 1
+        else:
+            if c == '"':
+                in_string = True
+                out.append(c)
+                i += 1
+            elif c == '/' and i + 1 < n and text[i + 1] == '/':
+                i += 2
+                while i < n and text[i] != '\n':
+                    i += 1
+            elif c == '/' and i + 1 < n and text[i + 1] == '*':
+                i += 2
+                while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
+                    i += 1
+                i += 2
+            else:
+                out.append(c)
+                i += 1
+
+    clean = "".join(out)
+    clean = re.sub(r',\s*(\}|\])', r'\1', clean)
+    return clean
+
+
+def loads_jsonc(text: str):
+    """Parse a JSON or JSONC string, accepting comments and trailing commas."""
+    if not isinstance(text, str):
+        raise TypeError(f"Expected string, got {type(text)}")
+    return json.loads(strip_jsonc(text))
+
+
 def section(cfg_data, key: str) -> dict:
     """Return cfg_data[key] when it is a dict, else an empty dict."""
     v = cfg_data.get(key) if isinstance(cfg_data, dict) else None
@@ -455,7 +507,7 @@ class ConfigFile:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 raw = f.read()
-            self.data = json.loads(raw)
+            self.data = loads_jsonc(raw)
             self.error = None
             return True
         except FileNotFoundError:
@@ -656,7 +708,8 @@ def _path_of(e) -> str:
         return "?"
 
 class PluginStateStore:
-    """Enhanced plugin state store with persistence"""
+    """Remember disabled opencode plugins in the editor cache, keying each by name and
+    storing its full entry so re-enabling restores tuple-form options verbatim."""
 
     def __init__(self):
         self.path = PLUGIN_STATE_CACHE
@@ -667,7 +720,7 @@ class PluginStateStore:
         """Load plugin state from cache"""
         try:
             if self.path.exists():
-                self._data = json.loads(self.path.read_text())
+                self._data = loads_jsonc(self.path.read_text(encoding="utf-8"))
         except Exception:
             self._data = {}
 
@@ -675,21 +728,77 @@ class PluginStateStore:
         """Save plugin state to cache"""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._data, indent=2))
+            self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
         except OSError:
             pass
 
-    def get_disabled(self, cfg_path: Path) -> set:
-        """Get disabled plugins for config file"""
-        return set(self._data.get(str(cfg_path), []))
+    def get_entries(self, cfg_path: Path) -> dict:
+        """Get dict of {plugin_name: full_entry} for disabled plugins for config file."""
+        raw = self._data.get(str(cfg_path), {})
+        if isinstance(raw, dict):
+            return dict(raw)
+        if isinstance(raw, list):
+            out = {}
+            for item in raw:
+                if isinstance(item, str):
+                    out[item] = item
+                elif isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
+                    out[item[0]] = item
+            return out
+        return {}
 
-    def set_disabled(self, cfg_path: Path, disabled: set):
-        """Set disabled plugins for config file"""
+    def get_disabled(self, cfg_path: Path) -> set:
+        """Get set of disabled plugin names for backward compatibility."""
+        return set(self.get_entries(cfg_path).keys())
+
+    def set_entry(self, cfg_path: Path, name: str, entry):
         key = str(cfg_path)
-        if disabled:
-            self._data[key] = sorted(disabled)
-        else:
+        if key not in self._data or not isinstance(self._data[key], dict):
+            self._data[key] = {}
+        self._data[key][name] = entry
+        self._save()
+
+    def remove_entry(self, cfg_path: Path, name: str):
+        key = str(cfg_path)
+        d = self._data.get(key)
+        if isinstance(d, dict) and name in d:
+            d.pop(name, None)
+            if not d:
+                self._data.pop(key, None)
+            self._save()
+
+    def clear(self, cfg_path: Path, names=None):
+        key = str(cfg_path)
+        d = self._data.get(key)
+        if isinstance(d, dict):
+            if names is None:
+                d = {}
+            else:
+                for n in names:
+                    d.pop(n, None)
+            if d:
+                self._data[key] = d
+            else:
+                self._data.pop(key, None)
+            self._save()
+
+    def set_disabled(self, cfg_path: Path, disabled):
+        """Set disabled plugins (accepts set/list of names or dict of {name: entry})."""
+        key = str(cfg_path)
+        if not disabled:
             self._data.pop(key, None)
+            self._save()
+            return
+        if isinstance(disabled, dict):
+            self._data[key] = disabled
+        elif isinstance(disabled, (set, list, tuple)):
+            d = {}
+            for item in disabled:
+                if isinstance(item, str):
+                    d[item] = item
+                elif isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
+                    d[item[0]] = item
+            self._data[key] = d
         self._save()
 
 class TuiPluginStateStore:
@@ -965,11 +1074,22 @@ class ModelCatalog:
         if model_id in self._model_index:
             matches.add(model_id)
 
-        # Normalized match
-        normalized_id = _normalize_model_id(model_id)
-        if normalized_id in self.normalized_index:
-            for original_id in self.normalized_index[normalized_id]:
+        # Full normalized match (most precise).
+        full = _normalize_model_id(model_id)
+        if full in self.normalized_index:
+            for original_id in self.normalized_index[full]:
                 matches.add(original_id)
+
+        # Fallback: version-stripped variants, e.g. "df/claude-opus-4.8" ->
+        # "claude-opus-4", so a config id still resolves when the catalog only
+        # lists the major version. Only consulted when nothing matched above.
+        if not matches:
+            for key in _normalized_match_keys(model_id):
+                if key == full:
+                    continue
+                if key in self.normalized_index:
+                    for original_id in self.normalized_index[key]:
+                        matches.add(original_id)
 
         if not matches:
             return []
@@ -1145,7 +1265,7 @@ class ModelFormat:
         return cls(
             provider=provider,
             model_id=model_id,
-            name=str(spec.get("name") or model_id),
+            name=str(spec.get("name") or humanize_model_id(model_id)),
             context=_as_int(context),
             output=_as_int(output),
             modalities=mods,
@@ -1220,10 +1340,61 @@ def _fmt_cost(v) -> str:
     return f"${v:.4f}"
 
 
-def build_spec_from_format(fmt: ModelFormat) -> dict:
-    """Convert a normalized ModelFormat back into a config-shaped spec."""
+# Tokens rendered as uppercase acronyms in derived display names.
+_NAME_ACRONYMS = {
+    "gpt": "GPT", "api": "API", "url": "URL", "http": "HTTP", "https": "HTTPS",
+    "ai": "AI", "ml": "ML", "llm": "LLM", "ui": "UI", "cli": "CLI", "json": "JSON",
+    "xml": "XML", "html": "HTML", "css": "CSS", "js": "JS", "ts": "TS",
+    "db": "DB", "id": "ID", "qa": "QA", "v": "v", "glm": "GLM", "dbrx": "DBRX",
+    "qwen": "Qwen", "deepseek": "DeepSeek", "llama": "Llama", "mistral": "Mistral",
+    "claude": "Claude", "gemini": "Gemini", "phi": "Phi", "gemma": "Gemma",
+    "yi": "Yi", "r1": "R1", "v3": "V3", "v2": "V2", "v1": "V1",
+}
+
+
+def humanize_model_id(model_id: str) -> str:
+    """Derive a readable label from a model id, e.g.
+    ``glm-5.3-flash`` -> ``GLM 5.3 Flash``,
+    ``claude-opus-4.8-thinking`` -> ``Claude Opus 4.8 Thinking``.
+
+    Used when creating or formatting a model spec so that the model's display name
+    is derived directly from its own model ID rather than inheriting an outdated
+    or mismatched name from a fallback/matched catalog entry.
+    """
+    if not model_id:
+        return model_id
+    s = _NAMESPACE_RE.sub("", str(model_id).strip())
+    parts = re.split(r"[-_/:]", s)
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        low = p.lower()
+        if low in _NAME_ACRONYMS:
+            out.append(_NAME_ACRONYMS[low])
+        elif re.fullmatch(r"\d+(\.\d+)*", p) or re.fullmatch(r"\d{6,8}", p):
+            out.append(p)
+        elif re.fullmatch(r"\d+[xX]\d+[bBmMkK]|\d+[bBmMkK]", p):
+            out.append(p.upper())
+        else:
+            out.append(p[:1].upper() + p[1:].lower())
+    return " ".join(out)
+
+
+def build_spec_from_format(fmt: ModelFormat, model_id: Optional[str] = None) -> dict:
+    """Convert a normalized ModelFormat back into a config-shaped spec.
+
+    When `model_id` is supplied, the spec name is set according to `model_id`
+    (e.g. humanized name derived from `model_id`) to ensure models like
+    `glm-5.3-flash` get `GLM 5.3 Flash` instead of the name of the matched entry.
+    """
     spec = {}
-    if fmt.name and fmt.name != fmt.model_id:
+    if model_id is not None:
+        if fmt.model_id == model_id and fmt.name and fmt.name != fmt.model_id:
+            spec["name"] = fmt.name
+        else:
+            spec["name"] = humanize_model_id(model_id)
+    elif fmt.name and fmt.name != fmt.model_id:
         spec["name"] = fmt.name
 
     limit = {}
@@ -1369,6 +1540,15 @@ _VERSION_SUFFIX = re.compile(
 
 # Prefixes and suffixes to strip during normalization. Order matters for suffixes.
 _NORM_PREFIXES = ("google/", "google:", "anthropic.", "openai:", "zh-", "en-")
+
+# A leading "namespace" token followed by '/' or ':', e.g. "df/", "anthropic/",
+# "openai:". Stripped so that "df/claude-opus-4.8" collapses to "claude-opus-4.8"
+# and matches catalog entries stored under any other (or no) namespace.
+_NAMESPACE_RE = re.compile(r'^[^/:]+[/:]')
+
+# A trailing dotted version (e.g. "4.8", "2.1", "3.5.2") reduced to its major,
+# so "claude-opus-4.8" -> "claude-opus-4" and matches "claude-opus-4".
+_DOTTED_VERSION_RE = re.compile(r'(-\d+)(?:\.\d+)+$')
 _NORM_SUFFIXES = (
     "-thinking",
     "-online",
@@ -1383,10 +1563,15 @@ _NORM_SUFFIXES = (
 
 def _normalize_model_id(mid: str) -> str:
     """Normalize a model id for fuzzy matching: lowercase, hyphens,
-    and trailing version/date/general suffixes stripped."""
+    a leading namespace token, and trailing version/date/general suffixes stripped."""
     s = str(mid).strip().lower().replace("_", "-")
 
-    # Strip prefixes
+    # Strip leading namespace/provider tokens ("df/", "anthropic:", ...).
+    # Looped so "df/anthropic/claude" -> "anthropic/claude" -> "claude".
+    while _NAMESPACE_RE.match(s):
+        s = _NAMESPACE_RE.sub("", s, count=1)
+
+    # Strip curated prefixes
     for prefix in _NORM_PREFIXES:
         if s.startswith(prefix):
             s = s[len(prefix):]
@@ -1412,6 +1597,45 @@ def _normalize_model_id(mid: str) -> str:
     return s.strip("-") or str(mid).strip().lower()
 
 
+def _normalized_match_keys(model_id: str) -> List[str]:
+    """Candidate normalized keys for matching, most specific first.
+
+    Starts from the fully-normalized id, then progressively drops trailing
+    version/date segments so that e.g. ``df/claude-opus-4.8`` can also match a
+    catalog entry stored as ``anthropic/claude-opus-4`` or ``claude-opus``.
+    """
+    base = _normalize_model_id(model_id)
+    if not base:
+        return []
+    keys = [base]
+    cur = base
+    while True:
+        new = None
+        # 1) Reduce a trailing "N.M" dotted version to its major "N".
+        red = _DOTTED_VERSION_RE.sub(r"\1", cur)
+        if red != cur and red:
+            new = red
+        # 2) Drop a trailing version/date token (vN, dates, latest, ...).
+        if new is None:
+            red = _VERSION_SUFFIX.sub("", cur)
+            if red != cur and red:
+                new = red
+        # 3) Drop a bare trailing "-N" or "-N.M" version.
+        if new is None:
+            m = re.search(r'-\d+(?:\.\d+)*$', cur)
+            if m:
+                red = cur[:m.start()]
+                if red:
+                    new = red
+        if new is None or new in keys:
+            break
+        keys.append(new)
+        cur = new
+    return keys
+
+
+
+
 def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     """Try to find a catalog format for an unmatched model id.
 
@@ -1434,16 +1658,35 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     if not normalized:
         return None
 
-    # (b) normalized match within the reference provider first
+    # (b) full normalized match within the reference provider first.
     if reference_provider:
-        pmap = formats.get(reference_provider, {})
-        if normalized in pmap:
-            return pmap[normalized]
+        for cand_id, fmt in formats.get(reference_provider, {}).items():
+            if _normalize_model_id(cand_id) == normalized:
+                return fmt
 
-    # (c) normalized match anywhere in the catalog
+    # (c) full normalized match anywhere in the catalog.
     for pid, pmap in formats.items():
-        if normalized in pmap:
-            return pmap[normalized]
+        for cand_id, fmt in pmap.items():
+            if _normalize_model_id(cand_id) == normalized:
+                return fmt
+
+    # (b') version-stripped variants within the reference provider.
+    for key in _normalized_match_keys(mid):
+        if key == normalized:
+            continue
+        if reference_provider:
+            for cand_id, fmt in formats.get(reference_provider, {}).items():
+                if _normalize_model_id(cand_id) == key:
+                    return fmt
+
+    # (c') version-stripped variants anywhere in the catalog.
+    for key in _normalized_match_keys(mid):
+        if key == normalized:
+            continue
+        for pid, pmap in formats.items():
+            for cand_id, fmt in pmap.items():
+                if _normalize_model_id(cand_id) == key:
+                    return fmt
 
     # (d) longest shared prefix within the reference provider
     if reference_provider:
@@ -1868,7 +2111,12 @@ class MaskedLineEdit(QWidget):
         self.edit = QLineEdit()
         self.edit.setPlaceholderText(placeholder)
         self.edit.setText(self._display_value())
-        self.edit.textChanged.connect(self.textChanged.emit)
+        # QLineEdit.textChanged carries a str, but our own textChanged is
+        # declared arg-less, so it must NOT be used as the slot directly:
+        # PySide6 raises "textChanged() only accepts 0 argument(s), 1 given!"
+        # inside the emit and the signal never reaches downstream slots (the
+        # dirty flag then stays False and the edit is silently dropped on save).
+        self.edit.textChanged.connect(self._relay_text_changed)
         layout.addWidget(self.edit)
 
         if self.is_secret:
@@ -1877,6 +2125,10 @@ class MaskedLineEdit(QWidget):
             self.toggle_btn.setFixedWidth(30)
             self.toggle_btn.toggled.connect(self._toggle_visibility)
             layout.addWidget(self.toggle_btn)
+
+    def _relay_text_changed(self, _text=""):
+        """Re-emit QLineEdit's str-carrying textChanged as our arg-less one."""
+        self.textChanged.emit()
 
     def _revealed(self) -> bool:
         return self.toggle_btn is not None and self.toggle_btn.isChecked()
@@ -2035,10 +2287,140 @@ class JsonImportDialog(QDialog):
     def _accept(self):
         """Validate and accept"""
         try:
-            self.result_data = json.loads(self.editor.toPlainText())
+            self.result_data = loads_jsonc(self.editor.toPlainText())
             self.accept()
         except json.JSONDecodeError as e:
             QMessageBox.warning(self, "Invalid JSON", str(e))
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid Data", str(e))
+
+
+class PluginOptionsDialog(QDialog):
+    """Dialog to edit/view JSON options for a plugin."""
+
+    def __init__(self, parent, plugin_name: str, options: Optional[dict] = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Plugin Options: {plugin_name}")
+        self.resize(600, 420)
+        self.result_options = None
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(f"Configure custom options for <b>{_esc_html(plugin_name)}</b> in JSON format:")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # Toolbar
+        tb_layout = QHBoxLayout()
+        format_btn = QPushButton("Format JSON")
+        format_btn.clicked.connect(self._format_json)
+        clear_btn = QPushButton("Clear Options")
+        clear_btn.clicked.connect(self._clear_options)
+        tb_layout.addWidget(format_btn)
+        tb_layout.addWidget(clear_btn)
+        tb_layout.addStretch()
+        layout.addLayout(tb_layout)
+
+        # Editor
+        self.editor = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.editor.setFont(font)
+        self.highlighter = JSONHighlighter(self.editor.document())
+
+        initial_text = json.dumps(options, indent=2, ensure_ascii=False) if options else "{\n  \n}"
+        self.editor.setPlainText(initial_text)
+        layout.addWidget(self.editor)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _format_json(self):
+        text = self.editor.toPlainText().strip()
+        if not text:
+            return
+        try:
+            parsed = loads_jsonc(text)
+            self.editor.setPlainText(json.dumps(parsed, indent=2, ensure_ascii=False))
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid JSON", f"Cannot format invalid JSON: {e}")
+
+    def _clear_options(self):
+        self.editor.setPlainText("")
+
+    def _accept(self):
+        text = self.editor.toPlainText().strip()
+        if not text or text == "{}":
+            self.result_options = None
+            self.accept()
+            return
+
+        try:
+            parsed = loads_jsonc(text)
+            if not isinstance(parsed, dict):
+                QMessageBox.warning(self, "Invalid Type", "Plugin options must be a JSON object ({...}) or empty.")
+                return
+            self.result_options = parsed if parsed else None
+            self.accept()
+        except Exception as e:
+            QMessageBox.warning(self, "Invalid JSON", f"Error parsing JSON options: {e}")
+
+
+class AddPluginDialog(QDialog):
+    """Dialog to add a new plugin with name and optional initial options."""
+
+    def __init__(self, parent, default_name: str = "@opencode/plugin-example"):
+        super().__init__(parent)
+        self.setWindowTitle("Add Plugin")
+        self.resize(550, 380)
+        self.plugin_name = ""
+        self.plugin_options = None
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Plugin specifier (npm package or local path):"))
+        self.name_edit = QLineEdit(default_name)
+        layout.addWidget(self.name_edit)
+
+        layout.addWidget(QLabel("Options (JSON object, optional):"))
+        self.options_edit = QPlainTextEdit()
+        font = QFont("Monospace")
+        font.setStyleHint(QFont.Monospace)
+        self.options_edit.setFont(font)
+        self.options_edit.setPlaceholderText('{\n  "key": "value"\n}')
+        self.highlighter = JSONHighlighter(self.options_edit.document())
+        layout.addWidget(self.options_edit)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _accept(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Missing Name", "Plugin specifier cannot be empty.")
+            return
+
+        opts_text = self.options_edit.toPlainText().strip()
+        opts = None
+        if opts_text and opts_text != "{}":
+            try:
+                parsed = loads_jsonc(opts_text)
+                if not isinstance(parsed, dict):
+                    QMessageBox.warning(self, "Invalid Options", "Options must be a JSON object ({...}).")
+                    return
+                opts = parsed
+            except Exception as e:
+                QMessageBox.warning(self, "Invalid JSON", f"Error parsing options JSON: {e}")
+                return
+
+        self.plugin_name = name
+        self.plugin_options = opts
+        self.accept()
 
 
 # Shared base for form-style tabs.
@@ -2413,7 +2795,7 @@ class ModelsManagerDialog(QDialog):
             self.table.setItem(row, 0, QTableWidgetItem(model_id))
 
             # Name
-            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name", "")))
+            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name") or humanize_model_id(model_id)))
 
             # Attachment
             self.table.setItem(row, 2, QTableWidgetItem("✓" if spec.get("attachment") else ""))
@@ -2474,7 +2856,7 @@ class ModelsManagerDialog(QDialog):
                 spec = {}
 
             self.table.setItem(row, 0, QTableWidgetItem(model_id))
-            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name", "")))
+            self.table.setItem(row, 1, QTableWidgetItem(spec.get("name") or humanize_model_id(model_id)))
             self.table.setItem(row, 2, QTableWidgetItem("✓" if spec.get("attachment") else ""))
             self.table.setItem(row, 3, QTableWidgetItem("✓" if spec.get("reasoning") else ""))
 
@@ -2692,7 +3074,7 @@ class ModelsManagerDialog(QDialog):
                 ambiguous_data[mid] = (self.provider_key, matches)
                 continue
             merged = _merge_model_spec(
-                self.models[mid], build_spec_from_format(chosen), overwrite=False)
+                self.models[mid], build_spec_from_format(chosen, mid), overwrite=False)
             status = "matched" if merged != (self.models[mid] or {}) else "unchanged"
             entries.append((mid, dict(self.models[mid]), merged, status))
 
@@ -3221,7 +3603,7 @@ class MatchFormatPreviewDialog(QDialog):
                 combo.currentIndexChanged.connect(
                     lambda _, r=row, mm=mid: self._on_combo_change(r, mm))
                 # reflect the default selection now
-                self.resolved_specs[mid] = build_spec_from_format(combo.currentData())
+                self.resolved_specs[mid] = build_spec_from_format(combo.currentData(), mid)
                 self._refresh_new_cell(row, mid)
             else:
                 combo.setEnabled(False)
@@ -3247,7 +3629,7 @@ class MatchFormatPreviewDialog(QDialog):
                 continue
             for m in matches:
                 counts[m.provider] = counts.get(m.provider, 0) + 1
-        self.bulk_combo.clear()
+            self.bulk_combo.clear()
         for prov, _n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
             self.bulk_combo.addItem(prov)
         n_ambiguous = sum(1 for e in self.entries if e[3] == "ambiguous")
@@ -3273,7 +3655,7 @@ class MatchFormatPreviewDialog(QDialog):
         if dlg.exec() != QDialog.Accepted or dlg.selected_format is None:
             return
         fmt = dlg.selected_format
-        spec = build_spec_from_format(fmt)
+        spec = build_spec_from_format(fmt, mid)
         self.mapped_specs[mid] = spec
         self.mapped_ids[mid] = fmt.model_id
         # Update the entry in place so selected_entries carries the new spec.
@@ -3306,7 +3688,7 @@ class MatchFormatPreviewDialog(QDialog):
         combo = self.table.cellWidget(row, 5).findChild(QComboBox)
         fmt = combo.currentData()
         if fmt is not None:
-            self.resolved_specs[mid] = build_spec_from_format(fmt)
+            self.resolved_specs[mid] = build_spec_from_format(fmt, mid)
             self._refresh_new_cell(row, mid)
             check = self.table.cellWidget(row, 0)
             if check is not None:
@@ -3967,7 +4349,7 @@ class ApplyCatalogDialog(QDialog):
                                       ", ".join(m.provider for m in matches),
                                       "ambiguous", "", ""])
                     continue
-                spec = build_spec_from_format(chosen)
+                spec = build_spec_from_format(chosen, mid)
                 merged = _merge_model_spec(models[mid], spec, overwrite)
                 status = "matched" if merged != (models[mid] or {}) else "unchanged"
                 self.rows.append([mid, prov_name, chosen.provider, status,
@@ -4062,7 +4444,7 @@ def match_models_against_catalog(key, models_dict, catalog, reference_provider=N
                 fmt = _find_fallback(mid, reference_provider, catalog)
             if fmt is not None:
                 merged = _merge_model_spec(
-                    models_dict[mid], build_spec_from_format(fmt), overwrite=False)
+                    models_dict[mid], build_spec_from_format(fmt, mid), overwrite=False)
                 entries.append((mid, dict(models_dict[mid]), merged,
                                 f"fallback:{fmt.provider}"))
                 fallback_data[mid] = fmt
@@ -4075,7 +4457,7 @@ def match_models_against_catalog(key, models_dict, catalog, reference_provider=N
             ambiguous_data[mid] = (key, matches)
             continue
         merged = _merge_model_spec(
-            models_dict[mid], build_spec_from_format(chosen), overwrite=False)
+            models_dict[mid], build_spec_from_format(chosen, mid), overwrite=False)
         status = "matched" if merged != (models_dict[mid] or {}) else "unchanged"
         entries.append((mid, dict(models_dict[mid]), merged, status))
     return entries, ambiguous_data, fallback_data
@@ -4440,7 +4822,7 @@ class ProvidersTab(QWidget):
                     fmt = _find_fallback(mid, reference, catalog)
                 if fmt is not None:
                     merged = _merge_model_spec(
-                        prov["models"][mid], build_spec_from_format(fmt), overwrite=False)
+                        prov["models"][mid], build_spec_from_format(fmt, mid), overwrite=False)
                     entries.append((mid, dict(prov["models"][mid]), merged,
                                     f"fallback:{fmt.provider}"))
                     fallback_data[mid] = fmt
@@ -4453,7 +4835,7 @@ class ProvidersTab(QWidget):
                 ambiguous_data[mid] = (key, matches)
                 continue
             merged = _merge_model_spec(
-                prov["models"][mid], build_spec_from_format(chosen), overwrite=False)
+                prov["models"][mid], build_spec_from_format(chosen, mid), overwrite=False)
             status = "matched" if merged != (prov["models"][mid] or {}) else "unchanged"
             entries.append((mid, dict(prov["models"][mid]), merged, status))
 
@@ -4991,14 +5373,42 @@ class McpTab(QWidget):
         pass
 
 # Plugins tab
+def _name_of_plugin(entry) -> str:
+    """Extract plugin name/specifier from string or [name, options] tuple."""
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, (list, tuple)) and entry and isinstance(entry[0], str):
+        return entry[0].strip()
+    return ""
+
+
+def _opts_of_plugin(entry) -> Optional[dict]:
+    """Extract options dict from [name, options] tuple, if any."""
+    if isinstance(entry, (list, tuple)) and len(entry) >= 2 and isinstance(entry[1], dict):
+        return entry[1]
+    return None
+
+
+def _format_opts_summary(opts: Optional[dict]) -> str:
+    """Format short summary of options for table display."""
+    if not opts:
+        return ""
+    try:
+        s = json.dumps(opts, ensure_ascii=False)
+        return s if len(s) <= 45 else s[:42] + "..."
+    except Exception:
+        return "(options)"
+
+
 class PluginsTab(QWidget):
-    """Enhanced plugins tab with search and bulk operations"""
+    """Enhanced plugins tab with search, options configuration, and bulk operations."""
 
     def __init__(self, app):
         super().__init__()
         self.app = app
         self.state_store = PluginStateStore()
-        self.cbs = {}  # plugin -> QCheckBox
+        self.cbs = {}  # name -> QCheckBox
+        self._entries = {}  # name -> full_entry (str or [name, opts])
 
         layout = QVBoxLayout(self)
 
@@ -5006,7 +5416,7 @@ class PluginsTab(QWidget):
         top_layout = QHBoxLayout()
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search plugins...")
+        self.search_edit.setPlaceholderText("Search plugins or options...")
         self.search_edit.textChanged.connect(self._filter_plugins)
         top_layout.addWidget(self.search_edit)
 
@@ -5026,126 +5436,221 @@ class PluginsTab(QWidget):
 
         # Table
         self.table = QTableWidget()
-        self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Enabled", "Plugin"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Enabled", "Plugin", "Options", "Actions"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.table.cellDoubleClicked.connect(self._on_double_click)
         layout.addWidget(self.table)
 
         # Status
         self.status_label = QLabel(
-            "Disabled plugins are removed from the saved config but remembered "
-            "so you can re-enable them later."
+            "Disabled plugins are removed from the saved config but remembered in cache "
+            "with their options intact so you can re-enable them later."
         )
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: gray;")
         layout.addWidget(self.status_label)
 
+    def _get_raw_plugins(self) -> list:
+        """Get plugin list from config data."""
+        plugins = self.app.cfg.data.get("plugin", []) if self.app.cfg else []
+        return plugins if isinstance(plugins, list) else []
+
+    def _display_entries(self) -> List[Any]:
+        """Combine active plugins from config and remembered-disabled ones."""
+        active = self._get_raw_plugins()
+        seen_names = set()
+        entries = []
+
+        # 1) Add active config entries
+        for e in active:
+            name = _name_of_plugin(e)
+            if name and name not in seen_names:
+                seen_names.add(name)
+                entries.append(e)
+
+        # 2) Add remembered disabled entries from state store
+        if self.app.cfg:
+            disabled_entries = self.state_store.get_entries(self.app.cfg.path)
+            for name, entry in sorted(disabled_entries.items()):
+                if name not in seen_names:
+                    seen_names.add(name)
+                    entries.append(entry)
+
+        return entries
+
     def _filter_plugins(self, text: str):
-        """Filter plugins by search text"""
+        """Filter plugins by search text matching name or options."""
         if not text:
             self.refresh()
             return
 
         text = text.lower()
-        plugins = self._get_plugins()
-        disabled = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+        all_entries = self._display_entries()
+        disabled_names = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
 
-        filtered = [
-            (p, p not in disabled) for p in plugins
-            if text in p.lower()
-        ]
+        filtered = []
+        for e in all_entries:
+            name = _name_of_plugin(e)
+            opts = _opts_of_plugin(e)
+            opts_str = json.dumps(opts, ensure_ascii=False).lower() if opts else ""
+            if text in name.lower() or text in opts_str:
+                filtered.append((e, name not in disabled_names))
 
-        self._update_table(filtered)
+        self._populate_table(filtered)
 
-    def _update_table(self, plugins: Optional[List[Tuple[str, bool]]] = None):
-        """Update table with plugins"""
-        if plugins is None:
-            plugins = self._get_plugins()
-            disabled = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
-            plugins = [(p, p not in disabled) for p in plugins]
+    def _update_table(self):
+        """Update table with full current entries list."""
+        all_entries = self._display_entries()
+        disabled_names = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+        pairs = [(e, _name_of_plugin(e) not in disabled_names) for e in all_entries]
+        self._populate_table(pairs)
 
-        self.table.setRowCount(len(plugins))
+    def _populate_table(self, pairs: List[Tuple[Any, bool]]):
+        """Populate table widget rows."""
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(pairs))
         self.cbs = {}
+        self._entries = {}
 
-        for row, (plugin, enabled) in enumerate(plugins):
-            # Enabled checkbox
-            enabled_check = QCheckBox()
-            enabled_check.setChecked(enabled)
-            enabled_check.stateChanged.connect(self.app.mark_dirty)
+        for row, (entry, enabled) in enumerate(pairs):
+            name = _name_of_plugin(entry)
+            opts = _opts_of_plugin(entry)
+            self._entries[name] = entry
+
+            # Col 0: Enabled checkbox
+            cb = QCheckBox()
+            cb.setChecked(enabled)
+            cb.stateChanged.connect(self.app.mark_dirty)
             cell = QWidget()
             cell_layout = QHBoxLayout(cell)
             cell_layout.setContentsMargins(0, 0, 0, 0)
             cell_layout.setAlignment(Qt.AlignCenter)
-            cell_layout.addWidget(enabled_check)
+            cell_layout.addWidget(cb)
             self.table.setCellWidget(row, 0, cell)
-            self.cbs[plugin] = enabled_check
+            self.cbs[name] = cb
 
-            # Plugin
-            self.table.setItem(row, 1, QTableWidgetItem(plugin))
+            # Col 1: Plugin name
+            name_item = QTableWidgetItem(name)
+            self.table.setItem(row, 1, name_item)
 
-    def _get_plugins(self) -> List[str]:
-        """Get all plugins: active (from config) plus remembered-disabled ones,
-        so disabled plugins reappear in the list and can be re-enabled."""
-        plugins = self.app.cfg.data.get("plugin", []) if self.app.cfg else []
-        if not isinstance(plugins, list):
-            plugins = []
-        active = {str(p) for p in plugins}
-        if self.app.cfg is not None:
-            active |= self.state_store.get_disabled(self.app.cfg.path)
-        return sorted(active)
+            # Col 2: Options summary
+            opts_item = QTableWidgetItem(_format_opts_summary(opts))
+            if opts:
+                opts_item.setToolTip(json.dumps(opts, indent=2, ensure_ascii=False))
+            self.table.setItem(row, 2, opts_item)
+
+            # Col 3: Configure Options button
+            cfg_btn = QPushButton("⚙ Options")
+            cfg_btn.clicked.connect(lambda _, n=name: self._configure_plugin(n))
+            self.table.setCellWidget(row, 3, cfg_btn)
+
+        self.table.blockSignals(False)
+        self._update_status()
+
+    def _update_status(self):
+        total = self.table.rowCount()
+        en = sum(1 for cb in self.cbs.values() if cb.isChecked())
+        self.status_label.setText(
+            f"{total} plugins ({en} enabled). Disabled plugins are remembered in cache with options intact."
+        )
 
     def refresh(self):
-        """Refresh table with current data"""
+        """Refresh table with current data."""
         self._update_table()
 
-    def _add_plugin(self):
-        """Add new plugin"""
+    def _on_double_click(self, row: int, col: int):
+        """Open options config dialog on row double click."""
+        name_item = self.table.item(row, 1)
+        if name_item:
+            self._configure_plugin(name_item.text())
+
+    def _configure_plugin(self, name: str):
+        """Open dialog to edit plugin options."""
+        entry = self._entries.get(name, name)
+        current_opts = _opts_of_plugin(entry)
+
+        dlg = PluginOptionsDialog(self, name, current_opts)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
         self.app.snapshot_state()
-        plugin, ok = QInputDialog.getText(
-            self, "Add Plugin", "Plugin (npm spec):",
-            QLineEdit.Normal, "@opencode/plugin-example"
-        )
-        if not ok or not plugin.strip():
-            return
+        new_opts = dlg.result_options
+        if new_opts:
+            self._entries[name] = [name, new_opts]
+        else:
+            self._entries[name] = name
 
-        plugin = plugin.strip()
-        if plugin in self.cbs:
-            QMessageBox.warning(self, "Error", f"Plugin '{plugin}' already exists")
-            return
+        # Update table row summary
+        row = self._find_plugin_row(name)
+        if row >= 0:
+            opts_item = QTableWidgetItem(_format_opts_summary(new_opts))
+            if new_opts:
+                opts_item.setToolTip(json.dumps(new_opts, indent=2, ensure_ascii=False))
+            self.table.setItem(row, 2, opts_item)
 
-        self._insert_plugin(plugin, True)
         self.app.mark_dirty()
 
-    def _insert_plugin(self, plugin: str, enabled: bool):
-        """Insert plugin into table"""
-        self.table.insertRow(self.table.rowCount())
-        row = self.table.rowCount() - 1
+    def _add_plugin(self):
+        """Add new plugin with optional initial options."""
+        dlg = AddPluginDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
 
-        # Enabled checkbox
-        enabled_check = QCheckBox()
-        enabled_check.setChecked(enabled)
-        enabled_check.stateChanged.connect(self.app.mark_dirty)
+        name = dlg.plugin_name
+        if not name:
+            return
+
+        if name in self.cbs:
+            QMessageBox.warning(self, "Error", f"Plugin '{name}' already exists")
+            return
+
+        self.app.snapshot_state()
+        opts = dlg.plugin_options
+        entry = [name, opts] if opts else name
+        self._entries[name] = entry
+
+        # Insert row
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+
+        cb = QCheckBox()
+        cb.setChecked(True)
+        cb.stateChanged.connect(self.app.mark_dirty)
         cell = QWidget()
         cell_layout = QHBoxLayout(cell)
         cell_layout.setContentsMargins(0, 0, 0, 0)
         cell_layout.setAlignment(Qt.AlignCenter)
-        cell_layout.addWidget(enabled_check)
+        cell_layout.addWidget(cb)
         self.table.setCellWidget(row, 0, cell)
-        self.cbs[plugin] = enabled_check
+        self.cbs[name] = cb
 
-        # Plugin
-        self.table.setItem(row, 1, QTableWidgetItem(plugin))
+        self.table.setItem(row, 1, QTableWidgetItem(name))
+        opts_item = QTableWidgetItem(_format_opts_summary(opts))
+        if opts:
+            opts_item.setToolTip(json.dumps(opts, indent=2, ensure_ascii=False))
+        self.table.setItem(row, 2, opts_item)
+
+        cfg_btn = QPushButton("⚙ Options")
+        cfg_btn.clicked.connect(lambda _, n=name: self._configure_plugin(n))
+        self.table.setCellWidget(row, 3, cfg_btn)
+
+        self.app.mark_dirty()
+        self._update_status()
 
     def _import_plugins(self):
-        """Import plugins from JSON"""
+        """Import plugins from JSON."""
         self.app.snapshot_state()
         dlg = JsonImportDialog(
             self, "Import Plugins",
             "Paste or load plugins JSON. Supported formats:\n"
-            "- Array of plugin strings\n"
-            "- {'plugin': [...]} object"
+            "- Array of plugins: [\"pkg\", [\"pkg-with-opts\", {\"lang\": \"en\"}]]\n"
+            "- Object containing 'plugin': {'plugin': [...]}"
         )
         if dlg.exec() != QDialog.Accepted:
             return
@@ -5155,22 +5660,49 @@ class PluginsTab(QWidget):
             data = data["plugin"]
 
         if not isinstance(data, list):
-            QMessageBox.warning(self, "Import Error", "Expected a JSON array of plugin strings")
+            QMessageBox.warning(self, "Import Error", "Expected a JSON array of plugins")
             return
 
-        existing = set(self.cbs.keys())
         added = 0
-
         for item in data:
-            if isinstance(item, str) and item not in existing:
-                self._insert_plugin(item, True)
+            name = _name_of_plugin(item)
+            if name and name not in self.cbs:
+                opts = _opts_of_plugin(item)
+                entry = [name, opts] if opts else name
+                self._entries[name] = entry
+
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+
+                cb = QCheckBox()
+                cb.setChecked(True)
+                cb.stateChanged.connect(self.app.mark_dirty)
+                cell = QWidget()
+                cell_layout = QHBoxLayout(cell)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
+                cell_layout.setAlignment(Qt.AlignCenter)
+                cell_layout.addWidget(cb)
+                self.table.setCellWidget(row, 0, cell)
+                self.cbs[name] = cb
+
+                self.table.setItem(row, 1, QTableWidgetItem(name))
+                opts_item = QTableWidgetItem(_format_opts_summary(opts))
+                if opts:
+                    opts_item.setToolTip(json.dumps(opts, indent=2, ensure_ascii=False))
+                self.table.setItem(row, 2, opts_item)
+
+                cfg_btn = QPushButton("⚙ Options")
+                cfg_btn.clicked.connect(lambda _, n=name: self._configure_plugin(n))
+                self.table.setCellWidget(row, 3, cfg_btn)
+
                 added += 1
 
         self.app.mark_dirty()
+        self._update_status()
         QMessageBox.information(self, "Import Complete", f"Added {added} new plugins")
 
     def _export_plugins(self):
-        """Export plugins to JSON file"""
+        """Export plugins to JSON file preserving options."""
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Plugins", "plugins.json",
             "JSON files (*.json);;All files (*)"
@@ -5178,69 +5710,84 @@ class PluginsTab(QWidget):
         if not path:
             return
 
-        plugins = [p for p, cb in self.cbs.items() if cb.isChecked()]
-        if not plugins:
-            QMessageBox.information(self, "Export", "No plugins to export")
+        active_entries = []
+        for name, cb in self.cbs.items():
+            if cb.isChecked():
+                active_entries.append(self._entries.get(name, name))
+
+        if not active_entries:
+            QMessageBox.information(self, "Export", "No enabled plugins to export")
             return
 
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(plugins, f, indent=2, ensure_ascii=False)
+                json.dump(active_entries, f, indent=2, ensure_ascii=False)
             QMessageBox.information(self, "Export Complete", f"Exported to {path}")
         except OSError as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
     def _set_all_enabled(self, enabled: bool):
-        """Enable/disable all plugins"""
+        """Enable/disable all plugins."""
         self.app.snapshot_state()
         for cb in self.cbs.values():
             cb.setChecked(enabled)
         self.app.mark_dirty()
+        self._update_status()
 
     def _remove_selected(self):
-        """Remove selected plugins"""
+        """Remove selected plugins."""
         self.app.snapshot_state()
         selected = self.table.selectedItems()
         if not selected:
             QMessageBox.information(self, "Remove", "Please select plugins to remove")
             return
 
-        plugins = {selected[i].text() for i in range(0, len(selected), self.table.columnCount())}
-        if not plugins:
+        names = {
+            self.table.item(item.row(), 1).text()
+            for item in selected if self.table.item(item.row(), 1) is not None
+        }
+        if not names:
             return
 
-        if not _confirm(self, "Remove Plugins", f"Remove {len(plugins)} selected plugins?"):
+        if not _confirm(self, "Remove Plugins", f"Remove {len(names)} selected plugin(s)?"):
             return
 
-        for plugin in plugins:
-            row = self._find_plugin_row(plugin)
+        for name in names:
+            row = self._find_plugin_row(name)
             if row >= 0:
                 self.table.removeRow(row)
-            self.cbs.pop(plugin, None)
+            self.cbs.pop(name, None)
+            self._entries.pop(name, None)
+            if self.app.cfg:
+                self.state_store.remove_entry(self.app.cfg.path, name)
 
         self.app.mark_dirty()
+        self._update_status()
 
-    def _find_plugin_row(self, plugin: str) -> int:
-        """Find row for plugin"""
+    def _find_plugin_row(self, plugin_name: str) -> int:
+        """Find row index for plugin name."""
         for row in range(self.table.rowCount()):
-            if self.table.item(row, 1).text() == plugin:
+            item = self.table.item(row, 1)
+            if item and item.text() == plugin_name:
                 return row
         return -1
 
     def collect(self, data: dict):
-        """Collect data from UI"""
+        """Collect data from UI into config dict, preserving options tuples."""
         active = []
-        disabled = []
+        disabled_dict = {}
 
-        for plugin, cb in self.cbs.items():
+        for name, cb in self.cbs.items():
+            entry = self._entries.get(name, name)
             if cb.isChecked():
-                active.append(plugin)
+                active.append(entry)
             else:
-                disabled.append(plugin)
+                disabled_dict[name] = entry
 
         data["plugin"] = active
         if self.app.cfg:
-            self.state_store.set_disabled(self.app.cfg.path, set(disabled))
+            self.state_store.set_disabled(self.app.cfg.path, disabled_dict)
+
 
 # Permissions tab
 class PermissionTab(QWidget):
@@ -7213,7 +7760,7 @@ class LayeredConfigFile:
     def _read(self, path) -> dict:
         try:
             if Path(path).exists():
-                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                data = loads_jsonc(Path(path).read_text(encoding="utf-8"))
                 return data if isinstance(data, dict) else {}
         except OSError as e:
             self.parse_errors[str(path)] = str(e)

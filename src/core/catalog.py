@@ -131,11 +131,22 @@ class ModelCatalog:
         if model_id in self._model_index:
             matches.add(model_id)
 
-        # Normalized match
-        normalized_id = _normalize_model_id(model_id)
-        if normalized_id in self.normalized_index:
-            for original_id in self.normalized_index[normalized_id]:
+        # Full normalized match (most precise).
+        full = _normalize_model_id(model_id)
+        if full in self.normalized_index:
+            for original_id in self.normalized_index[full]:
                 matches.add(original_id)
+
+        # Fallback: version-stripped variants, e.g. "df/claude-opus-4.8" ->
+        # "claude-opus-4", so a config id still resolves when the catalog only
+        # lists the major version. Only consulted when nothing matched above.
+        if not matches:
+            for key in _normalized_match_keys(model_id):
+                if key == full:
+                    continue
+                if key in self.normalized_index:
+                    for original_id in self.normalized_index[key]:
+                        matches.add(original_id)
 
         if not matches:
             return []
@@ -311,7 +322,7 @@ class ModelFormat:
         return cls(
             provider=provider,
             model_id=model_id,
-            name=str(spec.get("name") or model_id),
+            name=str(spec.get("name") or humanize_model_id(model_id)),
             context=_as_int(context),
             output=_as_int(output),
             modalities=mods,
@@ -386,10 +397,61 @@ def _fmt_cost(v) -> str:
     return f"${v:.4f}"
 
 
-def build_spec_from_format(fmt: ModelFormat) -> dict:
-    """Convert a normalized ModelFormat back into a config-shaped spec."""
+# Tokens rendered as uppercase acronyms in derived display names.
+_NAME_ACRONYMS = {
+    "gpt": "GPT", "api": "API", "url": "URL", "http": "HTTP", "https": "HTTPS",
+    "ai": "AI", "ml": "ML", "llm": "LLM", "ui": "UI", "cli": "CLI", "json": "JSON",
+    "xml": "XML", "html": "HTML", "css": "CSS", "js": "JS", "ts": "TS",
+    "db": "DB", "id": "ID", "qa": "QA", "v": "v", "glm": "GLM", "dbrx": "DBRX",
+    "qwen": "Qwen", "deepseek": "DeepSeek", "llama": "Llama", "mistral": "Mistral",
+    "claude": "Claude", "gemini": "Gemini", "phi": "Phi", "gemma": "Gemma",
+    "yi": "Yi", "r1": "R1", "v3": "V3", "v2": "V2", "v1": "V1",
+}
+
+
+def humanize_model_id(model_id: str) -> str:
+    """Derive a readable label from a model id, e.g.
+    ``glm-5.3-flash`` -> ``GLM 5.3 Flash``,
+    ``claude-opus-4.8-thinking`` -> ``Claude Opus 4.8 Thinking``.
+
+    Used when creating or formatting a model spec so that the model's display name
+    is derived directly from its own model ID rather than inheriting an outdated
+    or mismatched name from a fallback/matched catalog entry.
+    """
+    if not model_id:
+        return model_id
+    s = _NAMESPACE_RE.sub("", str(model_id).strip())
+    parts = re.split(r"[-_/:]", s)
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        low = p.lower()
+        if low in _NAME_ACRONYMS:
+            out.append(_NAME_ACRONYMS[low])
+        elif re.fullmatch(r"\d+(\.\d+)*", p) or re.fullmatch(r"\d{6,8}", p):
+            out.append(p)
+        elif re.fullmatch(r"\d+[xX]\d+[bBmMkK]|\d+[bBmMkK]", p):
+            out.append(p.upper())
+        else:
+            out.append(p[:1].upper() + p[1:].lower())
+    return " ".join(out)
+
+
+def build_spec_from_format(fmt: ModelFormat, model_id: Optional[str] = None) -> dict:
+    """Convert a normalized ModelFormat back into a config-shaped spec.
+
+    When `model_id` is supplied, the spec name is set according to `model_id`
+    (e.g. humanized name derived from `model_id`) to ensure models like
+    `glm-5.3-flash` get `GLM 5.3 Flash` instead of the name of the matched entry.
+    """
     spec = {}
-    if fmt.name and fmt.name != fmt.model_id:
+    if model_id is not None:
+        if fmt.model_id == model_id and fmt.name and fmt.name != fmt.model_id:
+            spec["name"] = fmt.name
+        else:
+            spec["name"] = humanize_model_id(model_id)
+    elif fmt.name and fmt.name != fmt.model_id:
         spec["name"] = fmt.name
 
     limit = {}
@@ -535,6 +597,15 @@ _VERSION_SUFFIX = re.compile(
 
 # Prefixes and suffixes to strip during normalization. Order matters for suffixes.
 _NORM_PREFIXES = ("google/", "google:", "anthropic.", "openai:", "zh-", "en-")
+
+# A leading "namespace" token followed by '/' or ':', e.g. "df/", "anthropic/",
+# "openai:". Stripped so that "df/claude-opus-4.8" collapses to "claude-opus-4.8"
+# and matches catalog entries stored under any other (or no) namespace.
+_NAMESPACE_RE = re.compile(r'^[^/:]+[/:]')
+
+# A trailing dotted version (e.g. "4.8", "2.1", "3.5.2") reduced to its major,
+# so "claude-opus-4.8" -> "claude-opus-4" and matches "claude-opus-4".
+_DOTTED_VERSION_RE = re.compile(r'(-\d+)(?:\.\d+)+$')
 _NORM_SUFFIXES = (
     "-thinking",
     "-online",
@@ -549,10 +620,15 @@ _NORM_SUFFIXES = (
 
 def _normalize_model_id(mid: str) -> str:
     """Normalize a model id for fuzzy matching: lowercase, hyphens,
-    and trailing version/date/general suffixes stripped."""
+    a leading namespace token, and trailing version/date/general suffixes stripped."""
     s = str(mid).strip().lower().replace("_", "-")
 
-    # Strip prefixes
+    # Strip leading namespace/provider tokens ("df/", "anthropic:", ...).
+    # Looped so "df/anthropic/claude" -> "anthropic/claude" -> "claude".
+    while _NAMESPACE_RE.match(s):
+        s = _NAMESPACE_RE.sub("", s, count=1)
+
+    # Strip curated prefixes
     for prefix in _NORM_PREFIXES:
         if s.startswith(prefix):
             s = s[len(prefix):]
@@ -578,6 +654,45 @@ def _normalize_model_id(mid: str) -> str:
     return s.strip("-") or str(mid).strip().lower()
 
 
+def _normalized_match_keys(model_id: str) -> List[str]:
+    """Candidate normalized keys for matching, most specific first.
+
+    Starts from the fully-normalized id, then progressively drops trailing
+    version/date segments so that e.g. ``df/claude-opus-4.8`` can also match a
+    catalog entry stored as ``anthropic/claude-opus-4`` or ``claude-opus``.
+    """
+    base = _normalize_model_id(model_id)
+    if not base:
+        return []
+    keys = [base]
+    cur = base
+    while True:
+        new = None
+        # 1) Reduce a trailing "N.M" dotted version to its major "N".
+        red = _DOTTED_VERSION_RE.sub(r"\1", cur)
+        if red != cur and red:
+            new = red
+        # 2) Drop a trailing version/date token (vN, dates, latest, ...).
+        if new is None:
+            red = _VERSION_SUFFIX.sub("", cur)
+            if red != cur and red:
+                new = red
+        # 3) Drop a bare trailing "-N" or "-N.M" version.
+        if new is None:
+            m = re.search(r'-\d+(?:\.\d+)*$', cur)
+            if m:
+                red = cur[:m.start()]
+                if red:
+                    new = red
+        if new is None or new in keys:
+            break
+        keys.append(new)
+        cur = new
+    return keys
+
+
+
+
 def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     """Try to find a catalog format for an unmatched model id.
 
@@ -600,16 +715,35 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     if not normalized:
         return None
 
-    # (b) normalized match within the reference provider first
+    # (b) full normalized match within the reference provider first.
     if reference_provider:
-        pmap = formats.get(reference_provider, {})
-        if normalized in pmap:
-            return pmap[normalized]
+        for cand_id, fmt in formats.get(reference_provider, {}).items():
+            if _normalize_model_id(cand_id) == normalized:
+                return fmt
 
-    # (c) normalized match anywhere in the catalog
+    # (c) full normalized match anywhere in the catalog.
     for pid, pmap in formats.items():
-        if normalized in pmap:
-            return pmap[normalized]
+        for cand_id, fmt in pmap.items():
+            if _normalize_model_id(cand_id) == normalized:
+                return fmt
+
+    # (b') version-stripped variants within the reference provider.
+    for key in _normalized_match_keys(mid):
+        if key == normalized:
+            continue
+        if reference_provider:
+            for cand_id, fmt in formats.get(reference_provider, {}).items():
+                if _normalize_model_id(cand_id) == key:
+                    return fmt
+
+    # (c') version-stripped variants anywhere in the catalog.
+    for key in _normalized_match_keys(mid):
+        if key == normalized:
+            continue
+        for pid, pmap in formats.items():
+            for cand_id, fmt in pmap.items():
+                if _normalize_model_id(cand_id) == key:
+                    return fmt
 
     # (d) longest shared prefix within the reference provider
     if reference_provider:

@@ -868,3 +868,59 @@ def test_raw_tab_reports_json_errors_and_warnings(oc_win, tmp_path):
     raw.editor.setPlainText('{"model": "opus"}')
     raw._validate()
     assert raw.status_label.text() == "Valid JSON"
+
+
+# --- MaskedLineEdit.textChanged relay (arg-less signal fed by a str signal) ---
+
+def test_masked_line_edit_relays_text_changed(qapp):
+    """QLineEdit.textChanged carries a str; MaskedLineEdit.textChanged is
+    declared arg-less. Connecting emit directly made PySide6 raise
+    'textChanged() only accepts 0 argument(s), 1 given!' and swallow the
+    signal, so downstream dirty-tracking never fired."""
+    w = app.MaskedLineEdit("sk-old", field_name="apiKey")
+    fired = []
+    w.textChanged.connect(lambda: fired.append(1))
+    w.edit.setText("sk-new")
+    assert fired, "downstream slot never ran — textChanged was swallowed"
+    assert w.value() == "sk-new"
+
+
+def test_provider_apikey_edit_marks_dirty_and_saves(oc_win, tmp_path):
+    """Updating ONLY a provider's apiKey must flip the Agent Models dirty flag,
+    otherwise the save hook skips the global rewrite and the new key is lost."""
+    gpath = tmp_path / "cfghome.json"
+    gpath.write_text(json.dumps({"providerProfiles": [
+        {"id": "provider_aaa", "name": "myprov", "provider": "custom",
+         "baseUrl": "https://x/v1", "model": "m1", "apiKey": "sk-OLDKEY"}]}),
+        encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+
+    tab = oc_win._agent_models_tab
+    assert tab._dirty is False                     # loading is not an edit
+    widget = tab.models_table.cellWidget(0, 4)
+    widget.edit.setText("sk-NEWKEY")               # user types a new key
+
+    assert tab._dirty is True                      # gates the global write
+    assert oc_win.oc_form_dirty is True            # gates the layer-switch prompt
+    oc_win._save()
+    saved = json.loads(gpath.read_text())
+    assert saved["providerProfiles"][0]["apiKey"] == "sk-NEWKEY"
+
+
+def test_masked_env_cell_edit_marks_scope_dirty(oc_win, tmp_path):
+    """Editing an MCP env/headers cell must mark its scope dirty on its own."""
+    gpath = tmp_path / "cfghome.json"
+    gpath.write_text(json.dumps({"mcpServers": {
+        "srv": {"command": "node", "env": {"TOKEN": "old"}}}}), encoding="utf-8")
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+
+    tab = oc_win._agent_mcp_tab
+    assert tab.global_dirty() is False
+    tab.mcp_table.cellWidget(0, 4).edit.setText("TOKEN=new")
+    assert tab.global_dirty() is True
+    oc_win._save()
+    saved = json.loads(gpath.read_text())
+    assert saved["mcpServers"]["srv"]["env"] == {"TOKEN": "new"}
+

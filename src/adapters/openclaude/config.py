@@ -61,7 +61,7 @@ class LayeredConfigFile:
     def _read(self, path) -> dict:
         try:
             if Path(path).exists():
-                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                data = loads_jsonc(Path(path).read_text(encoding="utf-8"))
                 return data if isinstance(data, dict) else {}
         except OSError as e:
             self.parse_errors[str(path)] = str(e)
