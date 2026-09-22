@@ -1193,3 +1193,579 @@ class ApplyCatalogDialog(QDialog):
         )
         return report
 
+
+class EditCustomModelDialog(QDialog):
+    """Dialog to add or edit a custom model spec in the catalog."""
+
+    def __init__(self, parent, model_id: str = "", spec: Optional[dict] = None, provider: str = "custom"):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Custom Model" if model_id else "Add Custom Model")
+        self.resize(560, 480)
+        self.result_model_id = ""
+        self.result_provider = ""
+        self.result_spec = {}
+
+        spec = spec or {}
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        # Model ID
+        self.id_edit = QLineEdit(model_id)
+        self.id_edit.setPlaceholderText("e.g. glm-5.3-flash, custom-gpt-5")
+        form.addRow("Model ID *:", self.id_edit)
+
+        # Name
+        init_name = spec.get("name") or (humanize_model_id(model_id) if model_id else "")
+        self.name_edit = QLineEdit(init_name)
+        self.name_edit.setPlaceholderText("e.g. GLM 5.3 Flash")
+        form.addRow("Display Name:", self.name_edit)
+
+        self.id_edit.textChanged.connect(self._on_id_changed)
+
+        # Provider
+        init_prov = spec.get("provider") or provider or "custom"
+        self.prov_edit = QLineEdit(init_prov)
+        self.prov_edit.setPlaceholderText("e.g. custom, zhipu, openai")
+        form.addRow("Provider Key:", self.prov_edit)
+
+        # Context limit
+        limit = spec.get("limit", {}) if isinstance(spec.get("limit"), dict) else {}
+        self.ctx_spin = QSpinBox()
+        self.ctx_spin.setRange(0, 10000000)
+        self.ctx_spin.setSingleStep(4000)
+        self.ctx_spin.setValue(int(limit.get("context", 128000)))
+        form.addRow("Context Window (tokens):", self.ctx_spin)
+
+        # Output limit
+        self.out_spin = QSpinBox()
+        self.out_spin.setRange(0, 1000000)
+        self.out_spin.setSingleStep(1000)
+        self.out_spin.setValue(int(limit.get("output", 8192)))
+        form.addRow("Max Output Tokens:", self.out_spin)
+
+        # Features
+        feat_box = QGroupBox("Capabilities & Features")
+        feat_layout = QGridLayout(feat_box)
+        self.att_cb = QCheckBox("Attachment (Images/Files)")
+        self.att_cb.setChecked(bool(spec.get("attachment", True)))
+        self.reas_cb = QCheckBox("Reasoning / Thinking")
+        self.reas_cb.setChecked(bool(spec.get("reasoning", False)))
+        self.tools_cb = QCheckBox("Tool Calling")
+        self.tools_cb.setChecked(bool(spec.get("tool_call", True)))
+        self.temp_cb = QCheckBox("Temperature Control")
+        self.temp_cb.setChecked(bool(spec.get("temperature", True)))
+
+        feat_layout.addWidget(self.att_cb, 0, 0)
+        feat_layout.addWidget(self.reas_cb, 0, 1)
+        feat_layout.addWidget(self.tools_cb, 1, 0)
+        feat_layout.addWidget(self.temp_cb, 1, 1)
+        form.addRow(feat_box)
+
+        # Modalities
+        mods = spec.get("modalities", {}) if isinstance(spec.get("modalities"), dict) else {}
+        in_mods = set(mods.get("input", ["text", "image"]))
+        out_mods = set(mods.get("output", ["text"]))
+
+        mod_box = QGroupBox("Modalities")
+        mod_layout = QHBoxLayout(mod_box)
+        self.mod_in_image = QCheckBox("Input Image")
+        self.mod_in_image.setChecked("image" in in_mods)
+        self.mod_in_audio = QCheckBox("Input Audio")
+        self.mod_in_audio.setChecked("audio" in in_mods)
+        self.mod_out_image = QCheckBox("Output Image")
+        self.mod_out_image.setChecked("image" in out_mods)
+
+        mod_layout.addWidget(self.mod_in_image)
+        mod_layout.addWidget(self.mod_in_audio)
+        mod_layout.addWidget(self.mod_out_image)
+        form.addRow(mod_box)
+
+        layout.addLayout(form)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _on_id_changed(self, text: str):
+        prev = self.id_edit.property("_prev_id") or ""
+        if not self.name_edit.text() or self.name_edit.text() == humanize_model_id(prev):
+            self.name_edit.setText(humanize_model_id(text))
+        self.id_edit.setProperty("_prev_id", text)
+
+    def _accept(self):
+        mid = self.id_edit.text().strip()
+        if not mid:
+            QMessageBox.warning(self, "Missing Model ID", "Please specify a Model ID.")
+            return
+
+        name = self.name_edit.text().strip() or humanize_model_id(mid)
+        prov = self.prov_edit.text().strip() or "custom"
+
+        in_mods = ["text"]
+        if self.mod_in_image.isChecked():
+            in_mods.append("image")
+        if self.mod_in_audio.isChecked():
+            in_mods.append("audio")
+
+        out_mods = ["text"]
+        if self.mod_out_image.isChecked():
+            out_mods.append("image")
+
+        spec = {
+            "name": name,
+            "provider": prov,
+            "limit": {
+                "context": self.ctx_spin.value(),
+                "output": self.out_spin.value(),
+            },
+            "attachment": self.att_cb.isChecked(),
+            "reasoning": self.reas_cb.isChecked(),
+            "tool_call": self.tools_cb.isChecked(),
+            "temperature": self.temp_cb.isChecked(),
+            "modalities": {
+                "input": in_mods,
+                "output": out_mods,
+            }
+        }
+
+        self.result_model_id = mid
+        self.result_provider = prov
+        self.result_spec = spec
+        self.accept()
+
+
+class EditPatternRuleDialog(QDialog):
+    """Dialog to create or edit a pattern mapping rule."""
+
+    def __init__(self, parent, rule: Optional[dict] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Pattern Mapping Rule" if rule else "Add Pattern Mapping Rule")
+        self.resize(500, 320)
+        self.result_rule = {}
+
+        rule = rule or {}
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        self.pat_edit = QLineEdit(rule.get("pattern", ""))
+        self.pat_edit.setPlaceholderText("e.g. glm-*, deepseek-*, or regex:^my-proxy/.*")
+        form.addRow("Pattern (wildcard/regex) *:", self.pat_edit)
+
+        self.prov_edit = QLineEdit(rule.get("reference_provider", ""))
+        self.prov_edit.setPlaceholderText("e.g. zhipu, openai, google, anthropic")
+        form.addRow("Reference Provider *:", self.prov_edit)
+
+        self.model_edit = QLineEdit(rule.get("reference_model", ""))
+        self.model_edit.setPlaceholderText("e.g. glm-4-flash, gpt-4o (optional)")
+        form.addRow("Reference Model (optional):", self.model_edit)
+
+        self.desc_edit = QLineEdit(rule.get("description", ""))
+        self.desc_edit.setPlaceholderText("e.g. Map all GLM models to Zhipu capabilities")
+        form.addRow("Description:", self.desc_edit)
+
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "<small><b>Examples:</b><br>"
+            "• <code>glm-*</code> with provider <code>zhipu</code>: any model like <code>glm-5.3-flash</code> gets Zhipu features.<br>"
+            "• <code>my-proxy/*</code> with provider <code>openai</code> and model <code>gpt-4o</code>: matches proxy models to GPT-4o spec."
+            "</small>"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray;")
+        layout.addWidget(hint)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _accept(self):
+        pat = self.pat_edit.text().strip()
+        prov = self.prov_edit.text().strip()
+        if not pat or not prov:
+            QMessageBox.warning(self, "Missing Fields", "Pattern and Reference Provider are required.")
+            return
+
+        self.result_rule = {
+            "pattern": pat,
+            "reference_provider": prov,
+            "reference_model": self.model_edit.text().strip(),
+            "description": self.desc_edit.text().strip(),
+        }
+        self.accept()
+
+
+class CustomCatalogManagerDialog(QDialog):
+    """Comprehensive dialog to manage custom model specs, pattern rules, and online catalog updates."""
+
+    def __init__(self, parent, catalog: ModelCatalog):
+        super().__init__(parent)
+        self.setWindowTitle("Model Catalog & Matching Rules Manager")
+        self.resize(900, 600)
+        self.catalog = catalog
+        self.settings = SettingsManager()
+
+        layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # Tab 1: Custom Models
+        self.custom_tab = QWidget()
+        self._setup_custom_models_tab()
+        self.tabs.addTab(self.custom_tab, "Custom Model Specs")
+
+        # Tab 2: Pattern Rules
+        self.rules_tab = QWidget()
+        self._setup_pattern_rules_tab()
+        self.tabs.addTab(self.rules_tab, "Pattern Mapping Rules")
+
+        # Tab 3: Online Sync & Sources
+        self.sync_tab = QWidget()
+        self._setup_sync_tab()
+        self.tabs.addTab(self.sync_tab, "Catalog Sources & Update")
+
+        # Bottom Close button
+        btn_layout = QHBoxLayout()
+        self.status_lbl = QLabel()
+        self._refresh_status()
+        btn_layout.addWidget(self.status_lbl)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+    def _setup_custom_models_tab(self):
+        lay = QVBoxLayout(self.custom_tab)
+
+        tb = QHBoxLayout()
+        self.custom_search = QLineEdit()
+        self.custom_search.setPlaceholderText("Search custom models...")
+        self.custom_search.textChanged.connect(self._filter_custom_models)
+        tb.addWidget(self.custom_search)
+
+        for text, slot in [
+            ("+ Add Model", self._add_custom_model),
+            ("Edit", self._edit_selected_custom_model),
+            ("Delete", self._delete_selected_custom_model),
+            ("Import JSON", self._import_custom_models),
+            ("Export JSON", self._export_custom_models),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            tb.addWidget(b)
+        lay.addLayout(tb)
+
+        self.custom_table = QTableWidget(0, 6)
+        self.custom_table.setHorizontalHeaderLabels([
+            "Model ID", "Name", "Provider", "Context", "Output", "Features"
+        ])
+        self.custom_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.custom_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.custom_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.custom_table.cellDoubleClicked.connect(lambda row, col: self._edit_selected_custom_model())
+        lay.addWidget(self.custom_table)
+
+        self._refresh_custom_models_table()
+
+    def _refresh_custom_models_table(self):
+        models = self.catalog.get_all_custom_models()
+        self._populate_custom_models_table(models)
+
+    def _populate_custom_models_table(self, models: dict):
+        self.custom_table.setRowCount(len(models))
+        for row, (mid, spec) in enumerate(sorted(models.items())):
+            self.custom_table.setItem(row, 0, QTableWidgetItem(mid))
+            self.custom_table.setItem(row, 1, QTableWidgetItem(spec.get("name") or humanize_model_id(mid)))
+            self.custom_table.setItem(row, 2, QTableWidgetItem(spec.get("provider", "custom")))
+            limit = spec.get("limit", {}) if isinstance(spec.get("limit"), dict) else {}
+            ctx = limit.get("context")
+            out = limit.get("output")
+            self.custom_table.setItem(row, 3, QTableWidgetItem(f"{ctx:,}" if ctx else "—"))
+            self.custom_table.setItem(row, 4, QTableWidgetItem(f"{out:,}" if out else "—"))
+
+            feats = []
+            if spec.get("attachment"):
+                feats.append("Attachment")
+            if spec.get("reasoning"):
+                feats.append("Reasoning")
+            if spec.get("tool_call"):
+                feats.append("Tools")
+            self.custom_table.setItem(row, 5, QTableWidgetItem(", ".join(feats) if feats else "—"))
+
+    def _filter_custom_models(self, text: str):
+        all_models = self.catalog.get_all_custom_models()
+        if not text:
+            self._populate_custom_models_table(all_models)
+            return
+        text = text.lower()
+        filtered = {
+            mid: spec for mid, spec in all_models.items()
+            if text in mid.lower() or text in str(spec.get("name", "")).lower() or text in str(spec.get("provider", "")).lower()
+        }
+        self._populate_custom_models_table(filtered)
+
+    def _add_custom_model(self):
+        dlg = EditCustomModelDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.result_model_id:
+            self.catalog.save_custom_model(dlg.result_model_id, dlg.result_spec, dlg.result_provider)
+            self._refresh_custom_models_table()
+            self._refresh_status()
+
+    def _edit_selected_custom_model(self):
+        selected = self.custom_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        mid_item = self.custom_table.item(row, 0)
+        if not mid_item:
+            return
+        mid = mid_item.text()
+        all_models = self.catalog.get_all_custom_models()
+        spec = all_models.get(mid, {})
+        dlg = EditCustomModelDialog(self, mid, spec, spec.get("provider", "custom"))
+        if dlg.exec() == QDialog.Accepted and dlg.result_model_id:
+            if dlg.result_model_id != mid:
+                self.catalog.delete_custom_model(mid)
+            self.catalog.save_custom_model(dlg.result_model_id, dlg.result_spec, dlg.result_provider)
+            self._refresh_custom_models_table()
+            self._refresh_status()
+
+    def _delete_selected_custom_model(self):
+        selected = self.custom_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        mid = self.custom_table.item(row, 0).text()
+        if _confirm(self, "Delete Custom Model", f"Delete custom model spec '{mid}'?"):
+            self.catalog.delete_custom_model(mid)
+            self._refresh_custom_models_table()
+            self._refresh_status()
+
+    def _import_custom_models(self):
+        dlg = JsonImportDialog(
+            self, "Import Custom Models",
+            "Paste or load custom models JSON. Supported format: { \"model_id\": { \"name\": \"...\", ... } }"
+        )
+        if dlg.exec() == QDialog.Accepted and dlg.result_data:
+            data = dlg.result_data
+            if isinstance(data, dict):
+                current = self.catalog.get_all_custom_models()
+                current.update(data)
+                try:
+                    CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+                    self.catalog._load_custom_models()
+                    self._refresh_custom_models_table()
+                    self._refresh_status()
+                    QMessageBox.information(self, "Import", f"Imported {len(data)} custom model(s).")
+                except Exception as e:
+                    QMessageBox.warning(self, "Import Error", str(e))
+
+    def _export_custom_models(self):
+        models = self.catalog.get_all_custom_models()
+        if not models:
+            QMessageBox.information(self, "Export", "No custom models to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Custom Models", "custom_models.json",
+            "JSON files (*.json);;All files (*)"
+        )
+        if path:
+            try:
+                Path(path).write_text(json.dumps(models, indent=2, ensure_ascii=False), encoding="utf-8")
+                QMessageBox.information(self, "Export Complete", f"Exported to {path}")
+            except OSError as e:
+                QMessageBox.warning(self, "Export Error", str(e))
+
+    def _setup_pattern_rules_tab(self):
+        lay = QVBoxLayout(self.rules_tab)
+
+        tb = QHBoxLayout()
+        for text, slot in [
+            ("+ Add Rule", self._add_pattern_rule),
+            ("Edit", self._edit_selected_pattern_rule),
+            ("Delete", self._delete_selected_pattern_rule),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            tb.addWidget(b)
+        tb.addStretch()
+        lay.addLayout(tb)
+
+        self.rules_table = QTableWidget(0, 4)
+        self.rules_table.setHorizontalHeaderLabels([
+            "Pattern", "Reference Provider", "Reference Model", "Description"
+        ])
+        self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.rules_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.rules_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.rules_table.cellDoubleClicked.connect(lambda row, col: self._edit_selected_pattern_rule())
+        lay.addWidget(self.rules_table)
+
+        # Interactive Tester Box
+        test_box = QGroupBox("Interactive Pattern Rule Tester")
+        test_lay = QHBoxLayout(test_box)
+        self.test_input = QLineEdit()
+        self.test_input.setPlaceholderText("Type a model ID to test pattern matching, e.g. glm-5.3-flash...")
+        self.test_input.textChanged.connect(self._test_pattern_match)
+        test_lay.addWidget(self.test_input, 2)
+        self.test_result = QLabel("Enter a model ID above to test")
+        self.test_result.setStyleSheet("color: #0969da; font-weight: bold;")
+        test_lay.addWidget(self.test_result, 3)
+        lay.addWidget(test_box)
+
+        self._refresh_pattern_rules_table()
+
+    def _refresh_pattern_rules_table(self):
+        rules = self.catalog.get_all_pattern_rules()
+        self.rules_table.setRowCount(len(rules))
+        for row, rule in enumerate(rules):
+            self.rules_table.setItem(row, 0, QTableWidgetItem(rule.get("pattern", "")))
+            self.rules_table.setItem(row, 1, QTableWidgetItem(rule.get("reference_provider", "")))
+            self.rules_table.setItem(row, 2, QTableWidgetItem(rule.get("reference_model", "")))
+            self.rules_table.setItem(row, 3, QTableWidgetItem(rule.get("description", "")))
+
+    def _add_pattern_rule(self):
+        dlg = EditPatternRuleDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.result_rule:
+            rules = self.catalog.get_all_pattern_rules()
+            rules.append(dlg.result_rule)
+            self.catalog.save_pattern_rules(rules)
+            self._refresh_pattern_rules_table()
+            self._refresh_status()
+
+    def _edit_selected_pattern_rule(self):
+        selected = self.rules_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        rules = self.catalog.get_all_pattern_rules()
+        if row < len(rules):
+            dlg = EditPatternRuleDialog(self, rules[row])
+            if dlg.exec() == QDialog.Accepted and dlg.result_rule:
+                rules[row] = dlg.result_rule
+                self.catalog.save_pattern_rules(rules)
+                self._refresh_pattern_rules_table()
+                self._refresh_status()
+
+    def _delete_selected_pattern_rule(self):
+        selected = self.rules_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        rules = self.catalog.get_all_pattern_rules()
+        if row < len(rules) and _confirm(self, "Delete Rule", f"Delete rule for pattern '{rules[row].get('pattern')}'?"):
+            rules.pop(row)
+            self.catalog.save_pattern_rules(rules)
+            self._refresh_pattern_rules_table()
+            self._refresh_status()
+
+    def _test_pattern_match(self, text: str):
+        mid = text.strip()
+        if not mid:
+            self.test_result.setText("Enter a model ID above to test")
+            return
+        matches = self.catalog.find_model(mid)
+        if matches:
+            fmt = matches[0]
+            self.test_result.setText(
+                f"✓ Matches! Provider: {fmt.provider} | Name: {fmt.name or humanize_model_id(mid)} | Context: {fmt.context_k()}"
+            )
+        else:
+            self.test_result.setText("✗ No match found in catalog or pattern rules")
+
+    def _setup_sync_tab(self):
+        lay = QVBoxLayout(self.sync_tab)
+
+        form = QFormLayout()
+        self.url_edit = QLineEdit(self.settings.get_catalog_url())
+        reset_btn = QPushButton("Reset URL")
+        reset_btn.clicked.connect(lambda: self.url_edit.setText(DEFAULT_CATALOG_URL))
+        url_lay = QHBoxLayout()
+        url_lay.addWidget(self.url_edit, 1)
+        url_lay.addWidget(reset_btn)
+        form.addRow("Online Catalog URL:", url_lay)
+        lay.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.sync_btn = QPushButton("🔄 Update Catalog Online Now")
+        self.sync_btn.setStyleSheet("padding: 8px 16px; font-weight: bold;")
+        self.sync_btn.clicked.connect(self._sync_online)
+        btn_row.addWidget(self.sync_btn)
+
+        load_file_btn = QPushButton("Load Catalog from Local JSON...")
+        load_file_btn.clicked.connect(self._load_local_catalog)
+        btn_row.addWidget(load_file_btn)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        self.sync_info = QLabel()
+        self.sync_info.setWordWrap(True)
+        self.sync_info.setStyleSheet("background: palette(window); padding: 12px; border-radius: 6px;")
+        lay.addWidget(self.sync_info)
+        lay.addStretch()
+        self._update_sync_info()
+
+    def _update_sync_info(self):
+        src = self.catalog.source or "None"
+        cnt = len(self.catalog.flat)
+        custom_cnt = len(self.catalog.get_all_custom_models())
+        rules_cnt = len(self.catalog.get_all_pattern_rules())
+        last = self.catalog.last_updated or "Never"
+        self.sync_info.setText(
+            f"<b>Active Catalog Source:</b> {src}<br>"
+            f"<b>Total Catalog Models:</b> {cnt:,}<br>"
+            f"<b>User Custom Models:</b> {custom_cnt:,}<br>"
+            f"<b>Active Pattern Rules:</b> {rules_cnt:,}<br>"
+            f"<b>Last Loaded / Updated:</b> {last}"
+        )
+
+    def _sync_online(self):
+        url = self.url_edit.text().strip()
+        self.settings.set_catalog_url(url)
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setText("Updating...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, msg, count = self.catalog.fetch_online(url)
+            if ok:
+                QMessageBox.information(self, "Catalog Update", msg)
+                self._update_sync_info()
+                self._refresh_status()
+            else:
+                QMessageBox.warning(self, "Catalog Update Error", msg)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.sync_btn.setEnabled(True)
+            self.sync_btn.setText("🔄 Update Catalog Online Now")
+
+    def _load_local_catalog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Catalog JSON", str(Path.home()),
+            "JSON files (*.json);;All files (*)"
+        )
+        if path:
+            try:
+                self.catalog.load(Path(path))
+                self._update_sync_info()
+                self._refresh_status()
+                QMessageBox.information(self, "Catalog Loaded", f"Successfully loaded {len(self.catalog.flat)} models.")
+            except Exception as e:
+                QMessageBox.warning(self, "Load Error", str(e))
+
+    def _refresh_status(self):
+        cnt = len(self.catalog.flat)
+        custom_cnt = len(self.catalog.get_all_custom_models())
+        rules_cnt = len(self.catalog.get_all_pattern_rules())
+        self.status_lbl.setText(
+            f"Catalog: {cnt:,} models | Custom: {custom_cnt} | Pattern Rules: {rules_cnt}"
+        )
+
+

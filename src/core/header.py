@@ -16,6 +16,7 @@ Key improvements:
 - Responsive UI with better error handling
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -96,6 +97,9 @@ TUI_SCHEMA_CACHE = USER_CONFIG_DIR / "tui-schema.json"
 PLUGIN_STATE_CACHE = USER_CONFIG_DIR / "plugin-state.json"
 SETTINGS_FILE = USER_CONFIG_DIR / "settings.ini"
 CATALOG_CACHE = USER_CONFIG_DIR / "catalog.json"
+CUSTOM_MODELS_FILE = USER_CONFIG_DIR / "custom_models.json"
+PATTERN_RULES_FILE = USER_CONFIG_DIR / "pattern_rules.json"
+DEFAULT_CATALOG_URL = "https://models.dev/api.json"
 UNDO_LIMIT = 100
 
 # Configuration keys (derived from https://opencode.ai/config.json and /tui.json)

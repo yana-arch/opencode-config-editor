@@ -1,20 +1,25 @@
 # Model catalog, normalized model formats, matching and fallback logic
 class ModelCatalog:
-    """Enhanced model catalog with filtering and preview"""
+    """Enhanced model catalog with custom models, pattern rules, filtering, and preview"""
 
     def __init__(self):
         self.raw = None
-        self.by_provider = {}  # provider_id -> {model_id: spec}
-        self.flat = {}         # model_id -> spec
+        self.by_provider = {}        # provider_id -> {model_id: spec}
+        self.flat = {}               # model_id -> spec
+        self.custom_models = {}      # model_id -> spec
+        self.custom_by_provider = {} # provider_id -> {model_id: spec}
+        self.pattern_rules = []      # list of rule dicts
         self.source = None
         self.last_updated = None
         self._formats_cache = None
-        self._model_index = {}  # model_id -> [provider_id, ...]
-        self.normalized_index = {} # normalized_id -> [model_id, ...]
+        self._model_index = {}       # model_id -> [provider_id, ...]
+        self.normalized_index = {}   # normalized_id -> [model_id, ...]
+        self._load_custom_models()
+        self._load_pattern_rules()
 
     def loaded(self) -> bool:
-        """Check if catalog is loaded"""
-        return self.raw is not None
+        """Check if catalog is loaded (including custom models)."""
+        return self.raw is not None or bool(self.custom_models)
 
     def load(self, path: Path):
         """Load catalog from file"""
@@ -30,8 +35,165 @@ class ModelCatalog:
         self.source = "(pasted)"
         self.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _load_custom_models(self):
+        """Load user-defined custom models from CUSTOM_MODELS_FILE."""
+        try:
+            if CUSTOM_MODELS_FILE.exists():
+                data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._apply_custom_models_dict(data)
+        except Exception:
+            pass
+
+    def _apply_custom_models_dict(self, data: dict):
+        """Merge custom models dict with high priority into catalog."""
+        self.custom_models = {}
+        self.custom_by_provider = {}
+
+        flat_custom = {}
+        by_prov = {}
+
+        if all(isinstance(v, dict) and "models" in v for v in data.values()):
+            for pid, pdata in data.items():
+                models = pdata.get("models", {})
+                if isinstance(models, dict):
+                    by_prov[pid] = models
+                    for mid, spec in models.items():
+                        flat_custom[mid] = spec
+        elif "models" in data and isinstance(data["models"], dict):
+            pid = data.get("id") or "custom"
+            by_prov[pid] = data["models"]
+            flat_custom.update(data["models"])
+        elif all(isinstance(v, dict) for v in data.values()):
+            for mid, spec in data.items():
+                pid = spec.get("provider") or "custom"
+                by_prov.setdefault(pid, {})[mid] = spec
+                flat_custom[mid] = spec
+
+        self.custom_models = flat_custom
+        self.custom_by_provider = by_prov
+
+        # Overlay on active index
+        for pid, models in by_prov.items():
+            if pid not in self.by_provider:
+                self.by_provider[pid] = {}
+            for mid, spec in models.items():
+                self.by_provider[pid][mid] = spec
+                self.flat[mid] = spec
+                if mid not in self._model_index:
+                    self._model_index[mid] = []
+                if pid not in self._model_index[mid]:
+                    self._model_index[mid].insert(0, pid)
+                norm_id = _normalize_model_id(mid)
+                if norm_id:
+                    self.normalized_index.setdefault(norm_id, []).insert(0, mid)
+                if isinstance(spec, dict) and "aliases" in spec:
+                    for alias in spec["aliases"]:
+                        self._model_index.setdefault(alias, []).insert(0, pid)
+                        norm_alias = _normalize_model_id(alias)
+                        if norm_alias:
+                            self.normalized_index.setdefault(norm_alias, []).insert(0, mid)
+
+        self._formats_cache = None
+
+    def _load_pattern_rules(self):
+        """Load pattern rules from PATTERN_RULES_FILE."""
+        try:
+            if PATTERN_RULES_FILE.exists():
+                data = loads_jsonc(PATTERN_RULES_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self.pattern_rules = [r for r in data if isinstance(r, dict)]
+        except Exception:
+            self.pattern_rules = []
+
+    def save_custom_model(self, model_id: str, spec: dict, provider: str = "custom") -> bool:
+        """Save/update a custom model spec in CUSTOM_MODELS_FILE."""
+        model_id = str(model_id).strip()
+        if not model_id:
+            return False
+        current = self.get_all_custom_models()
+        spec_copy = dict(spec)
+        spec_copy["provider"] = provider
+        current[model_id] = spec_copy
+
+        try:
+            CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+            if self.raw:
+                self._ingest(self.raw)
+            else:
+                self._load_custom_models()
+            return True
+        except OSError:
+            return False
+
+    def delete_custom_model(self, model_id: str) -> bool:
+        """Delete a custom model from CUSTOM_MODELS_FILE."""
+        current = self.get_all_custom_models()
+        if model_id in current:
+            current.pop(model_id, None)
+            try:
+                CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+                if self.raw:
+                    self._ingest(self.raw)
+                else:
+                    self.custom_models.pop(model_id, None)
+                    self._formats_cache = None
+                return True
+            except OSError:
+                return False
+        return False
+
+    def get_all_custom_models(self) -> Dict[str, dict]:
+        """Get dict of all saved custom models."""
+        try:
+            if CUSTOM_MODELS_FILE.exists():
+                data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return dict(self.custom_models)
+
+    def save_pattern_rules(self, rules: List[dict]) -> bool:
+        """Save list of pattern rules to PATTERN_RULES_FILE."""
+        self.pattern_rules = [r for r in rules if isinstance(r, dict) and r.get("pattern")]
+        try:
+            PATTERN_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PATTERN_RULES_FILE.write_text(json.dumps(self.pattern_rules, indent=2, ensure_ascii=False), encoding="utf-8")
+            return True
+        except OSError:
+            return False
+
+    def get_all_pattern_rules(self) -> List[dict]:
+        """Get list of all pattern rules."""
+        if not self.pattern_rules:
+            self._load_pattern_rules()
+        return list(self.pattern_rules)
+
+    def fetch_online(self, url: Optional[str] = None) -> Tuple[bool, str, int]:
+        """Download latest catalog from online source, update cache, and reload."""
+        catalog_url = (url or SettingsManager().get_catalog_url() or DEFAULT_CATALOG_URL).strip()
+        try:
+            req = urllib.request.Request(
+                catalog_url,
+                headers={"User-Agent": f"opencode-config-editor/{APP_VERSION}"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8")
+            data = loads_jsonc(raw)
+            if not isinstance(data, dict) or not data:
+                return False, "Downloaded catalog is empty or invalid JSON.", 0
+
+            CATALOG_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            CATALOG_CACHE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.load(CATALOG_CACHE)
+            return True, f"Catalog updated successfully from {catalog_url}!", len(self.flat)
+        except Exception as e:
+            return False, f"Failed to fetch catalog: {e}", 0
+
     def _ingest(self, data: dict):
-        """Process catalog data"""
+        """Process catalog data and overlay custom models."""
         if not isinstance(data, dict) or not data:
             raise ValueError("Catalog JSON must be a non-empty object.")
 
@@ -42,21 +204,21 @@ class ModelCatalog:
             for pid, pdata in data.items():
                 models = pdata.get("models", {})
                 if isinstance(models, dict):
-                    by_provider[pid] = models
+                    by_provider[pid] = dict(models)
                     for mid, spec in models.items():
                         flat.setdefault(mid, spec)
 
         # Single provider dump: {"id":..., "models": {...}}
         elif "models" in data and isinstance(data["models"], dict):
             pid = data.get("id") or "provider"
-            by_provider[pid] = data["models"]
+            by_provider[pid] = dict(data["models"])
             flat.update(data["models"])
 
         # Flat map: {modelId: spec}
         elif all(isinstance(v, dict) for v in data.values()):
             flat.update(data)
             # Provide a synthetic provider so the normalized formats still work.
-            by_provider["provider"] = data
+            by_provider["provider"] = dict(data)
 
         else:
             raise ValueError("Unrecognized model catalog format.")
@@ -73,11 +235,11 @@ class ModelCatalog:
                     for alias in spec["aliases"]:
                         self._model_index.setdefault(alias, []).append(pid)
 
-        for mid in self.flat:
+        for mid in list(self.flat.keys()):
             norm_id = _normalize_model_id(mid)
             if norm_id:
                 self.normalized_index.setdefault(norm_id, []).append(mid)
-            
+
             # Phase 2: Aliases in normalized index
             spec = self.flat[mid]
             if isinstance(spec, dict) and "aliases" in spec:
@@ -85,6 +247,10 @@ class ModelCatalog:
                     norm_alias = _normalize_model_id(alias)
                     if norm_alias:
                         self.normalized_index.setdefault(norm_alias, []).append(mid)
+
+        # Overlay custom models & load pattern rules
+        self._load_custom_models()
+        self._load_pattern_rules()
 
     def models_for(self, provider_key: str, npm: str = None) -> dict:
         """Get models for provider"""
@@ -124,22 +290,20 @@ class ModelCatalog:
         return [fmt for pmap in self.formats().values() for fmt in pmap.values()]
 
     def find_model(self, model_id: str) -> List["ModelFormat"]:
-        """Match a model id across the whole catalog (may match many providers)."""
+        """Match a model id across the catalog, custom models, and pattern rules."""
         matches = set()
 
-        # Exact match
+        # 1. Exact match
         if model_id in self._model_index:
             matches.add(model_id)
 
-        # Full normalized match (most precise).
+        # 2. Full normalized match (most precise).
         full = _normalize_model_id(model_id)
         if full in self.normalized_index:
             for original_id in self.normalized_index[full]:
                 matches.add(original_id)
 
-        # Fallback: version-stripped variants, e.g. "df/claude-opus-4.8" ->
-        # "claude-opus-4", so a config id still resolves when the catalog only
-        # lists the major version. Only consulted when nothing matched above.
+        # 3. Fallback: version-stripped variants
         if not matches:
             for key in _normalized_match_keys(model_id):
                 if key == full:
@@ -147,6 +311,50 @@ class ModelCatalog:
                 if key in self.normalized_index:
                     for original_id in self.normalized_index[key]:
                         matches.add(original_id)
+
+        # 4. Pattern rules match
+        if not matches and self.pattern_rules:
+            for rule in self.pattern_rules:
+                pat = str(rule.get("pattern", "")).strip()
+                if not pat:
+                    continue
+                matched = False
+                if pat.startswith("regex:"):
+                    try:
+                        matched = bool(re.search(pat[6:], model_id, re.IGNORECASE))
+                    except re.error:
+                        matched = False
+                else:
+                    matched = fnmatch.fnmatch(model_id.lower(), pat.lower())
+
+                if matched:
+                    ref_prov = rule.get("reference_provider")
+                    ref_mod = rule.get("reference_model")
+                    ref_fmt = None
+                    if ref_mod:
+                        mod_matches = self.find_model(ref_mod)
+                        if mod_matches:
+                            ref_fmt = mod_matches[0]
+                    if ref_fmt is None and ref_prov:
+                        ref_fmt = _find_fallback(model_id, ref_prov, self)
+                    if ref_fmt is not None:
+                        derived_fmt = ModelFormat(
+                            provider=ref_prov or ref_fmt.provider,
+                            model_id=model_id,
+                            name=humanize_model_id(model_id),
+                            context=ref_fmt.context,
+                            output=ref_fmt.output,
+                            cost_in=ref_fmt.cost_in,
+                            cost_out=ref_fmt.cost_out,
+                            cost_cache_read=ref_fmt.cost_cache_read,
+                            cost_cache_write=ref_fmt.cost_cache_write,
+                            modalities=ref_fmt.modalities,
+                            attachment=ref_fmt.attachment,
+                            reasoning=ref_fmt.reasoning,
+                            tools=ref_fmt.tools,
+                            temperature=ref_fmt.temperature,
+                        )
+                        return [derived_fmt]
 
         if not matches:
             return []
@@ -159,7 +367,6 @@ class ModelCatalog:
             for p in providers:
                 if mid in fmts.get(p, {}):
                     fmt = fmts[p][mid]
-                    # Use a tuple key to handle the same format object appearing for different providers
                     found_formats[(fmt.provider, fmt.model_id)] = fmt
 
         return list(found_formats.values())

@@ -16,6 +16,7 @@ Key improvements:
 - Responsive UI with better error handling
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -96,6 +97,9 @@ TUI_SCHEMA_CACHE = USER_CONFIG_DIR / "tui-schema.json"
 PLUGIN_STATE_CACHE = USER_CONFIG_DIR / "plugin-state.json"
 SETTINGS_FILE = USER_CONFIG_DIR / "settings.ini"
 CATALOG_CACHE = USER_CONFIG_DIR / "catalog.json"
+CUSTOM_MODELS_FILE = USER_CONFIG_DIR / "custom_models.json"
+PATTERN_RULES_FILE = USER_CONFIG_DIR / "pattern_rules.json"
+DEFAULT_CATALOG_URL = "https://models.dev/api.json"
 UNDO_LIMIT = 100
 
 # Configuration keys (derived from https://opencode.ai/config.json and /tui.json)
@@ -221,6 +225,12 @@ class SettingsManager:
         mappings = self.get_reference_mappings()
         mappings[f"{provider_key}/{model_id}"] = catalog_id
         self.set_reference_mappings(mappings)
+
+    def get_catalog_url(self) -> str:
+        return str(self.get("catalog/url", DEFAULT_CATALOG_URL))
+
+    def set_catalog_url(self, url: str):
+        self.set("catalog/url", str(url).strip())
 
 class ThemeManager:
     """Handle application theme switching"""
@@ -943,21 +953,26 @@ def _extract_models_map(data) -> dict:
 
 # Model catalog, normalized model formats, matching and fallback logic
 class ModelCatalog:
-    """Enhanced model catalog with filtering and preview"""
+    """Enhanced model catalog with custom models, pattern rules, filtering, and preview"""
 
     def __init__(self):
         self.raw = None
-        self.by_provider = {}  # provider_id -> {model_id: spec}
-        self.flat = {}         # model_id -> spec
+        self.by_provider = {}        # provider_id -> {model_id: spec}
+        self.flat = {}               # model_id -> spec
+        self.custom_models = {}      # model_id -> spec
+        self.custom_by_provider = {} # provider_id -> {model_id: spec}
+        self.pattern_rules = []      # list of rule dicts
         self.source = None
         self.last_updated = None
         self._formats_cache = None
-        self._model_index = {}  # model_id -> [provider_id, ...]
-        self.normalized_index = {} # normalized_id -> [model_id, ...]
+        self._model_index = {}       # model_id -> [provider_id, ...]
+        self.normalized_index = {}   # normalized_id -> [model_id, ...]
+        self._load_custom_models()
+        self._load_pattern_rules()
 
     def loaded(self) -> bool:
-        """Check if catalog is loaded"""
-        return self.raw is not None
+        """Check if catalog is loaded (including custom models)."""
+        return self.raw is not None or bool(self.custom_models)
 
     def load(self, path: Path):
         """Load catalog from file"""
@@ -973,8 +988,165 @@ class ModelCatalog:
         self.source = "(pasted)"
         self.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _load_custom_models(self):
+        """Load user-defined custom models from CUSTOM_MODELS_FILE."""
+        try:
+            if CUSTOM_MODELS_FILE.exists():
+                data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._apply_custom_models_dict(data)
+        except Exception:
+            pass
+
+    def _apply_custom_models_dict(self, data: dict):
+        """Merge custom models dict with high priority into catalog."""
+        self.custom_models = {}
+        self.custom_by_provider = {}
+
+        flat_custom = {}
+        by_prov = {}
+
+        if all(isinstance(v, dict) and "models" in v for v in data.values()):
+            for pid, pdata in data.items():
+                models = pdata.get("models", {})
+                if isinstance(models, dict):
+                    by_prov[pid] = models
+                    for mid, spec in models.items():
+                        flat_custom[mid] = spec
+        elif "models" in data and isinstance(data["models"], dict):
+            pid = data.get("id") or "custom"
+            by_prov[pid] = data["models"]
+            flat_custom.update(data["models"])
+        elif all(isinstance(v, dict) for v in data.values()):
+            for mid, spec in data.items():
+                pid = spec.get("provider") or "custom"
+                by_prov.setdefault(pid, {})[mid] = spec
+                flat_custom[mid] = spec
+
+        self.custom_models = flat_custom
+        self.custom_by_provider = by_prov
+
+        # Overlay on active index
+        for pid, models in by_prov.items():
+            if pid not in self.by_provider:
+                self.by_provider[pid] = {}
+            for mid, spec in models.items():
+                self.by_provider[pid][mid] = spec
+                self.flat[mid] = spec
+                if mid not in self._model_index:
+                    self._model_index[mid] = []
+                if pid not in self._model_index[mid]:
+                    self._model_index[mid].insert(0, pid)
+                norm_id = _normalize_model_id(mid)
+                if norm_id:
+                    self.normalized_index.setdefault(norm_id, []).insert(0, mid)
+                if isinstance(spec, dict) and "aliases" in spec:
+                    for alias in spec["aliases"]:
+                        self._model_index.setdefault(alias, []).insert(0, pid)
+                        norm_alias = _normalize_model_id(alias)
+                        if norm_alias:
+                            self.normalized_index.setdefault(norm_alias, []).insert(0, mid)
+
+        self._formats_cache = None
+
+    def _load_pattern_rules(self):
+        """Load pattern rules from PATTERN_RULES_FILE."""
+        try:
+            if PATTERN_RULES_FILE.exists():
+                data = loads_jsonc(PATTERN_RULES_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self.pattern_rules = [r for r in data if isinstance(r, dict)]
+        except Exception:
+            self.pattern_rules = []
+
+    def save_custom_model(self, model_id: str, spec: dict, provider: str = "custom") -> bool:
+        """Save/update a custom model spec in CUSTOM_MODELS_FILE."""
+        model_id = str(model_id).strip()
+        if not model_id:
+            return False
+        current = self.get_all_custom_models()
+        spec_copy = dict(spec)
+        spec_copy["provider"] = provider
+        current[model_id] = spec_copy
+
+        try:
+            CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+            if self.raw:
+                self._ingest(self.raw)
+            else:
+                self._load_custom_models()
+            return True
+        except OSError:
+            return False
+
+    def delete_custom_model(self, model_id: str) -> bool:
+        """Delete a custom model from CUSTOM_MODELS_FILE."""
+        current = self.get_all_custom_models()
+        if model_id in current:
+            current.pop(model_id, None)
+            try:
+                CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+                if self.raw:
+                    self._ingest(self.raw)
+                else:
+                    self.custom_models.pop(model_id, None)
+                    self._formats_cache = None
+                return True
+            except OSError:
+                return False
+        return False
+
+    def get_all_custom_models(self) -> Dict[str, dict]:
+        """Get dict of all saved custom models."""
+        try:
+            if CUSTOM_MODELS_FILE.exists():
+                data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return dict(self.custom_models)
+
+    def save_pattern_rules(self, rules: List[dict]) -> bool:
+        """Save list of pattern rules to PATTERN_RULES_FILE."""
+        self.pattern_rules = [r for r in rules if isinstance(r, dict) and r.get("pattern")]
+        try:
+            PATTERN_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PATTERN_RULES_FILE.write_text(json.dumps(self.pattern_rules, indent=2, ensure_ascii=False), encoding="utf-8")
+            return True
+        except OSError:
+            return False
+
+    def get_all_pattern_rules(self) -> List[dict]:
+        """Get list of all pattern rules."""
+        if not self.pattern_rules:
+            self._load_pattern_rules()
+        return list(self.pattern_rules)
+
+    def fetch_online(self, url: Optional[str] = None) -> Tuple[bool, str, int]:
+        """Download latest catalog from online source, update cache, and reload."""
+        catalog_url = (url or SettingsManager().get_catalog_url() or DEFAULT_CATALOG_URL).strip()
+        try:
+            req = urllib.request.Request(
+                catalog_url,
+                headers={"User-Agent": f"opencode-config-editor/{APP_VERSION}"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8")
+            data = loads_jsonc(raw)
+            if not isinstance(data, dict) or not data:
+                return False, "Downloaded catalog is empty or invalid JSON.", 0
+
+            CATALOG_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            CATALOG_CACHE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self.load(CATALOG_CACHE)
+            return True, f"Catalog updated successfully from {catalog_url}!", len(self.flat)
+        except Exception as e:
+            return False, f"Failed to fetch catalog: {e}", 0
+
     def _ingest(self, data: dict):
-        """Process catalog data"""
+        """Process catalog data and overlay custom models."""
         if not isinstance(data, dict) or not data:
             raise ValueError("Catalog JSON must be a non-empty object.")
 
@@ -985,21 +1157,21 @@ class ModelCatalog:
             for pid, pdata in data.items():
                 models = pdata.get("models", {})
                 if isinstance(models, dict):
-                    by_provider[pid] = models
+                    by_provider[pid] = dict(models)
                     for mid, spec in models.items():
                         flat.setdefault(mid, spec)
 
         # Single provider dump: {"id":..., "models": {...}}
         elif "models" in data and isinstance(data["models"], dict):
             pid = data.get("id") or "provider"
-            by_provider[pid] = data["models"]
+            by_provider[pid] = dict(data["models"])
             flat.update(data["models"])
 
         # Flat map: {modelId: spec}
         elif all(isinstance(v, dict) for v in data.values()):
             flat.update(data)
             # Provide a synthetic provider so the normalized formats still work.
-            by_provider["provider"] = data
+            by_provider["provider"] = dict(data)
 
         else:
             raise ValueError("Unrecognized model catalog format.")
@@ -1016,11 +1188,11 @@ class ModelCatalog:
                     for alias in spec["aliases"]:
                         self._model_index.setdefault(alias, []).append(pid)
 
-        for mid in self.flat:
+        for mid in list(self.flat.keys()):
             norm_id = _normalize_model_id(mid)
             if norm_id:
                 self.normalized_index.setdefault(norm_id, []).append(mid)
-            
+
             # Phase 2: Aliases in normalized index
             spec = self.flat[mid]
             if isinstance(spec, dict) and "aliases" in spec:
@@ -1028,6 +1200,10 @@ class ModelCatalog:
                     norm_alias = _normalize_model_id(alias)
                     if norm_alias:
                         self.normalized_index.setdefault(norm_alias, []).append(mid)
+
+        # Overlay custom models & load pattern rules
+        self._load_custom_models()
+        self._load_pattern_rules()
 
     def models_for(self, provider_key: str, npm: str = None) -> dict:
         """Get models for provider"""
@@ -1067,22 +1243,20 @@ class ModelCatalog:
         return [fmt for pmap in self.formats().values() for fmt in pmap.values()]
 
     def find_model(self, model_id: str) -> List["ModelFormat"]:
-        """Match a model id across the whole catalog (may match many providers)."""
+        """Match a model id across the catalog, custom models, and pattern rules."""
         matches = set()
 
-        # Exact match
+        # 1. Exact match
         if model_id in self._model_index:
             matches.add(model_id)
 
-        # Full normalized match (most precise).
+        # 2. Full normalized match (most precise).
         full = _normalize_model_id(model_id)
         if full in self.normalized_index:
             for original_id in self.normalized_index[full]:
                 matches.add(original_id)
 
-        # Fallback: version-stripped variants, e.g. "df/claude-opus-4.8" ->
-        # "claude-opus-4", so a config id still resolves when the catalog only
-        # lists the major version. Only consulted when nothing matched above.
+        # 3. Fallback: version-stripped variants
         if not matches:
             for key in _normalized_match_keys(model_id):
                 if key == full:
@@ -1090,6 +1264,50 @@ class ModelCatalog:
                 if key in self.normalized_index:
                     for original_id in self.normalized_index[key]:
                         matches.add(original_id)
+
+        # 4. Pattern rules match
+        if not matches and self.pattern_rules:
+            for rule in self.pattern_rules:
+                pat = str(rule.get("pattern", "")).strip()
+                if not pat:
+                    continue
+                matched = False
+                if pat.startswith("regex:"):
+                    try:
+                        matched = bool(re.search(pat[6:], model_id, re.IGNORECASE))
+                    except re.error:
+                        matched = False
+                else:
+                    matched = fnmatch.fnmatch(model_id.lower(), pat.lower())
+
+                if matched:
+                    ref_prov = rule.get("reference_provider")
+                    ref_mod = rule.get("reference_model")
+                    ref_fmt = None
+                    if ref_mod:
+                        mod_matches = self.find_model(ref_mod)
+                        if mod_matches:
+                            ref_fmt = mod_matches[0]
+                    if ref_fmt is None and ref_prov:
+                        ref_fmt = _find_fallback(model_id, ref_prov, self)
+                    if ref_fmt is not None:
+                        derived_fmt = ModelFormat(
+                            provider=ref_prov or ref_fmt.provider,
+                            model_id=model_id,
+                            name=humanize_model_id(model_id),
+                            context=ref_fmt.context,
+                            output=ref_fmt.output,
+                            cost_in=ref_fmt.cost_in,
+                            cost_out=ref_fmt.cost_out,
+                            cost_cache_read=ref_fmt.cost_cache_read,
+                            cost_cache_write=ref_fmt.cost_cache_write,
+                            modalities=ref_fmt.modalities,
+                            attachment=ref_fmt.attachment,
+                            reasoning=ref_fmt.reasoning,
+                            tools=ref_fmt.tools,
+                            temperature=ref_fmt.temperature,
+                        )
+                        return [derived_fmt]
 
         if not matches:
             return []
@@ -1102,7 +1320,6 @@ class ModelCatalog:
             for p in providers:
                 if mid in fmts.get(p, {}):
                     fmt = fmts[p][mid]
-                    # Use a tuple key to handle the same format object appearing for different providers
                     found_formats[(fmt.provider, fmt.model_id)] = fmt
 
         return list(found_formats.values())
@@ -4418,6 +4635,582 @@ class ApplyCatalogDialog(QDialog):
             resolve_fn=self._pick_provider,
         )
         return report
+
+
+class EditCustomModelDialog(QDialog):
+    """Dialog to add or edit a custom model spec in the catalog."""
+
+    def __init__(self, parent, model_id: str = "", spec: Optional[dict] = None, provider: str = "custom"):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Custom Model" if model_id else "Add Custom Model")
+        self.resize(560, 480)
+        self.result_model_id = ""
+        self.result_provider = ""
+        self.result_spec = {}
+
+        spec = spec or {}
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        # Model ID
+        self.id_edit = QLineEdit(model_id)
+        self.id_edit.setPlaceholderText("e.g. glm-5.3-flash, custom-gpt-5")
+        form.addRow("Model ID *:", self.id_edit)
+
+        # Name
+        init_name = spec.get("name") or (humanize_model_id(model_id) if model_id else "")
+        self.name_edit = QLineEdit(init_name)
+        self.name_edit.setPlaceholderText("e.g. GLM 5.3 Flash")
+        form.addRow("Display Name:", self.name_edit)
+
+        self.id_edit.textChanged.connect(self._on_id_changed)
+
+        # Provider
+        init_prov = spec.get("provider") or provider or "custom"
+        self.prov_edit = QLineEdit(init_prov)
+        self.prov_edit.setPlaceholderText("e.g. custom, zhipu, openai")
+        form.addRow("Provider Key:", self.prov_edit)
+
+        # Context limit
+        limit = spec.get("limit", {}) if isinstance(spec.get("limit"), dict) else {}
+        self.ctx_spin = QSpinBox()
+        self.ctx_spin.setRange(0, 10000000)
+        self.ctx_spin.setSingleStep(4000)
+        self.ctx_spin.setValue(int(limit.get("context", 128000)))
+        form.addRow("Context Window (tokens):", self.ctx_spin)
+
+        # Output limit
+        self.out_spin = QSpinBox()
+        self.out_spin.setRange(0, 1000000)
+        self.out_spin.setSingleStep(1000)
+        self.out_spin.setValue(int(limit.get("output", 8192)))
+        form.addRow("Max Output Tokens:", self.out_spin)
+
+        # Features
+        feat_box = QGroupBox("Capabilities & Features")
+        feat_layout = QGridLayout(feat_box)
+        self.att_cb = QCheckBox("Attachment (Images/Files)")
+        self.att_cb.setChecked(bool(spec.get("attachment", True)))
+        self.reas_cb = QCheckBox("Reasoning / Thinking")
+        self.reas_cb.setChecked(bool(spec.get("reasoning", False)))
+        self.tools_cb = QCheckBox("Tool Calling")
+        self.tools_cb.setChecked(bool(spec.get("tool_call", True)))
+        self.temp_cb = QCheckBox("Temperature Control")
+        self.temp_cb.setChecked(bool(spec.get("temperature", True)))
+
+        feat_layout.addWidget(self.att_cb, 0, 0)
+        feat_layout.addWidget(self.reas_cb, 0, 1)
+        feat_layout.addWidget(self.tools_cb, 1, 0)
+        feat_layout.addWidget(self.temp_cb, 1, 1)
+        form.addRow(feat_box)
+
+        # Modalities
+        mods = spec.get("modalities", {}) if isinstance(spec.get("modalities"), dict) else {}
+        in_mods = set(mods.get("input", ["text", "image"]))
+        out_mods = set(mods.get("output", ["text"]))
+
+        mod_box = QGroupBox("Modalities")
+        mod_layout = QHBoxLayout(mod_box)
+        self.mod_in_image = QCheckBox("Input Image")
+        self.mod_in_image.setChecked("image" in in_mods)
+        self.mod_in_audio = QCheckBox("Input Audio")
+        self.mod_in_audio.setChecked("audio" in in_mods)
+        self.mod_out_image = QCheckBox("Output Image")
+        self.mod_out_image.setChecked("image" in out_mods)
+
+        mod_layout.addWidget(self.mod_in_image)
+        mod_layout.addWidget(self.mod_in_audio)
+        mod_layout.addWidget(self.mod_out_image)
+        form.addRow(mod_box)
+
+        layout.addLayout(form)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _on_id_changed(self, text: str):
+        prev = self.id_edit.property("_prev_id") or ""
+        if not self.name_edit.text() or self.name_edit.text() == humanize_model_id(prev):
+            self.name_edit.setText(humanize_model_id(text))
+        self.id_edit.setProperty("_prev_id", text)
+
+    def _accept(self):
+        mid = self.id_edit.text().strip()
+        if not mid:
+            QMessageBox.warning(self, "Missing Model ID", "Please specify a Model ID.")
+            return
+
+        name = self.name_edit.text().strip() or humanize_model_id(mid)
+        prov = self.prov_edit.text().strip() or "custom"
+
+        in_mods = ["text"]
+        if self.mod_in_image.isChecked():
+            in_mods.append("image")
+        if self.mod_in_audio.isChecked():
+            in_mods.append("audio")
+
+        out_mods = ["text"]
+        if self.mod_out_image.isChecked():
+            out_mods.append("image")
+
+        spec = {
+            "name": name,
+            "provider": prov,
+            "limit": {
+                "context": self.ctx_spin.value(),
+                "output": self.out_spin.value(),
+            },
+            "attachment": self.att_cb.isChecked(),
+            "reasoning": self.reas_cb.isChecked(),
+            "tool_call": self.tools_cb.isChecked(),
+            "temperature": self.temp_cb.isChecked(),
+            "modalities": {
+                "input": in_mods,
+                "output": out_mods,
+            }
+        }
+
+        self.result_model_id = mid
+        self.result_provider = prov
+        self.result_spec = spec
+        self.accept()
+
+
+class EditPatternRuleDialog(QDialog):
+    """Dialog to create or edit a pattern mapping rule."""
+
+    def __init__(self, parent, rule: Optional[dict] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Pattern Mapping Rule" if rule else "Add Pattern Mapping Rule")
+        self.resize(500, 320)
+        self.result_rule = {}
+
+        rule = rule or {}
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        self.pat_edit = QLineEdit(rule.get("pattern", ""))
+        self.pat_edit.setPlaceholderText("e.g. glm-*, deepseek-*, or regex:^my-proxy/.*")
+        form.addRow("Pattern (wildcard/regex) *:", self.pat_edit)
+
+        self.prov_edit = QLineEdit(rule.get("reference_provider", ""))
+        self.prov_edit.setPlaceholderText("e.g. zhipu, openai, google, anthropic")
+        form.addRow("Reference Provider *:", self.prov_edit)
+
+        self.model_edit = QLineEdit(rule.get("reference_model", ""))
+        self.model_edit.setPlaceholderText("e.g. glm-4-flash, gpt-4o (optional)")
+        form.addRow("Reference Model (optional):", self.model_edit)
+
+        self.desc_edit = QLineEdit(rule.get("description", ""))
+        self.desc_edit.setPlaceholderText("e.g. Map all GLM models to Zhipu capabilities")
+        form.addRow("Description:", self.desc_edit)
+
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "<small><b>Examples:</b><br>"
+            "• <code>glm-*</code> with provider <code>zhipu</code>: any model like <code>glm-5.3-flash</code> gets Zhipu features.<br>"
+            "• <code>my-proxy/*</code> with provider <code>openai</code> and model <code>gpt-4o</code>: matches proxy models to GPT-4o spec."
+            "</small>"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray;")
+        layout.addWidget(hint)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self._accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _accept(self):
+        pat = self.pat_edit.text().strip()
+        prov = self.prov_edit.text().strip()
+        if not pat or not prov:
+            QMessageBox.warning(self, "Missing Fields", "Pattern and Reference Provider are required.")
+            return
+
+        self.result_rule = {
+            "pattern": pat,
+            "reference_provider": prov,
+            "reference_model": self.model_edit.text().strip(),
+            "description": self.desc_edit.text().strip(),
+        }
+        self.accept()
+
+
+class CustomCatalogManagerDialog(QDialog):
+    """Comprehensive dialog to manage custom model specs, pattern rules, and online catalog updates."""
+
+    def __init__(self, parent, catalog: ModelCatalog):
+        super().__init__(parent)
+        self.setWindowTitle("Model Catalog & Matching Rules Manager")
+        self.resize(900, 600)
+        self.catalog = catalog
+        self.settings = SettingsManager()
+
+        layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # Tab 1: Custom Models
+        self.custom_tab = QWidget()
+        self._setup_custom_models_tab()
+        self.tabs.addTab(self.custom_tab, "Custom Model Specs")
+
+        # Tab 2: Pattern Rules
+        self.rules_tab = QWidget()
+        self._setup_pattern_rules_tab()
+        self.tabs.addTab(self.rules_tab, "Pattern Mapping Rules")
+
+        # Tab 3: Online Sync & Sources
+        self.sync_tab = QWidget()
+        self._setup_sync_tab()
+        self.tabs.addTab(self.sync_tab, "Catalog Sources & Update")
+
+        # Bottom Close button
+        btn_layout = QHBoxLayout()
+        self.status_lbl = QLabel()
+        self._refresh_status()
+        btn_layout.addWidget(self.status_lbl)
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+    def _setup_custom_models_tab(self):
+        lay = QVBoxLayout(self.custom_tab)
+
+        tb = QHBoxLayout()
+        self.custom_search = QLineEdit()
+        self.custom_search.setPlaceholderText("Search custom models...")
+        self.custom_search.textChanged.connect(self._filter_custom_models)
+        tb.addWidget(self.custom_search)
+
+        for text, slot in [
+            ("+ Add Model", self._add_custom_model),
+            ("Edit", self._edit_selected_custom_model),
+            ("Delete", self._delete_selected_custom_model),
+            ("Import JSON", self._import_custom_models),
+            ("Export JSON", self._export_custom_models),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            tb.addWidget(b)
+        lay.addLayout(tb)
+
+        self.custom_table = QTableWidget(0, 6)
+        self.custom_table.setHorizontalHeaderLabels([
+            "Model ID", "Name", "Provider", "Context", "Output", "Features"
+        ])
+        self.custom_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.custom_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.custom_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.custom_table.cellDoubleClicked.connect(lambda row, col: self._edit_selected_custom_model())
+        lay.addWidget(self.custom_table)
+
+        self._refresh_custom_models_table()
+
+    def _refresh_custom_models_table(self):
+        models = self.catalog.get_all_custom_models()
+        self._populate_custom_models_table(models)
+
+    def _populate_custom_models_table(self, models: dict):
+        self.custom_table.setRowCount(len(models))
+        for row, (mid, spec) in enumerate(sorted(models.items())):
+            self.custom_table.setItem(row, 0, QTableWidgetItem(mid))
+            self.custom_table.setItem(row, 1, QTableWidgetItem(spec.get("name") or humanize_model_id(mid)))
+            self.custom_table.setItem(row, 2, QTableWidgetItem(spec.get("provider", "custom")))
+            limit = spec.get("limit", {}) if isinstance(spec.get("limit"), dict) else {}
+            ctx = limit.get("context")
+            out = limit.get("output")
+            self.custom_table.setItem(row, 3, QTableWidgetItem(f"{ctx:,}" if ctx else "—"))
+            self.custom_table.setItem(row, 4, QTableWidgetItem(f"{out:,}" if out else "—"))
+
+            feats = []
+            if spec.get("attachment"):
+                feats.append("Attachment")
+            if spec.get("reasoning"):
+                feats.append("Reasoning")
+            if spec.get("tool_call"):
+                feats.append("Tools")
+            self.custom_table.setItem(row, 5, QTableWidgetItem(", ".join(feats) if feats else "—"))
+
+    def _filter_custom_models(self, text: str):
+        all_models = self.catalog.get_all_custom_models()
+        if not text:
+            self._populate_custom_models_table(all_models)
+            return
+        text = text.lower()
+        filtered = {
+            mid: spec for mid, spec in all_models.items()
+            if text in mid.lower() or text in str(spec.get("name", "")).lower() or text in str(spec.get("provider", "")).lower()
+        }
+        self._populate_custom_models_table(filtered)
+
+    def _add_custom_model(self):
+        dlg = EditCustomModelDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.result_model_id:
+            self.catalog.save_custom_model(dlg.result_model_id, dlg.result_spec, dlg.result_provider)
+            self._refresh_custom_models_table()
+            self._refresh_status()
+
+    def _edit_selected_custom_model(self):
+        selected = self.custom_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        mid_item = self.custom_table.item(row, 0)
+        if not mid_item:
+            return
+        mid = mid_item.text()
+        all_models = self.catalog.get_all_custom_models()
+        spec = all_models.get(mid, {})
+        dlg = EditCustomModelDialog(self, mid, spec, spec.get("provider", "custom"))
+        if dlg.exec() == QDialog.Accepted and dlg.result_model_id:
+            if dlg.result_model_id != mid:
+                self.catalog.delete_custom_model(mid)
+            self.catalog.save_custom_model(dlg.result_model_id, dlg.result_spec, dlg.result_provider)
+            self._refresh_custom_models_table()
+            self._refresh_status()
+
+    def _delete_selected_custom_model(self):
+        selected = self.custom_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        mid = self.custom_table.item(row, 0).text()
+        if _confirm(self, "Delete Custom Model", f"Delete custom model spec '{mid}'?"):
+            self.catalog.delete_custom_model(mid)
+            self._refresh_custom_models_table()
+            self._refresh_status()
+
+    def _import_custom_models(self):
+        dlg = JsonImportDialog(
+            self, "Import Custom Models",
+            "Paste or load custom models JSON. Supported format: { \"model_id\": { \"name\": \"...\", ... } }"
+        )
+        if dlg.exec() == QDialog.Accepted and dlg.result_data:
+            data = dlg.result_data
+            if isinstance(data, dict):
+                current = self.catalog.get_all_custom_models()
+                current.update(data)
+                try:
+                    CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+                    self.catalog._load_custom_models()
+                    self._refresh_custom_models_table()
+                    self._refresh_status()
+                    QMessageBox.information(self, "Import", f"Imported {len(data)} custom model(s).")
+                except Exception as e:
+                    QMessageBox.warning(self, "Import Error", str(e))
+
+    def _export_custom_models(self):
+        models = self.catalog.get_all_custom_models()
+        if not models:
+            QMessageBox.information(self, "Export", "No custom models to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Custom Models", "custom_models.json",
+            "JSON files (*.json);;All files (*)"
+        )
+        if path:
+            try:
+                Path(path).write_text(json.dumps(models, indent=2, ensure_ascii=False), encoding="utf-8")
+                QMessageBox.information(self, "Export Complete", f"Exported to {path}")
+            except OSError as e:
+                QMessageBox.warning(self, "Export Error", str(e))
+
+    def _setup_pattern_rules_tab(self):
+        lay = QVBoxLayout(self.rules_tab)
+
+        tb = QHBoxLayout()
+        for text, slot in [
+            ("+ Add Rule", self._add_pattern_rule),
+            ("Edit", self._edit_selected_pattern_rule),
+            ("Delete", self._delete_selected_pattern_rule),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            tb.addWidget(b)
+        tb.addStretch()
+        lay.addLayout(tb)
+
+        self.rules_table = QTableWidget(0, 4)
+        self.rules_table.setHorizontalHeaderLabels([
+            "Pattern", "Reference Provider", "Reference Model", "Description"
+        ])
+        self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.rules_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.rules_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.rules_table.cellDoubleClicked.connect(lambda row, col: self._edit_selected_pattern_rule())
+        lay.addWidget(self.rules_table)
+
+        # Interactive Tester Box
+        test_box = QGroupBox("Interactive Pattern Rule Tester")
+        test_lay = QHBoxLayout(test_box)
+        self.test_input = QLineEdit()
+        self.test_input.setPlaceholderText("Type a model ID to test pattern matching, e.g. glm-5.3-flash...")
+        self.test_input.textChanged.connect(self._test_pattern_match)
+        test_lay.addWidget(self.test_input, 2)
+        self.test_result = QLabel("Enter a model ID above to test")
+        self.test_result.setStyleSheet("color: #0969da; font-weight: bold;")
+        test_lay.addWidget(self.test_result, 3)
+        lay.addWidget(test_box)
+
+        self._refresh_pattern_rules_table()
+
+    def _refresh_pattern_rules_table(self):
+        rules = self.catalog.get_all_pattern_rules()
+        self.rules_table.setRowCount(len(rules))
+        for row, rule in enumerate(rules):
+            self.rules_table.setItem(row, 0, QTableWidgetItem(rule.get("pattern", "")))
+            self.rules_table.setItem(row, 1, QTableWidgetItem(rule.get("reference_provider", "")))
+            self.rules_table.setItem(row, 2, QTableWidgetItem(rule.get("reference_model", "")))
+            self.rules_table.setItem(row, 3, QTableWidgetItem(rule.get("description", "")))
+
+    def _add_pattern_rule(self):
+        dlg = EditPatternRuleDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.result_rule:
+            rules = self.catalog.get_all_pattern_rules()
+            rules.append(dlg.result_rule)
+            self.catalog.save_pattern_rules(rules)
+            self._refresh_pattern_rules_table()
+            self._refresh_status()
+
+    def _edit_selected_pattern_rule(self):
+        selected = self.rules_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        rules = self.catalog.get_all_pattern_rules()
+        if row < len(rules):
+            dlg = EditPatternRuleDialog(self, rules[row])
+            if dlg.exec() == QDialog.Accepted and dlg.result_rule:
+                rules[row] = dlg.result_rule
+                self.catalog.save_pattern_rules(rules)
+                self._refresh_pattern_rules_table()
+                self._refresh_status()
+
+    def _delete_selected_pattern_rule(self):
+        selected = self.rules_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        rules = self.catalog.get_all_pattern_rules()
+        if row < len(rules) and _confirm(self, "Delete Rule", f"Delete rule for pattern '{rules[row].get('pattern')}'?"):
+            rules.pop(row)
+            self.catalog.save_pattern_rules(rules)
+            self._refresh_pattern_rules_table()
+            self._refresh_status()
+
+    def _test_pattern_match(self, text: str):
+        mid = text.strip()
+        if not mid:
+            self.test_result.setText("Enter a model ID above to test")
+            return
+        matches = self.catalog.find_model(mid)
+        if matches:
+            fmt = matches[0]
+            self.test_result.setText(
+                f"✓ Matches! Provider: {fmt.provider} | Name: {fmt.name or humanize_model_id(mid)} | Context: {fmt.context_k()}"
+            )
+        else:
+            self.test_result.setText("✗ No match found in catalog or pattern rules")
+
+    def _setup_sync_tab(self):
+        lay = QVBoxLayout(self.sync_tab)
+
+        form = QFormLayout()
+        self.url_edit = QLineEdit(self.settings.get_catalog_url())
+        reset_btn = QPushButton("Reset URL")
+        reset_btn.clicked.connect(lambda: self.url_edit.setText(DEFAULT_CATALOG_URL))
+        url_lay = QHBoxLayout()
+        url_lay.addWidget(self.url_edit, 1)
+        url_lay.addWidget(reset_btn)
+        form.addRow("Online Catalog URL:", url_lay)
+        lay.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.sync_btn = QPushButton("🔄 Update Catalog Online Now")
+        self.sync_btn.setStyleSheet("padding: 8px 16px; font-weight: bold;")
+        self.sync_btn.clicked.connect(self._sync_online)
+        btn_row.addWidget(self.sync_btn)
+
+        load_file_btn = QPushButton("Load Catalog from Local JSON...")
+        load_file_btn.clicked.connect(self._load_local_catalog)
+        btn_row.addWidget(load_file_btn)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        self.sync_info = QLabel()
+        self.sync_info.setWordWrap(True)
+        self.sync_info.setStyleSheet("background: palette(window); padding: 12px; border-radius: 6px;")
+        lay.addWidget(self.sync_info)
+        lay.addStretch()
+        self._update_sync_info()
+
+    def _update_sync_info(self):
+        src = self.catalog.source or "None"
+        cnt = len(self.catalog.flat)
+        custom_cnt = len(self.catalog.get_all_custom_models())
+        rules_cnt = len(self.catalog.get_all_pattern_rules())
+        last = self.catalog.last_updated or "Never"
+        self.sync_info.setText(
+            f"<b>Active Catalog Source:</b> {src}<br>"
+            f"<b>Total Catalog Models:</b> {cnt:,}<br>"
+            f"<b>User Custom Models:</b> {custom_cnt:,}<br>"
+            f"<b>Active Pattern Rules:</b> {rules_cnt:,}<br>"
+            f"<b>Last Loaded / Updated:</b> {last}"
+        )
+
+    def _sync_online(self):
+        url = self.url_edit.text().strip()
+        self.settings.set_catalog_url(url)
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setText("Updating...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, msg, count = self.catalog.fetch_online(url)
+            if ok:
+                QMessageBox.information(self, "Catalog Update", msg)
+                self._update_sync_info()
+                self._refresh_status()
+            else:
+                QMessageBox.warning(self, "Catalog Update Error", msg)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.sync_btn.setEnabled(True)
+            self.sync_btn.setText("🔄 Update Catalog Online Now")
+
+    def _load_local_catalog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Catalog JSON", str(Path.home()),
+            "JSON files (*.json);;All files (*)"
+        )
+        if path:
+            try:
+                self.catalog.load(Path(path))
+                self._update_sync_info()
+                self._refresh_status()
+                QMessageBox.information(self, "Catalog Loaded", f"Successfully loaded {len(self.catalog.flat)} models.")
+            except Exception as e:
+                QMessageBox.warning(self, "Load Error", str(e))
+
+    def _refresh_status(self):
+        cnt = len(self.catalog.flat)
+        custom_cnt = len(self.catalog.get_all_custom_models())
+        rules_cnt = len(self.catalog.get_all_pattern_rules())
+        self.status_lbl.setText(
+            f"Catalog: {cnt:,} models | Custom: {custom_cnt} | Pattern Rules: {rules_cnt}"
+        )
+
 
 def match_models_against_catalog(key, models_dict, catalog, reference_provider=None):
     """Build a list of potential catalog matches for the given models.
@@ -9970,13 +10763,21 @@ class MainWindow(QMainWindow):
         mtools = mb.addMenu("&Tools")
 
         if "catalog" in caps:
-            self.act_catalog = QAction("Load Model &Catalog...", self)
-            self.act_catalog.triggered.connect(self.load_model_catalog)
-            mtools.addAction(self.act_catalog)
+            self.act_catalog_mgr = QAction("Manage &Custom Models && Rules...", self)
+            self.act_catalog_mgr.triggered.connect(self._manage_custom_catalog)
+            mtools.addAction(self.act_catalog_mgr)
+
+            self.act_update_catalog = QAction("🔄 Update Model Catalog &Online...", self)
+            self.act_update_catalog.triggered.connect(self._update_catalog_online)
+            mtools.addAction(self.act_update_catalog)
 
             self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
             self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
             mtools.addAction(self.act_browse_catalog)
+
+            self.act_catalog = QAction("&Load Model Catalog File...", self)
+            self.act_catalog.triggered.connect(self.load_model_catalog)
+            mtools.addAction(self.act_catalog)
 
             self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
             self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
@@ -10605,6 +11406,27 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError) as e:
                 QMessageBox.warning(self, "Catalog Error", f"Failed to load bundled catalog: {e}")
         return self.load_model_catalog()
+
+    def _manage_custom_catalog(self):
+        """Open the Custom Models & Matching Rules manager dialog."""
+        self._ensure_catalog()
+        dlg = CustomCatalogManagerDialog(self, self.model_catalog)
+        dlg.exec()
+        self._update_catalog_status()
+
+    def _update_catalog_online(self):
+        """Update model catalog directly from configured online source."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, msg, count = self.model_catalog.fetch_online()
+            if ok:
+                self._update_catalog_status()
+                self.status_bar.showMessage(msg, 5000)
+                QMessageBox.information(self, "Catalog Update", msg)
+            else:
+                QMessageBox.warning(self, "Catalog Update Error", msg)
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _browse_model_catalog(self):
         """Open the full-catalog browse dialog."""

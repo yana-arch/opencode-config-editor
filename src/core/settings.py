@@ -98,6 +98,12 @@ class SettingsManager:
         mappings[f"{provider_key}/{model_id}"] = catalog_id
         self.set_reference_mappings(mappings)
 
+    def get_catalog_url(self) -> str:
+        return str(self.get("catalog/url", DEFAULT_CATALOG_URL))
+
+    def set_catalog_url(self, url: str):
+        self.set("catalog/url", str(url).strip())
+
 class ThemeManager:
     """Handle application theme switching"""
 

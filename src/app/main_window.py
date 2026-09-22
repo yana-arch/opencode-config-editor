@@ -232,13 +232,21 @@ class MainWindow(QMainWindow):
         mtools = mb.addMenu("&Tools")
 
         if "catalog" in caps:
-            self.act_catalog = QAction("Load Model &Catalog...", self)
-            self.act_catalog.triggered.connect(self.load_model_catalog)
-            mtools.addAction(self.act_catalog)
+            self.act_catalog_mgr = QAction("Manage &Custom Models && Rules...", self)
+            self.act_catalog_mgr.triggered.connect(self._manage_custom_catalog)
+            mtools.addAction(self.act_catalog_mgr)
+
+            self.act_update_catalog = QAction("🔄 Update Model Catalog &Online...", self)
+            self.act_update_catalog.triggered.connect(self._update_catalog_online)
+            mtools.addAction(self.act_update_catalog)
 
             self.act_browse_catalog = QAction("&Browse Model Catalog...", self)
             self.act_browse_catalog.triggered.connect(self._browse_model_catalog)
             mtools.addAction(self.act_browse_catalog)
+
+            self.act_catalog = QAction("&Load Model Catalog File...", self)
+            self.act_catalog.triggered.connect(self.load_model_catalog)
+            mtools.addAction(self.act_catalog)
 
             self.act_apply_catalog = QAction("&Match & Format Models from Catalog...", self)
             self.act_apply_catalog.triggered.connect(self._apply_model_catalog)
@@ -867,6 +875,27 @@ class MainWindow(QMainWindow):
             except (OSError, ValueError) as e:
                 QMessageBox.warning(self, "Catalog Error", f"Failed to load bundled catalog: {e}")
         return self.load_model_catalog()
+
+    def _manage_custom_catalog(self):
+        """Open the Custom Models & Matching Rules manager dialog."""
+        self._ensure_catalog()
+        dlg = CustomCatalogManagerDialog(self, self.model_catalog)
+        dlg.exec()
+        self._update_catalog_status()
+
+    def _update_catalog_online(self):
+        """Update model catalog directly from configured online source."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, msg, count = self.model_catalog.fetch_online()
+            if ok:
+                self._update_catalog_status()
+                self.status_bar.showMessage(msg, 5000)
+                QMessageBox.information(self, "Catalog Update", msg)
+            else:
+                QMessageBox.warning(self, "Catalog Update Error", msg)
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _browse_model_catalog(self):
         """Open the full-catalog browse dialog."""
