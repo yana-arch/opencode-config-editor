@@ -157,3 +157,25 @@ def test_providers_tab_add_from_api_creates_new_provider(qapp, catalog, monkeypa
     assert "brand-new" in providers
     assert set(providers["brand-new"]["models"]) == {"m-a", "m-b"}
 
+
+def test_new_feature_dialogs_construct(qapp):
+    # Health check dialog
+    health_dlg = app.ProviderHealthCheckDialog(None, providers={"openai": {"npm": "@ai-sdk/openai"}}, auto_run=False)
+    assert health_dlg is not None
+    health_dlg.close()
+
+    # MCP Hub dialog
+    hub_oc = app.MCPTemplateHubDialog(None, target_mode="opencode")
+    assert hub_oc is not None
+    hub_oc.close()
+
+    hub_cl = app.MCPTemplateHubDialog(None, target_mode="openclaude")
+    assert hub_cl is not None
+    hub_cl.close()
+
+    # Cross config converter dialog
+    conv_dlg = app.CrossConfigConverterDialog(None)
+    assert conv_dlg is not None
+    conv_dlg.close()
+
+

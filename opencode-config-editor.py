@@ -2238,6 +2238,622 @@ def fetch_provider_models(spec: ProviderFetchSpec, *, opener=None) -> dict:
     return parse_fetched_models(data, spec)
 
 
+# Connectivity and Health Check module for Provider APIs
+# ---------------------------------------------------------------------------
+import json
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+
+@dataclass
+class ConnectionTestResult:
+    """Result of testing connectivity to a model provider API."""
+    success: bool
+    latency_ms: float = 0.0
+    status_code: int = 0
+    message: str = ""
+    model_count: Optional[int] = None
+    models: List[str] = field(default_factory=list)
+    raw_error: str = ""
+
+    def summary(self) -> str:
+        if self.success:
+            count_str = f" ({self.model_count} models found)" if self.model_count is not None else ""
+            return f"✓ Connected in {self.latency_ms:.0f}ms{count_str}"
+        return f"✗ Failed: {self.message}"
+
+
+def test_provider_connection(
+    base_url: str,
+    api_key: str = "",
+    adapter: str = "openai",
+    timeout: int = 10,
+    allow_local: bool = True,
+    opener=None,
+) -> ConnectionTestResult:
+    """Send a lightweight test request to verify API endpoint connectivity and authentication.
+
+    Measures latency and extracts model list when possible.
+    """
+    if not base_url or not base_url.strip():
+        return ConnectionTestResult(
+            success=False,
+            message="Base URL is empty.",
+            raw_error="Empty URL",
+        )
+
+    clean_url = base_url.strip()
+    spec = ProviderFetchSpec(
+        base_url=clean_url,
+        adapter=adapter,
+        api_key=api_key.strip() if api_key else "",
+        allow_local=allow_local,
+        timeout=timeout,
+    )
+
+    t0 = time.perf_counter()
+    try:
+        url = _build_fetch_url(spec)
+        _validate_fetch_url(url, spec.allow_local)
+        headers = _build_fetch_headers(spec)
+
+        if opener is not None:
+            raw = opener(url, headers, spec.timeout)
+            status_code = 200
+        else:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=spec.timeout) as r:
+                raw = r.read()
+                status_code = getattr(r, "status", 200)
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+
+        data = json.loads(raw)
+        models_dict = parse_fetched_models(data, spec)
+        model_keys = sorted(models_dict.keys())
+
+        return ConnectionTestResult(
+            success=True,
+            latency_ms=latency_ms,
+            status_code=status_code,
+            message="Connection successful",
+            model_count=len(model_keys),
+            models=model_keys[:50],
+        )
+
+    except FetchError as e:
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return ConnectionTestResult(
+            success=False,
+            latency_ms=latency_ms,
+            message=str(e),
+            raw_error=str(e),
+        )
+    except urllib.error.HTTPError as e:
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        msg = f"HTTP {e.code}: {e.reason}"
+        if e.code == 401:
+            msg = "HTTP 401: Unauthorized (Invalid or missing API key)"
+        elif e.code == 403:
+            msg = "HTTP 403: Forbidden (Access denied or insufficient permissions)"
+        elif e.code == 404:
+            msg = f"HTTP 404: Endpoint not found ({url})"
+        elif e.code == 429:
+            msg = "HTTP 429: Rate limited or quota exhausted"
+        return ConnectionTestResult(
+            success=False,
+            latency_ms=latency_ms,
+            status_code=e.code,
+            message=msg,
+            raw_error=str(e),
+        )
+    except urllib.error.URLError as e:
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        reason = str(e.reason)
+        if "Connection refused" in reason:
+            reason = "Connection refused (Check if local server like Ollama/vLLM is running)"
+        return ConnectionTestResult(
+            success=False,
+            latency_ms=latency_ms,
+            message=f"Network error: {reason}",
+            raw_error=str(e),
+        )
+    except Exception as e:
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return ConnectionTestResult(
+            success=False,
+            latency_ms=latency_ms,
+            message=f"Error: {e}",
+            raw_error=str(e),
+        )
+# MCP Server Templates and Hub Catalog
+# ---------------------------------------------------------------------------
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class MCPTemplate:
+    id: str
+    name: str
+    category: str  # "Memory & Context", "System & Files", "Developer Tools", "Data & Web", "Database"
+    description: str
+    transport_type: str  # "local" | "remote"
+    command: List[str] = field(default_factory=list)
+    url: str = ""
+    env_keys: Dict[str, str] = field(default_factory=dict)  # key -> placeholder/hint
+    default_args: List[str] = field(default_factory=list)
+    doc_url: str = ""
+
+
+MCP_REGISTRY: List[MCPTemplate] = [
+    MCPTemplate(
+        id="memory",
+        name="Memory (Knowledge Graph)",
+        category="Memory & Context",
+        description="Persistent memory and knowledge graph storage across AI sessions using official MCP memory server.",
+        transport_type="local",
+        command=["npx", "-y", "@modelcontextprotocol/server-memory"],
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/memory",
+    ),
+    MCPTemplate(
+        id="filesystem",
+        name="Filesystem Access",
+        category="System & Files",
+        description="Secure file system access to read, write, and list files within specified directories.",
+        transport_type="local",
+        command=["npx", "-y", "@modelcontextprotocol/server-filesystem", "{allowed_directory}"],
+        default_args=["/path/to/allowed/directory"],
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem",
+    ),
+    MCPTemplate(
+        id="github",
+        name="GitHub Integration",
+        category="Developer Tools",
+        description="Search repositories, view code, inspect pull requests, and manage issues directly on GitHub.",
+        transport_type="local",
+        command=["npx", "-y", "@modelcontextprotocol/server-github"],
+        env_keys={"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxxxxxxxxxxx"},
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/github",
+    ),
+    MCPTemplate(
+        id="brave-search",
+        name="Brave Search",
+        category="Data & Web",
+        description="Web search and local business search via Brave Search API for live internet knowledge.",
+        transport_type="local",
+        command=["npx", "-y", "@modelcontextprotocol/server-brave-search"],
+        env_keys={"BRAVE_API_KEY": "BSAxxxxxxxxxxxx"},
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search",
+    ),
+    MCPTemplate(
+        id="fetch",
+        name="Web Page Fetcher",
+        category="Data & Web",
+        description="Fetch web pages, extract content, and convert HTML to clean markdown for reading.",
+        transport_type="local",
+        command=["npx", "-y", "@modelcontextprotocol/server-fetch"],
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
+    ),
+    MCPTemplate(
+        id="postgres",
+        name="PostgreSQL Inspector",
+        category="Database",
+        description="Read-only or read/write schema inspection and querying for PostgreSQL databases.",
+        transport_type="local",
+        command=["npx", "-y", "@modelcontextprotocol/server-postgres", "{connection_string}"],
+        default_args=["postgresql://user:password@localhost:5432/my_database"],
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
+    ),
+    MCPTemplate(
+        id="sqlite",
+        name="SQLite Explorer",
+        category="Database",
+        description="Inspect tables, query schemas, and run SQL on local SQLite database files.",
+        transport_type="local",
+        command=["uvx", "mcp-server-sqlite", "--db-path", "{db_path}"],
+        default_args=["/path/to/database.db"],
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
+    ),
+    MCPTemplate(
+        id="puppeteer",
+        name="Puppeteer Browser",
+        category="Data & Web",
+        description="Headless browser automation to interact with dynamic web pages, take screenshots, and execute JavaScript.",
+        transport_type="local",
+        command=["npx", "-y", "@modelcontextprotocol/server-puppeteer"],
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer",
+    ),
+    MCPTemplate(
+        id="git",
+        name="Git Tools",
+        category="Developer Tools",
+        description="Query repository status, commit history, diffs, and inspect branches.",
+        transport_type="local",
+        command=["uvx", "mcp-server-git", "--repository", "{repo_path}"],
+        default_args=["/path/to/repo"],
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/git",
+    ),
+    MCPTemplate(
+        id="sequential-thinking",
+        name="Sequential Thinking",
+        category="Memory & Context",
+        description="Dynamic, multi-step structured reasoning tool for complex problem solving and debugging.",
+        transport_type="local",
+        command=["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/sequential-thinking",
+    ),
+    MCPTemplate(
+        id="context7",
+        name="Context7 Docs & Libraries",
+        category="Developer Tools",
+        description="Up-to-date documentation and API reference lookup engine for popular libraries.",
+        transport_type="local",
+        command=["npx", "-y", "context7-mcp"],
+        doc_url="https://context7.com",
+    ),
+    MCPTemplate(
+        id="remote-sse",
+        name="Generic Remote MCP (SSE/HTTP)",
+        category="Custom & Remote",
+        description="Connect to any remote or hosted MCP server via Server-Sent Events (SSE) or HTTP endpoint.",
+        transport_type="remote",
+        url="https://mcp.example.com/sse",
+        doc_url="https://modelcontextprotocol.io",
+    ),
+]
+
+
+def get_mcp_template(template_id: str) -> Optional[MCPTemplate]:
+    """Retrieve template by its ID."""
+    for tmpl in MCP_REGISTRY:
+        if tmpl.id == template_id:
+            return tmpl
+    return None
+
+
+def instantiate_opencode_mcp(
+    template: MCPTemplate,
+    server_key: str,
+    args_values: Optional[Dict[str, str]] = None,
+    env_values: Optional[Dict[str, str]] = None,
+    url_value: str = "",
+) -> Dict[str, Any]:
+    """Create OpenCode format config for an MCP server."""
+    args_values = args_values or {}
+    env_values = env_values or {}
+
+    if template.transport_type == "remote":
+        res: Dict[str, Any] = {
+            "type": "remote",
+            "url": url_value.strip() or template.url,
+            "enabled": True,
+        }
+        return res
+
+    cmd_list = []
+    for part in template.command:
+        formatted = part
+        for k, v in args_values.items():
+            formatted = formatted.replace(f"{{{k}}}", v.strip())
+        cmd_list.append(formatted)
+
+    config: Dict[str, Any] = {
+        "type": "local",
+        "command": cmd_list,
+        "enabled": True,
+    }
+    clean_env = {k: v.strip() for k, v in env_values.items() if v.strip()}
+    if clean_env:
+        config["env"] = clean_env
+
+    return config
+
+
+def instantiate_openclaude_mcp(
+    template: MCPTemplate,
+    server_key: str,
+    args_values: Optional[Dict[str, str]] = None,
+    env_values: Optional[Dict[str, str]] = None,
+    url_value: str = "",
+) -> Dict[str, Any]:
+    """Create OpenClaude / Claude Code format config for an MCP server (mcpServers entry)."""
+    args_values = args_values or {}
+    env_values = env_values or {}
+
+    if template.transport_type == "remote":
+        return {
+            "type": "sse",
+            "url": url_value.strip() or template.url,
+        }
+
+    cmd_list = []
+    for part in template.command:
+        formatted = part
+        for k, v in args_values.items():
+            formatted = formatted.replace(f"{{{k}}}", v.strip())
+        cmd_list.append(formatted)
+
+    if not cmd_list:
+        return {}
+
+    command = cmd_list[0]
+    args = cmd_list[1:]
+
+    config: Dict[str, Any] = {
+        "command": command,
+        "args": args,
+    }
+    clean_env = {k: v.strip() for k, v in env_values.items() if v.strip()}
+    if clean_env:
+        config["env"] = clean_env
+
+    return config
+# Universal Config Converter & Cross-Import/Export Engine
+# (OpenCode <-> OpenClaude <-> OMP v1 <-> Claude Desktop / Cursor)
+# ---------------------------------------------------------------------------
+
+def detect_config_format(data: dict) -> str:
+    """Identify the config format of the given dictionary."""
+    if not isinstance(data, dict):
+        return "unknown"
+
+    if data.get("format") == "omp/v1" or ("$schema" in data and "omp" in str(data["$schema"])):
+        return "omp"
+
+    if "provider" in data or "tui" in data or "plugin" in data:
+        return "opencode"
+
+    if "providerProfiles" in data or "activeProviderProfileId" in data:
+        return "openclaude_global"
+
+    if "permissions" in data or "modelLimits" in data or "statusLine" in data:
+        return "openclaude_settings"
+
+    if "mcpServers" in data:
+        if len(data) == 1:
+            return "claude_desktop"
+        return "openclaude_global"
+
+    if "mcp" in data:
+        return "opencode"
+
+    return "generic"
+
+
+# ---------------------------------------------------------------------------
+# OpenCode <-> OpenClaude converters
+# ---------------------------------------------------------------------------
+
+def opencode_mcp_to_claude_mcp(opencode_mcp: dict) -> dict:
+    """Convert OpenCode `mcp` dictionary to Claude `mcpServers` dictionary."""
+    out = {}
+    if not isinstance(opencode_mcp, dict):
+        return out
+
+    for name, cfg in opencode_mcp.items():
+        if not isinstance(cfg, dict):
+            continue
+        stype = cfg.get("type", "local")
+        entry = {}
+        if stype == "remote":
+            entry["type"] = "sse"
+            entry["url"] = cfg.get("url", "")
+            if "headers" in cfg and isinstance(cfg["headers"], dict):
+                entry["headers"] = dict(cfg["headers"])
+        else:
+            cmd = cfg.get("command", [])
+            if isinstance(cmd, list) and cmd:
+                entry["command"] = str(cmd[0])
+                if len(cmd) > 1:
+                    entry["args"] = [str(x) for x in cmd[1:]]
+            elif isinstance(cmd, str) and cmd:
+                parts = cmd.split()
+                entry["command"] = parts[0]
+                if len(parts) > 1:
+                    entry["args"] = parts[1:]
+        if "env" in cfg and isinstance(cfg["env"], dict):
+            entry["env"] = {str(k): str(v) for k, v in cfg["env"].items()}
+        out[name] = entry
+    return out
+
+
+def claude_mcp_to_opencode_mcp(claude_mcp: dict) -> dict:
+    """Convert Claude `mcpServers` dictionary to OpenCode `mcp` dictionary."""
+    out = {}
+    if not isinstance(claude_mcp, dict):
+        return out
+
+    for name, cfg in claude_mcp.items():
+        if not isinstance(cfg, dict):
+            continue
+        stype = cfg.get("type", "stdio")
+        if stype in ("sse", "remote", "http") or "url" in cfg:
+            entry = {
+                "type": "remote",
+                "url": cfg.get("url", ""),
+                "enabled": True,
+            }
+            if "headers" in cfg and isinstance(cfg["headers"], dict):
+                entry["headers"] = dict(cfg["headers"])
+        else:
+            cmd_parts = []
+            if "command" in cfg and cfg["command"]:
+                cmd_parts.append(str(cfg["command"]))
+            if "args" in cfg and isinstance(cfg["args"], list):
+                cmd_parts.extend([str(a) for a in cfg["args"]])
+            entry = {
+                "type": "local",
+                "command": cmd_parts,
+                "enabled": True,
+            }
+        if "env" in cfg and isinstance(cfg["env"], dict):
+            entry["env"] = {str(k): str(v) for k, v in cfg["env"].items()}
+        out[name] = entry
+    return out
+
+
+def opencode_permissions_to_claude(perms: dict) -> dict:
+    """Convert OpenCode permissions to OpenClaude permissions format."""
+    out = {"allow": [], "deny": [], "ask": []}
+    if not isinstance(perms, dict):
+        return out
+
+    for cmd, action in perms.items():
+        act_str = str(action).lower()
+        if act_str in ("allow", "true"):
+            out["allow"].append(cmd)
+        elif act_str in ("deny", "false", "block"):
+            out["deny"].append(cmd)
+        elif act_str in ("ask", "prompt"):
+            out["ask"].append(cmd)
+    return {k: v for k, v in out.items() if v}
+
+
+def claude_permissions_to_opencode(perms: dict) -> dict:
+    """Convert OpenClaude permissions to OpenCode dictionary format."""
+    out = {}
+    if not isinstance(perms, dict):
+        return out
+    for cmd in perms.get("allow", []):
+        out[str(cmd)] = "allow"
+    for cmd in perms.get("deny", []):
+        out[str(cmd)] = "deny"
+    for cmd in perms.get("ask", []):
+        out[str(cmd)] = "ask"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# OMP (Open Multi-Platform) Schema v1
+# ---------------------------------------------------------------------------
+
+def export_to_omp(
+    opencode_cfg: Optional[dict] = None,
+    openclaude_global: Optional[dict] = None,
+    openclaude_settings: Optional[dict] = None,
+    name: str = "My AI Development Profile",
+    description: str = "",
+) -> dict:
+    """Export configs from OpenCode and/or OpenClaude into a unified OMP v1 bundle."""
+    bundle: Dict[str, Any] = {
+        "$schema": "https://opencode.ai/schemas/omp-v1.json",
+        "format": "omp/v1",
+        "metadata": {
+            "name": name,
+            "description": description,
+            "exported_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "generator": "opencode-config-editor",
+        },
+        "providers": {},
+        "mcp_servers": {},
+        "plugins": [],
+        "permissions": {},
+        "prompts": {},
+        "settings": {},
+    }
+
+    # Extract from OpenCode
+    if isinstance(opencode_cfg, dict):
+        if "provider" in opencode_cfg and isinstance(opencode_cfg["provider"], dict):
+            bundle["providers"] = json.loads(json.dumps(opencode_cfg["provider"]))
+        if "mcp" in opencode_cfg and isinstance(opencode_cfg["mcp"], dict):
+            bundle["mcp_servers"] = json.loads(json.dumps(opencode_cfg["mcp"]))
+        if "plugin" in opencode_cfg:
+            bundle["plugins"] = json.loads(json.dumps(opencode_cfg["plugin"]))
+        if "permission" in opencode_cfg and isinstance(opencode_cfg["permission"], dict):
+            bundle["permissions"] = json.loads(json.dumps(opencode_cfg["permission"]))
+        if "instructions" in opencode_cfg:
+            bundle["prompts"]["instructions"] = opencode_cfg["instructions"]
+        if "tui" in opencode_cfg:
+            bundle["settings"]["tui"] = json.loads(json.dumps(opencode_cfg["tui"]))
+
+    # Merge/augment from OpenClaude
+    if isinstance(openclaude_global, dict):
+        if "mcpServers" in openclaude_global and isinstance(openclaude_global["mcpServers"], dict):
+            converted = claude_mcp_to_opencode_mcp(openclaude_global["mcpServers"])
+            for k, v in converted.items():
+                bundle["mcp_servers"].setdefault(k, v)
+        if "providerProfiles" in openclaude_global:
+            bundle["settings"]["claude_provider_profiles"] = json.loads(
+                json.dumps(openclaude_global["providerProfiles"])
+            )
+
+    if isinstance(openclaude_settings, dict):
+        if "permissions" in openclaude_settings and isinstance(openclaude_settings["permissions"], dict):
+            conv_perms = claude_permissions_to_opencode(openclaude_settings["permissions"])
+            for k, v in conv_perms.items():
+                bundle["permissions"].setdefault(k, v)
+        if "env" in openclaude_settings and isinstance(openclaude_settings["env"], dict):
+            bundle["settings"]["env"] = json.loads(json.dumps(openclaude_settings["env"]))
+
+    return bundle
+
+
+def import_from_omp(
+    omp_data: dict,
+    target: str = "opencode",  # "opencode" | "openclaude_settings" | "openclaude_global"
+    selected_components: Optional[List[str]] = None,
+) -> dict:
+    """Import an OMP v1 bundle into the target config dictionary structure."""
+    if not isinstance(omp_data, dict):
+        return {}
+
+    comps = set(selected_components or ["providers", "mcp_servers", "plugins", "permissions", "prompts", "settings"])
+    result: Dict[str, Any] = {}
+
+    if target == "opencode":
+        if "providers" in comps and "providers" in omp_data and isinstance(omp_data["providers"], dict):
+            result["provider"] = json.loads(json.dumps(omp_data["providers"]))
+        if "mcp_servers" in comps and "mcp_servers" in omp_data and isinstance(omp_data["mcp_servers"], dict):
+            result["mcp"] = json.loads(json.dumps(omp_data["mcp_servers"]))
+        if "plugins" in comps and "plugins" in omp_data:
+            result["plugin"] = json.loads(json.dumps(omp_data["plugins"]))
+        if "permissions" in comps and "permissions" in omp_data and isinstance(omp_data["permissions"], dict):
+            result["permission"] = json.loads(json.dumps(omp_data["permissions"]))
+        if "prompts" in comps and "prompts" in omp_data and isinstance(omp_data["prompts"], dict):
+            if "instructions" in omp_data["prompts"]:
+                result["instructions"] = omp_data["prompts"]["instructions"]
+        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+            if "tui" in omp_data["settings"]:
+                result["tui"] = json.loads(json.dumps(omp_data["settings"]["tui"]))
+
+    elif target == "openclaude_global":
+        if "mcp_servers" in comps and "mcp_servers" in omp_data and isinstance(omp_data["mcp_servers"], dict):
+            result["mcpServers"] = opencode_mcp_to_claude_mcp(omp_data["mcp_servers"])
+        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+            if "claude_provider_profiles" in omp_data["settings"]:
+                result["providerProfiles"] = json.loads(json.dumps(omp_data["settings"]["claude_provider_profiles"]))
+
+    elif target == "openclaude_settings":
+        if "permissions" in comps and "permissions" in omp_data and isinstance(omp_data["permissions"], dict):
+            result["permissions"] = opencode_permissions_to_claude(omp_data["permissions"])
+        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+            if "env" in omp_data["settings"]:
+                result["env"] = json.loads(json.dumps(omp_data["settings"]["env"]))
+
+    return result
+
+
+def extract_external_mcp_servers(raw_data: dict) -> dict:
+    """Extract MCP servers from Claude Desktop (`claude_desktop_config.json`) or Cursor (`mcp.json`)."""
+    if not isinstance(raw_data, dict):
+        return {}
+    if "mcpServers" in raw_data and isinstance(raw_data["mcpServers"], dict):
+        return raw_data["mcpServers"]
+    if "mcp" in raw_data and isinstance(raw_data["mcp"], dict):
+        return opencode_mcp_to_claude_mcp(raw_data["mcp"])
+    likely_mcp = {}
+    for k, v in raw_data.items():
+        if isinstance(v, dict) and ("command" in v or "url" in v or "type" in v):
+            likely_mcp[k] = v
+    return likely_mcp
 # Agent adapter spec + registry.
 #
 # An AdapterSpec describes ONE agent CLI's config surface (file locations,
@@ -5212,6 +5828,796 @@ class CustomCatalogManagerDialog(QDialog):
         )
 
 
+# Connectivity & Health Check GUI Components
+# ---------------------------------------------------------------------------
+import json
+from typing import Dict, Optional
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
+    QMessageBox, QTextEdit, QGroupBox, QSplitter
+)
+
+
+class ProviderPingWorker(QThread):
+    """Background worker to test a provider connection without freezing the GUI."""
+    finished_one = Signal(str, object)  # provider_key, ConnectionTestResult
+
+    def __init__(self, providers_to_test: Dict[str, dict]):
+        super().__init__()
+        self.providers_to_test = providers_to_test
+
+    def run(self):
+        for key, pdata in self.providers_to_test.items():
+            if not isinstance(pdata, dict):
+                continue
+            opts = pdata.get("options", {}) if isinstance(pdata.get("options"), dict) else {}
+            base_url = opts.get("baseURL", "")
+            api_key = opts.get("apiKey", "")
+            npm = pdata.get("npm", "")
+
+            # Guess adapter
+            adapter = "openai"
+            if "anthropic" in npm:
+                adapter = "anthropic"
+            elif "google" in npm:
+                adapter = "gemini"
+
+            # If no base_url specified, use default for known npm
+            if not base_url:
+                if "anthropic" in npm:
+                    base_url = "https://api.anthropic.com"
+                elif "openai" in npm and not "openai-compatible" in npm:
+                    base_url = "https://api.openai.com/v1"
+                elif "google" in npm:
+                    base_url = "https://generativelanguage.googleapis.com"
+
+            if not base_url:
+                res = ConnectionTestResult(
+                    success=False,
+                    message="No baseURL configured for this provider.",
+                )
+            else:
+                res = test_provider_connection(
+                    base_url=base_url,
+                    api_key=api_key,
+                    adapter=adapter,
+                    timeout=12,
+                    allow_local=True,
+                )
+            self.finished_one.emit(key, res)
+
+
+class ProviderHealthCheckDialog(QDialog):
+    """Dialog to run live health checks on all configured providers."""
+
+    def __init__(self, parent=None, providers: Optional[dict] = None, auto_run: bool = True):
+        super().__init__(parent)
+        self.setWindowTitle("⚡ Provider Connectivity & Health Check")
+        self.setMinimumSize(780, 520)
+        self.providers = providers or {}
+        self.results: Dict[str, ConnectionTestResult] = {}
+        self.worker: Optional[ProviderPingWorker] = None
+
+        layout = QVBoxLayout(self)
+
+        # Header description
+        info = QLabel(
+            "Test endpoint reachability, response latency, authentication keys, and discovered models for your configured providers."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #666; margin-bottom: 6px;")
+        layout.addWidget(info)
+
+        # Progress bar
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        self.progress.hide()
+        layout.addWidget(self.progress)
+
+        # Splitter: Left table, right details
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Table
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Provider", "Status", "Latency", "Models"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        splitter.addWidget(self.table)
+
+        # Right side: Detail box
+        right_box = QGroupBox("Health Diagnostic Details")
+        right_lay = QVBoxLayout(right_box)
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        self.detail_text.setPlaceholderText("Select a provider row to view detailed response and model list...")
+        right_lay.addWidget(self.detail_text)
+        splitter.addWidget(right_box)
+        splitter.setSizes([450, 330])
+
+        layout.addWidget(splitter, 1)
+
+        # Buttons
+        btns = QHBoxLayout()
+        self.run_btn = QPushButton("▶ Run All Tests")
+        self.run_btn.clicked.connect(self.run_tests)
+        btns.addWidget(self.run_btn)
+
+        self.retest_sel_btn = QPushButton("↺ Test Selected")
+        self.retest_sel_btn.clicked.connect(self._test_selected)
+        btns.addWidget(self.retest_sel_btn)
+
+        btns.addStretch(1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btns.addWidget(close_btn)
+        layout.addLayout(btns)
+
+        self._populate_table()
+        if auto_run and self.providers:
+            self.run_tests()
+
+    def _stop_worker(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(1500)
+
+    def closeEvent(self, event):
+        self._stop_worker()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._stop_worker()
+        super().reject()
+
+    def accept(self):
+        self._stop_worker()
+        super().accept()
+
+    def _populate_table(self):
+        self.table.setRowCount(0)
+        for key in sorted(self.providers.keys()):
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            self.table.setItem(r, 0, QTableWidgetItem(key))
+            self.table.setItem(r, 1, QTableWidgetItem("Ready"))
+            self.table.setItem(r, 2, QTableWidgetItem("-"))
+            self.table.setItem(r, 3, QTableWidgetItem("-"))
+
+    def run_tests(self):
+        if not self.providers:
+            QMessageBox.information(self, "No Providers", "No providers configured to test.")
+            return
+
+        self.run_btn.setEnabled(False)
+        self.progress.show()
+        self.progress.setRange(0, len(self.providers))
+        self.progress.setValue(0)
+
+        for r in range(self.table.rowCount()):
+            self.table.setItem(r, 1, QTableWidgetItem("Testing..."))
+            self.table.setItem(r, 2, QTableWidgetItem("-"))
+            self.table.setItem(r, 3, QTableWidgetItem("-"))
+
+        self.worker = ProviderPingWorker(self.providers)
+        self.worker.finished_one.connect(self._on_provider_tested)
+        self.worker.finished.connect(self._on_all_finished)
+        self.worker.start()
+
+    def _test_selected(self):
+        selected_rows = sorted({i.row() for i in self.table.selectedItems()})
+        if not selected_rows:
+            QMessageBox.information(self, "Selection", "Please select a provider row to test.")
+            return
+
+        subset = {}
+        for r in selected_rows:
+            key = self.table.item(r, 0).text()
+            if key in self.providers:
+                subset[key] = self.providers[key]
+                self.table.setItem(r, 1, QTableWidgetItem("Testing..."))
+
+        self.worker = ProviderPingWorker(subset)
+        self.worker.finished_one.connect(self._on_provider_tested)
+        self.worker.finished.connect(self._on_all_finished)
+        self.worker.start()
+
+    def _on_provider_tested(self, key: str, res: ConnectionTestResult):
+        self.results[key] = res
+        self.progress.setValue(self.progress.value() + 1)
+
+        # Find row
+        for r in range(self.table.rowCount()):
+            if self.table.item(r, 0).text() == key:
+                if res.success:
+                    status_item = QTableWidgetItem("✓ OK")
+                    status_item.setForeground(Qt.darkGreen)
+                    lat_item = QTableWidgetItem(f"{res.latency_ms:.0f} ms")
+                    mod_item = QTableWidgetItem(str(res.model_count or 0))
+                else:
+                    status_item = QTableWidgetItem("✗ Error")
+                    status_item.setForeground(Qt.red)
+                    lat_item = QTableWidgetItem(f"{res.latency_ms:.0f} ms" if res.latency_ms else "-")
+                    mod_item = QTableWidgetItem("-")
+
+                self.table.setItem(r, 1, status_item)
+                self.table.setItem(r, 2, lat_item)
+                self.table.setItem(r, 3, mod_item)
+                break
+
+        self._on_selection_changed()
+
+    def _on_all_finished(self):
+        self.run_btn.setEnabled(True)
+        self.progress.hide()
+
+    def _on_selection_changed(self):
+        selected = self.table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        key = self.table.item(row, 0).text()
+        res = self.results.get(key)
+        if not res:
+            self.detail_text.setHtml(f"<h3>{key}</h3><p>Testing or not yet run...</p>")
+            return
+
+        color = "green" if res.success else "red"
+        html = f"<h3>Provider: <span style='color:{color}'>{key}</span></h3>"
+        html += f"<p><b>Status:</b> {'SUCCESS' if res.success else 'FAILED'}</p>"
+        html += f"<p><b>Latency:</b> {res.latency_ms:.1f} ms</p>"
+        html += f"<p><b>Message:</b> {res.message}</p>"
+
+        if res.models:
+            html += f"<h4>Discovered Models ({len(res.models)}):</h4><ul>"
+            for m in res.models:
+                html += f"<li><code>{m}</code></li>"
+            html += "</ul>"
+        elif res.raw_error:
+            html += f"<h4>Diagnostic Log:</h4><pre style='background:#f5f5f5; padding:6px;'>{res.raw_error}</pre>"
+
+        self.detail_text.setHtml(html)
+# MCP Template Hub GUI Dialog
+# ---------------------------------------------------------------------------
+import json
+from typing import Dict, Optional
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QListWidget, QListWidgetItem, QComboBox,
+    QGroupBox, QTextEdit, QSplitter, QFileDialog, QMessageBox,
+    QFormLayout, QWidget
+)
+
+
+class MCPTemplateHubDialog(QDialog):
+    """Visual App Store / Hub for browsing and 1-click installing MCP Servers."""
+
+    def __init__(self, parent=None, target_mode: str = "opencode"):
+        super().__init__(parent)
+        self.setWindowTitle("🧩 MCP Server Hub & Templates")
+        self.setMinimumSize(860, 560)
+        self.target_mode = target_mode  # "opencode" or "openclaude"
+        self.selected_template: Optional[MCPTemplate] = None
+        self.result_server_key: str = ""
+        self.result_server_config: dict = {}
+
+        layout = QVBoxLayout(self)
+
+        # Header description
+        info = QLabel(
+            "Browse curated Model Context Protocol (MCP) servers and install them directly into your configuration."
+        )
+        info.setStyleSheet("color: #666; margin-bottom: 4px;")
+        layout.addWidget(info)
+
+        # Filter bar
+        filter_bar = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search MCP servers...")
+        self.search_edit.textChanged.connect(self._filter_templates)
+        filter_bar.addWidget(self.search_edit, 2)
+
+        self.category_combo = QComboBox()
+        self.category_combo.addItem("All Categories")
+        cats = sorted({t.category for t in MCP_REGISTRY})
+        for c in cats:
+            self.category_combo.addItem(c)
+        self.category_combo.currentIndexChanged.connect(self._filter_templates)
+        filter_bar.addWidget(self.category_combo, 1)
+
+        layout.addLayout(filter_bar)
+
+        # Main splitter
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left: List of templates
+        self.template_list = QListWidget()
+        self.template_list.currentRowChanged.connect(self._on_template_selected)
+        splitter.addWidget(self.template_list)
+
+        # Right: Configurator & preview
+        right_panel = QWidget()
+        right_lay = QVBoxLayout(right_panel)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+
+        # Template Header / Description
+        self.desc_group = QGroupBox("Server Info")
+        desc_lay = QVBoxLayout(self.desc_group)
+        self.desc_label = QLabel()
+        self.desc_label.setWordWrap(True)
+        desc_lay.addWidget(self.desc_label)
+        right_lay.addWidget(self.desc_group)
+
+        # Parameters Form
+        self.param_group = QGroupBox("Configuration Parameters")
+        self.param_form = QFormLayout(self.param_group)
+        self.key_edit = QLineEdit()
+        self.key_edit.textChanged.connect(self._update_preview)
+        self.param_form.addRow("Server Key:", self.key_edit)
+
+        self.param_widgets: Dict[str, QLineEdit] = {}
+        self.env_widgets: Dict[str, QLineEdit] = {}
+        self.url_edit: Optional[QLineEdit] = None
+
+        right_lay.addWidget(self.param_group)
+
+        # Preview box
+        self.preview_group = QGroupBox(f"Configuration Preview ({target_mode.capitalize()})")
+        prev_lay = QVBoxLayout(self.preview_group)
+        self.preview_edit = QTextEdit()
+        self.preview_edit.setReadOnly(True)
+        self.preview_edit.setMaximumHeight(140)
+        prev_lay.addWidget(self.preview_edit)
+        right_lay.addWidget(self.preview_group)
+
+        splitter.addWidget(right_panel)
+        splitter.setSizes([320, 540])
+        layout.addWidget(splitter, 1)
+
+        # Bottom buttons
+        btns = QHBoxLayout()
+        self.install_btn = QPushButton(f"✓ Install into {target_mode.capitalize()}")
+        self.install_btn.setStyleSheet("font-weight: bold; padding: 6px 16px;")
+        self.install_btn.clicked.connect(self._on_install)
+        btns.addWidget(self.install_btn)
+
+        btns.addStretch(1)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+        layout.addLayout(btns)
+
+        self._populate_list()
+        if self.template_list.count() > 0:
+            self.template_list.setCurrentRow(0)
+
+    def _populate_list(self):
+        self.template_list.clear()
+        for tmpl in MCP_REGISTRY:
+            item = QListWidgetItem(f"{tmpl.name} [{tmpl.category}]")
+            item.setData(Qt.UserRole, tmpl.id)
+            self.template_list.addItem(item)
+
+    def _filter_templates(self):
+        text = self.search_edit.text().strip().lower()
+        cat = self.category_combo.currentText()
+
+        self.template_list.clear()
+        for tmpl in MCP_REGISTRY:
+            if cat != "All Categories" and tmpl.category != cat:
+                continue
+            if text and (text not in tmpl.name.lower() and text not in tmpl.description.lower() and text not in tmpl.id.lower()):
+                continue
+            item = QListWidgetItem(f"{tmpl.name} [{tmpl.category}]")
+            item.setData(Qt.UserRole, tmpl.id)
+            self.template_list.addItem(item)
+
+        if self.template_list.count() > 0:
+            self.template_list.setCurrentRow(0)
+
+    def _on_template_selected(self, row: int):
+        if row < 0:
+            return
+        item = self.template_list.item(row)
+        if not item:
+            return
+        tid = item.data(Qt.UserRole)
+        tmpl = get_mcp_template(tid)
+        if not tmpl:
+            return
+
+        self.selected_template = tmpl
+        self.key_edit.setText(tmpl.id)
+
+        # Update description
+        doc_html = f"<br><a href='{tmpl.doc_url}'>Documentation</a>" if tmpl.doc_url else ""
+        self.desc_label.setText(f"<b>{tmpl.name}</b> ({tmpl.category})<br>{tmpl.description}{doc_html}")
+
+        # Clear and rebuild dynamic parameter form
+        while self.param_form.rowCount() > 1:
+            self.param_form.removeRow(1)
+
+        self.param_widgets.clear()
+        self.env_widgets.clear()
+
+        if tmpl.transport_type == "remote":
+            self.url_edit = QLineEdit(tmpl.url)
+            self.url_edit.textChanged.connect(self._update_preview)
+            self.param_form.addRow("Server URL:", self.url_edit)
+        else:
+            # Check for arguments like {allowed_directory} or {db_path}
+            for part in tmpl.command:
+                if "{" in part and "}" in part:
+                    param_name = part[part.find("{") + 1 : part.find("}")]
+                    p_edit = QLineEdit()
+                    p_edit.textChanged.connect(self._update_preview)
+
+                    # Add file / dir picker button if applicable
+                    row_box = QHBoxLayout()
+                    row_box.addWidget(p_edit, 1)
+                    if "directory" in param_name or "path" in param_name or "repo" in param_name:
+                        browse_btn = QPushButton("Browse...")
+                        browse_btn.setFixedWidth(70)
+                        browse_btn.clicked.connect(lambda _, pe=p_edit: self._browse_path(pe))
+                        row_box.addWidget(browse_btn)
+
+                    self.param_form.addRow(f"Arg ({param_name}):", row_box)
+                    self.param_widgets[param_name] = p_edit
+
+            # Env keys
+            for k, placeholder in tmpl.env_keys.items():
+                env_edit = QLineEdit()
+                env_edit.setPlaceholderText(placeholder)
+                env_edit.textChanged.connect(self._update_preview)
+                self.param_form.addRow(f"Env ({k}):", env_edit)
+                self.env_widgets[k] = env_edit
+
+        self._update_preview()
+
+    def _browse_path(self, target_edit: QLineEdit):
+        path = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if path:
+            target_edit.setText(path)
+
+    def _update_preview(self):
+        if not self.selected_template:
+            return
+
+        key = self.key_edit.text().strip() or self.selected_template.id
+        args_vals = {k: w.text().strip() for k, w in self.param_widgets.items()}
+        env_vals = {k: w.text().strip() for k, w in self.env_widgets.items()}
+        url_val = self.url_edit.text().strip() if self.url_edit else ""
+
+        if self.target_mode == "openclaude":
+            cfg = instantiate_openclaude_mcp(
+                self.selected_template, key, args_vals, env_vals, url_val
+            )
+        else:
+            cfg = instantiate_opencode_mcp(
+                self.selected_template, key, args_vals, env_vals, url_val
+            )
+
+        self.result_server_key = key
+        self.result_server_config = cfg
+        self.preview_edit.setPlainText(json.dumps({key: cfg}, indent=2, ensure_ascii=False))
+
+    def _on_install(self):
+        if not self.result_server_key:
+            QMessageBox.warning(self, "Error", "Server key cannot be empty.")
+            return
+        self.accept()
+# Universal Cross-Config Converter GUI Dialog
+# ---------------------------------------------------------------------------
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QComboBox, QCheckBox, QTextEdit, QGroupBox, QSplitter,
+    QFileDialog, QMessageBox, QTabWidget, QWidget, QApplication
+)
+
+
+class CrossConfigConverterDialog(QDialog):
+    """Dialog to convert and transfer configurations across OpenCode, OpenClaude, OMP v1, Claude Desktop, and Cursor."""
+
+    def __init__(self, parent=None, app_context=None):
+        super().__init__(parent)
+        self.setWindowTitle("🔄 Universal AI Config Converter & Importer/Exporter")
+        self.setMinimumSize(920, 620)
+        self.app_context = app_context
+        self.source_data: Dict[str, Any] = {}
+        self.converted_data: Dict[str, Any] = {}
+
+        layout = QVBoxLayout(self)
+
+        # Header description
+        info = QLabel(
+            "Convert, migrate, or bundle configurations seamlessly between OpenCode, OpenClaude, OMP v1, Cursor, and Claude Desktop."
+        )
+        info.setStyleSheet("color: #666; margin-bottom: 6px;")
+        layout.addWidget(info)
+
+        # Splitter: Source & Options on Left, Target & Preview on Right
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left Panel: Source & Selections
+        left_panel = QWidget()
+        left_lay = QVBoxLayout(left_panel)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+
+        # Source Selection Group
+        src_group = QGroupBox("1. Source Configuration")
+        src_lay = QVBoxLayout(src_group)
+
+        src_top = QHBoxLayout()
+        self.src_type_combo = QComboBox()
+        self.src_type_combo.addItem("Current Active OpenCode Config", "active_opencode")
+        self.src_type_combo.addItem("Current Active OpenClaude Config", "active_openclaude")
+        self.src_type_combo.addItem("Load from File...", "file")
+        self.src_type_combo.addItem("Paste Custom JSON", "custom")
+        self.src_type_combo.currentIndexChanged.connect(self._on_source_type_changed)
+        src_top.addWidget(self.src_type_combo, 1)
+
+        self.load_file_btn = QPushButton("Browse...")
+        self.load_file_btn.clicked.connect(self._load_source_file)
+        self.load_file_btn.hide()
+        src_top.addWidget(self.load_file_btn)
+        src_lay.addLayout(src_top)
+
+        self.src_editor = QTextEdit()
+        self.src_editor.setPlaceholderText("Source JSON will appear here...")
+        self.src_editor.textChanged.connect(self._on_source_text_changed)
+        src_lay.addWidget(self.src_editor)
+        left_lay.addWidget(src_group, 2)
+
+        # Component Filters Group
+        comp_group = QGroupBox("2. Select Components to Transfer")
+        comp_lay = QVBoxLayout(comp_group)
+
+        self.comp_checks = {
+            "providers": QCheckBox("Providers & Models"),
+            "mcp_servers": QCheckBox("MCP Servers"),
+            "plugins": QCheckBox("Plugins"),
+            "permissions": QCheckBox("Permissions (allow / deny / ask)"),
+            "prompts": QCheckBox("Instructions / Prompts"),
+            "settings": QCheckBox("Environment & TUI Settings"),
+        }
+        for chk in self.comp_checks.values():
+            chk.setChecked(True)
+            chk.stateChanged.connect(self._run_conversion)
+            comp_lay.addWidget(chk)
+
+        left_lay.addWidget(comp_group, 1)
+        splitter.addWidget(left_panel)
+
+        # Right Panel: Target & Output Preview
+        right_panel = QWidget()
+        right_lay = QVBoxLayout(right_panel)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+
+        # Target Selection Group
+        tgt_group = QGroupBox("3. Target Format")
+        tgt_lay = QVBoxLayout(tgt_group)
+
+        self.tgt_format_combo = QComboBox()
+        self.tgt_format_combo.addItem("OpenCode Config (opencode.json)", "opencode")
+        self.tgt_format_combo.addItem("OpenClaude Global (~/.openclaude.json / .mcp.json)", "openclaude_global")
+        self.tgt_format_combo.addItem("OpenClaude Settings (settings.json)", "openclaude_settings")
+        self.tgt_format_combo.addItem("OMP v1 Universal Bundle (omp.json)", "omp")
+        self.tgt_format_combo.addItem("Claude Desktop / Cursor MCP (mcpServers)", "claude_desktop")
+        self.tgt_format_combo.currentIndexChanged.connect(self._run_conversion)
+        tgt_lay.addWidget(self.tgt_format_combo)
+        right_lay.addWidget(tgt_group)
+
+        # Output Preview Group
+        out_group = QGroupBox("4. Resulting Output Preview")
+        out_lay = QVBoxLayout(out_group)
+        self.out_editor = QTextEdit()
+        self.out_editor.setReadOnly(True)
+        out_lay.addWidget(self.out_editor)
+
+        out_btns = QHBoxLayout()
+        copy_btn = QPushButton("📋 Copy Result")
+        copy_btn.clicked.connect(self._copy_result)
+        out_btns.addWidget(copy_btn)
+
+        save_btn = QPushButton("💾 Save to File...")
+        save_btn.clicked.connect(self._save_to_file)
+        out_btns.addWidget(save_btn)
+        out_lay.addLayout(out_btns)
+
+        right_lay.addWidget(out_group, 1)
+        splitter.addWidget(right_panel)
+        splitter.setSizes([430, 490])
+        layout.addWidget(splitter, 1)
+
+        # Bottom Actions
+        bottom_bar = QHBoxLayout()
+        self.apply_btn = QPushButton("⚡ Apply Directly to Active Config")
+        self.apply_btn.setStyleSheet("font-weight: bold; padding: 6px 14px;")
+        self.apply_btn.clicked.connect(self._apply_to_active)
+        bottom_bar.addWidget(self.apply_btn)
+
+        bottom_bar.addStretch(1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        bottom_bar.addWidget(close_btn)
+        layout.addLayout(bottom_bar)
+
+        # Initial source load
+        self._on_source_type_changed(0)
+
+    def _on_source_type_changed(self, idx: int):
+        src_type = self.src_type_combo.currentData()
+        self.load_file_btn.setVisible(src_type == "file")
+
+        if src_type == "active_opencode":
+            if self.app_context and getattr(self.app_context, "cfg", None):
+                self.source_data = dict(self.app_context.cfg.data)
+                self.src_editor.setPlainText(json.dumps(self.source_data, indent=2, ensure_ascii=False))
+            else:
+                self.src_editor.setPlainText("{\n  \"provider\": {}\n}")
+        elif src_type == "active_openclaude":
+            if self.app_context and hasattr(self.app_context, "cf"):
+                # Layered config file
+                cf = self.app_context.cf
+                combined = {
+                    "settings": cf.effective(),
+                    "global": cf.global_data,
+                    "project_mcp": cf.project_mcp,
+                }
+                self.src_editor.setPlainText(json.dumps(combined, indent=2, ensure_ascii=False))
+            else:
+                self.src_editor.setPlainText("{\n  \"mcpServers\": {}\n}")
+        elif src_type == "file":
+            self.src_editor.setPlaceholderText("Click 'Browse...' to select a config file to import.")
+        elif src_type == "custom":
+            self.src_editor.setPlaceholderText("Paste any JSON config here...")
+
+    def _load_source_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Config File to Import", "",
+            "JSON files (*.json *.jsonc);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            content = Path(path).read_text(encoding="utf-8")
+            data = loads_jsonc(content)
+            self.src_editor.setPlainText(json.dumps(data, indent=2, ensure_ascii=False))
+        except Exception as e:
+            QMessageBox.warning(self, "Load Error", f"Failed to load file: {e}")
+
+    def _on_source_text_changed(self):
+        text = self.src_editor.toPlainText().strip()
+        if not text:
+            self.source_data = {}
+            self.out_editor.clear()
+            return
+        try:
+            self.source_data = loads_jsonc(text)
+            self._run_conversion()
+        except Exception:
+            self.out_editor.setPlainText("// Invalid JSON input in source editor")
+
+    def _get_selected_components(self) -> List[str]:
+        return [k for k, chk in self.comp_checks.items() if chk.isChecked()]
+
+    def _run_conversion(self):
+        if not self.source_data:
+            self.out_editor.clear()
+            return
+
+        target_fmt = self.tgt_format_combo.currentData()
+        comps = self._get_selected_components()
+        src_fmt = detect_config_format(self.source_data)
+
+        # 1. Normalize source to OMP bundle first as intermediate universal format
+        if src_fmt == "omp":
+            omp_bundle = self.source_data
+        elif src_fmt == "openclaude_global":
+            omp_bundle = export_to_omp(openclaude_global=self.source_data)
+        elif src_fmt == "openclaude_settings":
+            omp_bundle = export_to_omp(openclaude_settings=self.source_data)
+        elif src_fmt == "claude_desktop":
+            omp_bundle = export_to_omp(openclaude_global=self.source_data)
+        else:
+            # Assume opencode
+            omp_bundle = export_to_omp(opencode_cfg=self.source_data)
+
+        # 2. Convert OMP bundle to target format
+        if target_fmt == "omp":
+            self.converted_data = omp_bundle
+        elif target_fmt == "claude_desktop":
+            mcp_data = import_from_omp(omp_bundle, "openclaude_global", comps)
+            self.converted_data = {"mcpServers": mcp_data.get("mcpServers", {})}
+        else:
+            self.converted_data = import_from_omp(omp_bundle, target_fmt, comps)
+
+        self.out_editor.setPlainText(json.dumps(self.converted_data, indent=2, ensure_ascii=False))
+
+    def _copy_result(self):
+        text = self.out_editor.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            QMessageBox.information(self, "Copied", "Converted configuration copied to clipboard.")
+
+    def _save_to_file(self):
+        target_fmt = self.tgt_format_combo.currentData()
+        default_name = f"{target_fmt}-config.json"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Converted Config", default_name,
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.out_editor.toPlainText(), encoding="utf-8")
+            QMessageBox.information(self, "Saved", f"Exported successfully to {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", f"Failed to save file: {e}")
+
+    def _apply_to_active(self):
+        if not self.converted_data:
+            QMessageBox.warning(self, "No Data", "No converted data to apply.")
+            return
+
+        if not self.app_context:
+            QMessageBox.warning(self, "Error", "No active editor instance found.")
+            return
+
+        target_fmt = self.tgt_format_combo.currentData()
+
+        if target_fmt == "opencode" and getattr(self.app_context, "cfg", None):
+            if not _confirm(self, "Apply Config", "Merge converted settings into current OpenCode configuration?"):
+                return
+            self.app_context.snapshot_state()
+            for k, v in self.converted_data.items():
+                if isinstance(v, dict) and isinstance(self.app_context.cfg.data.get(k), dict):
+                    self.app_context.cfg.data[k].update(v)
+                else:
+                    self.app_context.cfg.data[k] = v
+            self.app_context.mark_dirty()
+            if hasattr(self.app_context, "refresh_all_tabs"):
+                self.app_context.refresh_all_tabs()
+            QMessageBox.information(self, "Success", "Applied converted settings to OpenCode configuration.")
+            self.accept()
+
+        elif "openclaude" in target_fmt and hasattr(self.app_context, "cf"):
+            if not _confirm(self, "Apply Config", "Apply converted settings into current OpenClaude configuration?"):
+                return
+            cf = self.app_context.cf
+            if target_fmt == "openclaude_global":
+                for k, v in self.converted_data.items():
+                    if isinstance(v, dict) and isinstance(cf.global_data.get(k), dict):
+                        cf.global_data[k].update(v)
+                    else:
+                        cf.global_data[k] = v
+                cf.save_global(cf.global_data)
+            elif target_fmt == "openclaude_settings":
+                user_layer = cf.layers.get("user", {})
+                for k, v in self.converted_data.items():
+                    if isinstance(v, dict) and isinstance(user_layer.get(k), dict):
+                        user_layer[k].update(v)
+                    else:
+                        user_layer[k] = v
+                cf.save_layer("user", user_layer)
+            QMessageBox.information(self, "Success", "Applied converted settings to OpenClaude configuration.")
+            self.accept()
+        else:
+            QMessageBox.information(self, "Format Mismatch", f"Please export to file or copy result to use with {target_fmt}.")
 def match_models_against_catalog(key, models_dict, catalog, reference_provider=None):
     """Build a list of potential catalog matches for the given models.
     Returns (entries, ambiguous_data, fallback_data).
@@ -5278,6 +6684,7 @@ class ProvidersTab(QWidget):
         for text, slot in [
             ("+ Add", self._add_provider),
             ("+ Fetch from API", self._fetch_new_provider),
+            ("⚡ Health Check", self._health_check_providers),
             ("Import", self._import_providers),
             ("Export", self._export_providers),
             ("Enable All", lambda: self._set_all_enabled(True)),
@@ -5738,6 +7145,12 @@ class ProvidersTab(QWidget):
             except (json.JSONDecodeError, ValueError) as e:
                 QMessageBox.warning(self, "Error", str(e))
 
+    def _health_check_providers(self):
+        """Run connectivity and health check for configured providers"""
+        providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
+        dlg = ProviderHealthCheckDialog(self, providers=providers)
+        dlg.exec()
+
     def collect(self, data: dict):
         """Collect data from UI"""
         providers = data.setdefault("provider", {})
@@ -5854,6 +7267,7 @@ class McpTab(QWidget):
 
         for text, slot in [
             ("+ Add", self._add_server),
+            ("🧩 Hub / Templates", self._open_mcp_hub),
             ("Import", self._import_servers),
             ("Export", self._export_servers),
             ("Enable All", lambda: self._set_all_enabled(True)),
@@ -6159,6 +7573,24 @@ class McpTab(QWidget):
         if name in mcp:
             mcp[name]["enabled"] = self.cbs[name].isChecked()
             self.app.mark_dirty()
+
+    def _open_mcp_hub(self):
+        """Open MCP Template Hub to install curated MCP servers"""
+        dlg = MCPTemplateHubDialog(self, target_mode="opencode")
+        if dlg.exec() == QDialog.Accepted:
+            key = dlg.result_server_key
+            cfg = dlg.result_server_config
+            if not key or not cfg:
+                return
+            mcp = self.app.cfg.data.setdefault("mcp", {})
+            if key in mcp:
+                if not _confirm(self, "Overwrite Server", f"Server '{key}' already exists. Overwrite?"):
+                    return
+            self.app.snapshot_state()
+            mcp[key] = cfg
+            self.app.mark_dirty()
+            self.refresh()
+            QMessageBox.information(self, "Installed", f"MCP server '{key}' installed successfully.")
 
     def collect(self, data: dict):
         """Collect data from UI"""
@@ -9303,9 +10735,12 @@ class OpenclaudeMcpTab(OpenclaudeTab):
         btns = QHBoxLayout()
         add_b = QPushButton("Add server")
         add_b.clicked.connect(lambda: self._add_row())
+        hub_b = QPushButton("🧩 Hub / Templates")
+        hub_b.clicked.connect(self._open_mcp_hub)
         del_b = QPushButton("Remove selected")
         del_b.clicked.connect(self._remove_row)
         btns.addWidget(add_b)
+        btns.addWidget(hub_b)
         btns.addWidget(del_b)
         btns.addStretch()
         layout.addLayout(btns)
@@ -9356,6 +10791,17 @@ class OpenclaudeMcpTab(OpenclaudeTab):
     def _remove_row(self):
         if self.remove_current(self.mcp_table):
             self._edited()
+
+    def _open_mcp_hub(self):
+        dlg = MCPTemplateHubDialog(self, target_mode="openclaude")
+        if dlg.exec() == QDialog.Accepted:
+            key = dlg.result_server_key
+            cfg = dlg.result_server_config
+            if not key or not cfg:
+                return
+            self._add_row(key, cfg)
+            self._dirty_scopes.add(self._shown_scope)
+            self._mark_edited()
 
     def _cell(self, r, c):
         return self.cell_text(self.mcp_table, r, c)
@@ -10800,6 +12246,20 @@ class MainWindow(QMainWindow):
             self.act_imp_plugin.triggered.connect(self.tab_plugins._import_plugins)
             mtools.addAction(self.act_imp_plugin)
 
+        mtools.addSeparator()
+
+        self.act_health_check = QAction("⚡ &Provider Health Check...", self)
+        self.act_health_check.triggered.connect(self._show_health_check)
+        mtools.addAction(self.act_health_check)
+
+        self.act_mcp_hub = QAction("🧩 &MCP Server Hub && Templates...", self)
+        self.act_mcp_hub.triggered.connect(self._show_mcp_hub)
+        mtools.addAction(self.act_mcp_hub)
+
+        self.act_config_converter = QAction("🔄 &Universal Config Converter (OpenCode / OpenClaude / OMP)...", self)
+        self.act_config_converter.triggered.connect(self._show_config_converter)
+        mtools.addAction(self.act_config_converter)
+
         mtools.menuAction().setVisible(not mtools.isEmpty())
 
         # View menu
@@ -11500,6 +12960,41 @@ class MainWindow(QMainWindow):
         font = QApplication.font()
         font.setPointSize(size)
         QApplication.setFont(font)
+
+    def _show_health_check(self):
+        """Show Provider Health Check & Latency Ping dialog"""
+        providers = {}
+        if hasattr(self, "cfg") and self.cfg and isinstance(self.cfg.data, dict):
+            providers = section(self.cfg.data, "provider")
+        dlg = ProviderHealthCheckDialog(self, providers=providers)
+        dlg.exec()
+
+    def _show_mcp_hub(self):
+        """Show MCP Server Hub & Templates dialog"""
+        mode = "openclaude" if getattr(self, "adapter_name", "") == "openclaude" else "opencode"
+        dlg = MCPTemplateHubDialog(self, target_mode=mode)
+        if dlg.exec() == QDialog.Accepted:
+            key = dlg.result_server_key
+            cfg = dlg.result_server_config
+            if not key or not cfg:
+                return
+            if mode == "opencode" and hasattr(self, "cfg") and self.cfg:
+                mcp = self.cfg.data.setdefault("mcp", {})
+                mcp[key] = cfg
+                self.mark_dirty()
+                if hasattr(self, "tab_mcp"):
+                    self.tab_mcp.refresh()
+                QMessageBox.information(self, "Installed", f"MCP server '{key}' installed into OpenCode config.")
+            elif mode == "openclaude" and hasattr(self, "tab_openclaude_mcp"):
+                self.tab_openclaude_mcp._add_row(key, cfg)
+                self.tab_openclaude_mcp._dirty_scopes.add(self.tab_openclaude_mcp._shown_scope)
+                self.tab_openclaude_mcp._mark_edited()
+                QMessageBox.information(self, "Installed", f"MCP server '{key}' installed into OpenClaude config.")
+
+    def _show_config_converter(self):
+        """Show Universal Config Converter & Importer/Exporter dialog"""
+        dlg = CrossConfigConverterDialog(self, app_context=self)
+        dlg.exec()
 
     def _show_about(self):
         """Show about dialog"""

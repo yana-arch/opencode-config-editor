@@ -64,6 +64,7 @@ class ProvidersTab(QWidget):
         for text, slot in [
             ("+ Add", self._add_provider),
             ("+ Fetch from API", self._fetch_new_provider),
+            ("⚡ Health Check", self._health_check_providers),
             ("Import", self._import_providers),
             ("Export", self._export_providers),
             ("Enable All", lambda: self._set_all_enabled(True)),
@@ -523,6 +524,12 @@ class ProvidersTab(QWidget):
                 self.refresh()
             except (json.JSONDecodeError, ValueError) as e:
                 QMessageBox.warning(self, "Error", str(e))
+
+    def _health_check_providers(self):
+        """Run connectivity and health check for configured providers"""
+        providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
+        dlg = ProviderHealthCheckDialog(self, providers=providers)
+        dlg.exec()
 
     def collect(self, data: dict):
         """Collect data from UI"""

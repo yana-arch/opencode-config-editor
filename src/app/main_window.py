@@ -269,6 +269,20 @@ class MainWindow(QMainWindow):
             self.act_imp_plugin.triggered.connect(self.tab_plugins._import_plugins)
             mtools.addAction(self.act_imp_plugin)
 
+        mtools.addSeparator()
+
+        self.act_health_check = QAction("⚡ &Provider Health Check...", self)
+        self.act_health_check.triggered.connect(self._show_health_check)
+        mtools.addAction(self.act_health_check)
+
+        self.act_mcp_hub = QAction("🧩 &MCP Server Hub && Templates...", self)
+        self.act_mcp_hub.triggered.connect(self._show_mcp_hub)
+        mtools.addAction(self.act_mcp_hub)
+
+        self.act_config_converter = QAction("🔄 &Universal Config Converter (OpenCode / OpenClaude / OMP)...", self)
+        self.act_config_converter.triggered.connect(self._show_config_converter)
+        mtools.addAction(self.act_config_converter)
+
         mtools.menuAction().setVisible(not mtools.isEmpty())
 
         # View menu
@@ -969,6 +983,41 @@ class MainWindow(QMainWindow):
         font = QApplication.font()
         font.setPointSize(size)
         QApplication.setFont(font)
+
+    def _show_health_check(self):
+        """Show Provider Health Check & Latency Ping dialog"""
+        providers = {}
+        if hasattr(self, "cfg") and self.cfg and isinstance(self.cfg.data, dict):
+            providers = section(self.cfg.data, "provider")
+        dlg = ProviderHealthCheckDialog(self, providers=providers)
+        dlg.exec()
+
+    def _show_mcp_hub(self):
+        """Show MCP Server Hub & Templates dialog"""
+        mode = "openclaude" if getattr(self, "adapter_name", "") == "openclaude" else "opencode"
+        dlg = MCPTemplateHubDialog(self, target_mode=mode)
+        if dlg.exec() == QDialog.Accepted:
+            key = dlg.result_server_key
+            cfg = dlg.result_server_config
+            if not key or not cfg:
+                return
+            if mode == "opencode" and hasattr(self, "cfg") and self.cfg:
+                mcp = self.cfg.data.setdefault("mcp", {})
+                mcp[key] = cfg
+                self.mark_dirty()
+                if hasattr(self, "tab_mcp"):
+                    self.tab_mcp.refresh()
+                QMessageBox.information(self, "Installed", f"MCP server '{key}' installed into OpenCode config.")
+            elif mode == "openclaude" and hasattr(self, "tab_openclaude_mcp"):
+                self.tab_openclaude_mcp._add_row(key, cfg)
+                self.tab_openclaude_mcp._dirty_scopes.add(self.tab_openclaude_mcp._shown_scope)
+                self.tab_openclaude_mcp._mark_edited()
+                QMessageBox.information(self, "Installed", f"MCP server '{key}' installed into OpenClaude config.")
+
+    def _show_config_converter(self):
+        """Show Universal Config Converter & Importer/Exporter dialog"""
+        dlg = CrossConfigConverterDialog(self, app_context=self)
+        dlg.exec()
 
     def _show_about(self):
         """Show about dialog"""

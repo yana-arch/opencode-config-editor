@@ -581,9 +581,12 @@ class OpenclaudeMcpTab(OpenclaudeTab):
         btns = QHBoxLayout()
         add_b = QPushButton("Add server")
         add_b.clicked.connect(lambda: self._add_row())
+        hub_b = QPushButton("🧩 Hub / Templates")
+        hub_b.clicked.connect(self._open_mcp_hub)
         del_b = QPushButton("Remove selected")
         del_b.clicked.connect(self._remove_row)
         btns.addWidget(add_b)
+        btns.addWidget(hub_b)
         btns.addWidget(del_b)
         btns.addStretch()
         layout.addLayout(btns)
@@ -634,6 +637,17 @@ class OpenclaudeMcpTab(OpenclaudeTab):
     def _remove_row(self):
         if self.remove_current(self.mcp_table):
             self._edited()
+
+    def _open_mcp_hub(self):
+        dlg = MCPTemplateHubDialog(self, target_mode="openclaude")
+        if dlg.exec() == QDialog.Accepted:
+            key = dlg.result_server_key
+            cfg = dlg.result_server_config
+            if not key or not cfg:
+                return
+            self._add_row(key, cfg)
+            self._dirty_scopes.add(self._shown_scope)
+            self._mark_edited()
 
     def _cell(self, r, c):
         return self.cell_text(self.mcp_table, r, c)

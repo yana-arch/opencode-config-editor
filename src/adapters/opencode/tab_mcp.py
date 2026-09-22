@@ -86,6 +86,7 @@ class McpTab(QWidget):
 
         for text, slot in [
             ("+ Add", self._add_server),
+            ("🧩 Hub / Templates", self._open_mcp_hub),
             ("Import", self._import_servers),
             ("Export", self._export_servers),
             ("Enable All", lambda: self._set_all_enabled(True)),
@@ -391,6 +392,24 @@ class McpTab(QWidget):
         if name in mcp:
             mcp[name]["enabled"] = self.cbs[name].isChecked()
             self.app.mark_dirty()
+
+    def _open_mcp_hub(self):
+        """Open MCP Template Hub to install curated MCP servers"""
+        dlg = MCPTemplateHubDialog(self, target_mode="opencode")
+        if dlg.exec() == QDialog.Accepted:
+            key = dlg.result_server_key
+            cfg = dlg.result_server_config
+            if not key or not cfg:
+                return
+            mcp = self.app.cfg.data.setdefault("mcp", {})
+            if key in mcp:
+                if not _confirm(self, "Overwrite Server", f"Server '{key}' already exists. Overwrite?"):
+                    return
+            self.app.snapshot_state()
+            mcp[key] = cfg
+            self.app.mark_dirty()
+            self.refresh()
+            QMessageBox.information(self, "Installed", f"MCP server '{key}' installed successfully.")
 
     def collect(self, data: dict):
         """Collect data from UI"""
