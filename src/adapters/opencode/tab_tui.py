@@ -79,25 +79,42 @@ class TuiPluginEditor(QWidget):
         return name in self._active_names()
 
     def _migrate_file_flag(self):
+        """Move disabled plugins that exist in the `plugin` list into the editor
+        cache, and keep every other `plugin_enabled` entry in the file.
+
+        `plugin_enabled` is schema-valid for names the editor has no `plugin`
+        entry for (built-in TUI plugins) and for `true` values, so those must
+        survive untouched (OC-09).
+        """
         data = self._data
         path = self._cfg_path()
         if path is None or not isinstance(data.get("plugin_enabled"), dict):
             return
         flagged = {n for n, v in data["plugin_enabled"].items() if v is False}
         plugin = data.get("plugin", [])
+        migrated = set()
         if flagged:
             kept = []
             for entry in plugin:
                 name = self._name_of(entry)
                 if name in flagged:
                     self.state_store.set_entry(path, name, entry)
+                    migrated.add(name)
                 else:
                     kept.append(entry)
             if kept:
                 data["plugin"] = kept
             else:
                 data.pop("plugin", None)
-        data.pop("plugin_enabled", None)
+        # Everything the editor does not own stays in the file: `true` entries,
+        # and `false` entries for names absent from the `plugin` list (built-in
+        # TUI plugins the editor cannot re-enable from here).
+        residual = {k: v for k, v in data["plugin_enabled"].items()
+                    if not (v is False and k in migrated)}
+        if residual:
+            data["plugin_enabled"] = residual
+        else:
+            data.pop("plugin_enabled", None)
 
     def _display_entries(self):
         path = self._cfg_path()
@@ -252,7 +269,9 @@ class TuiPluginEditor(QWidget):
         self.refresh()
 
     def collect(self, data):
-        data.pop("plugin_enabled", None)
+        """Leave `plugin_enabled` alone: entries the editor does not own are
+        preserved verbatim (migrated ones were already dropped on refresh)."""
+        pass
 
 
 class TuiTab(BaseTab):
@@ -332,11 +351,21 @@ class TuiTab(BaseTab):
         self.prompt_h.valueChanged.connect(self._t("prompt"))
         form.addRow("Prompt max height", self.prompt_h)
 
+        # max_width is `int > 0 | "auto"`; 0 stays "(unset)" and a checkbox
+        # selects the literal "auto" value (OC-15).
+        pw_row = QWidget()
+        pw_lay = QHBoxLayout(pw_row)
+        pw_lay.setContentsMargins(0, 0, 0, 0)
         self.prompt_w = QSpinBox()
         self.prompt_w.setRange(0, 10**6)
-        self.prompt_w.setSpecialValueText("(auto)")
+        self.prompt_w.setSpecialValueText("(unset)")
         self.prompt_w.valueChanged.connect(self._t("prompt"))
-        form.addRow("Prompt max width", self.prompt_w)
+        pw_lay.addWidget(self.prompt_w)
+        self.prompt_w_auto = QCheckBox("auto")
+        self.prompt_w_auto.toggled.connect(self._t("prompt"))
+        pw_lay.addWidget(self.prompt_w_auto)
+        self.prompt_w_auto.toggled.connect(self.prompt_w.setDisabled)
+        form.addRow("Prompt max width", pw_row)
 
         self.plugins = TuiPluginEditor(app)
         form.addRow("Plugins", self.plugins)
@@ -371,7 +400,13 @@ class TuiTab(BaseTab):
         self._set_double(self.att_volume, att.get("volume", 0.4))
         prompt = data.get("prompt") if isinstance(data.get("prompt"), dict) else {}
         self._set_spin(self.prompt_h, prompt.get("max_height"))
-        self._set_spin(self.prompt_w, prompt.get("max_width"))
+        pw = prompt.get("max_width")
+        is_auto = pw == "auto"
+        self.prompt_w_auto.blockSignals(True)
+        self.prompt_w_auto.setChecked(is_auto)
+        self.prompt_w_auto.blockSignals(False)
+        self.prompt_w.setDisabled(is_auto)
+        self._set_spin(self.prompt_w, None if is_auto else pw)
         self.plugins.refresh()
 
     def collect(self, data):
@@ -409,7 +444,10 @@ class TuiTab(BaseTab):
         if "prompt" in self._touched:
             prompt = data.setdefault("prompt", {})
             self._put(prompt, "max_height", self.prompt_h.value() or None, None)
-            self._put(prompt, "max_width", self.prompt_w.value() or None, None)
+            if self.prompt_w_auto.isChecked():
+                prompt["max_width"] = "auto"
+            else:
+                self._put(prompt, "max_width", self.prompt_w.value() or None, None)
             if not prompt:
                 data.pop("prompt", None)
         self.plugins.collect(data)

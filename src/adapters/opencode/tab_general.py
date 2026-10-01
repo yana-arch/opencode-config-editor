@@ -13,9 +13,10 @@ class GeneralTab(QWidget):
         self.schema_edit.edit.editingFinished.connect(self.app.mark_dirty)
         layout.addRow("$schema", self.schema_edit)
 
-        # Autoupdate: true | false | "notify"
+        # Autoupdate: absent | false | true | "notify"
         self.autoupdate_combo = QComboBox()
-        for label, val in [("Off (false)", False), ("On (true)", True), ("Notify (\"notify\")", "notify")]:
+        for label, val in [("(default)", "__absent__"), ("Off (false)", False),
+                           ("On (true)", True), ('Notify ("notify")', "notify")]:
             self.autoupdate_combo.addItem(label, val)
         self.autoupdate_combo.currentIndexChanged.connect(self.app.mark_dirty)
         layout.addRow("Autoupdate", self.autoupdate_combo)
@@ -35,9 +36,9 @@ class GeneralTab(QWidget):
         self.default_agent_edit.edit.editingFinished.connect(self.app.mark_dirty)
         layout.addRow("Default Agent", self.default_agent_edit)
 
-        # Subagent depth
+        # Subagent depth: -1 is '(default)'; 0 is a distinct, schema-valid value
         self.subagent_depth = QSpinBox()
-        self.subagent_depth.setRange(0, 100)
+        self.subagent_depth.setRange(-1, 100)
         self.subagent_depth.setSpecialValueText("(default)")
         self.subagent_depth.valueChanged.connect(self._depth_changed)
         layout.addRow("Subagent Depth", self.subagent_depth)
@@ -63,7 +64,8 @@ class GeneralTab(QWidget):
 
         # Share
         self.share_combo = QComboBox()
-        for label, val in [("(default)", ""), ("true", "true"), ("false", "false")]:
+        for label, val in [("(default)", ""), ("manual", "manual"),
+                           ("auto", "auto"), ("disabled", "disabled")]:
             self.share_combo.addItem(label, val)
         self.share_combo.currentIndexChanged.connect(self.app.mark_dirty)
         layout.addRow("Share", self.share_combo)
@@ -105,7 +107,14 @@ class GeneralTab(QWidget):
         data = self.app.cfg.data if self.app.cfg else {}
         self.schema_edit.set_value(data.get("$schema", ""))
         au = data.get("autoupdate")
-        idx = 0 if au is False or au is None else (1 if au is True else 2)
+        if au is False:
+            idx = 1
+        elif au is True:
+            idx = 2
+        elif au == "notify":
+            idx = 3
+        else:
+            idx = 0
         self.autoupdate_combo.blockSignals(True)
         self.autoupdate_combo.setCurrentIndex(idx)
         self.autoupdate_combo.blockSignals(False)
@@ -114,7 +123,10 @@ class GeneralTab(QWidget):
         self.default_agent_edit.set_value(data.get("default_agent", ""))
         self._depth_touched = False
         self.subagent_depth.blockSignals(True)
-        self.subagent_depth.setValue(int(data["subagent_depth"]) if isinstance(data.get("subagent_depth"), int) else 0)
+        depth = data.get("subagent_depth")
+        self.subagent_depth.setValue(
+            int(depth) if isinstance(depth, int) and not isinstance(depth, bool)
+            and depth >= 0 else -1)
         self.subagent_depth.blockSignals(False)
         self.username_edit.set_value(data.get("username", ""))
         self.shell_edit.set_value(data.get("shell", ""))
@@ -124,13 +136,14 @@ class GeneralTab(QWidget):
         self.loglevel_combo.setCurrentIndex(ll_idx if ll_idx >= 0 else 0)
         self.loglevel_combo.blockSignals(False)
         sh = data.get("share")
-        sh_idx = self.share_combo.findData("true" if sh is True else ("false" if sh is False else ""))
+        sh_idx = self.share_combo.findData(sh if isinstance(sh, str) else "")
         self.share_combo.blockSignals(True)
         self.share_combo.setCurrentIndex(sh_idx if sh_idx >= 0 else 0)
         self.share_combo.blockSignals(False)
         self._snapshot_touched = False
         self.snapshot_check.blockSignals(True)
-        self.snapshot_check.setChecked(bool(data.get("snapshot", False)))
+        # snapshot defaults to true, so an absent key must show as enabled
+        self.snapshot_check.setChecked(data.get("snapshot") is not False)
         self.snapshot_check.blockSignals(False)
         self.disabled_providers.refresh()
         self.enabled_providers.refresh()
@@ -141,7 +154,7 @@ class GeneralTab(QWidget):
             data["$schema"] = self.schema_edit.value()
 
         au = self.autoupdate_combo.currentData()
-        if au is False:
+        if au == "__absent__":
             data.pop("autoupdate", None)
         else:
             data["autoupdate"] = au
@@ -160,7 +173,11 @@ class GeneralTab(QWidget):
                 data.pop(key, None)
 
         if self._depth_touched:
-            data["subagent_depth"] = self.subagent_depth.value()
+            # -1 is '(default)'; 0 is a real, schema-valid depth
+            if self.subagent_depth.value() >= 0:
+                data["subagent_depth"] = self.subagent_depth.value()
+            else:
+                data.pop("subagent_depth", None)
 
         ll = self.loglevel_combo.currentData()
         if ll:
@@ -169,18 +186,14 @@ class GeneralTab(QWidget):
             data.pop("logLevel", None)
 
         sh = self.share_combo.currentData()
-        if sh == "true":
-            data["share"] = True
-        elif sh == "false":
-            data["share"] = False
+        if sh:
+            data["share"] = sh
         else:
             data.pop("share", None)
 
         if self._snapshot_touched:
-            if self.snapshot_check.isChecked():
-                data["snapshot"] = True
-            else:
-                data.pop("snapshot", None)
+            # snapshot defaults to true, so "off" must be written as false.
+            data["snapshot"] = self.snapshot_check.isChecked()
 
         self.disabled_providers.collect(data)
         self.enabled_providers.collect(data)

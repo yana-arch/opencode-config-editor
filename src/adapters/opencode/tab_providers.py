@@ -44,12 +44,12 @@ def match_models_against_catalog(key, models_dict, catalog, reference_provider=N
 
 # Providers tab
 class ProvidersTab(QWidget):
-    """Enhanced providers tab with search and bulk operations"""
+    """Providers tab: search, inline edits, soft delete via the trash file."""
 
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.rows = []  # (provider_name, npm_edit, name_edit)
+        self.rows = []  # live rows only: (provider_key, npm_edit, name_edit)
 
         layout = QVBoxLayout(self)
 
@@ -61,14 +61,17 @@ class ProvidersTab(QWidget):
         self.search_edit.textChanged.connect(self._filter_providers)
         top_layout.addWidget(self.search_edit)
 
+        self.show_trash_chk = QCheckBox("Show deleted")
+        self.show_trash_chk.setToolTip(f"Removed providers are kept in {PROVIDER_TRASH_FILE}")
+        self.show_trash_chk.toggled.connect(lambda _: self._update_table())
+        top_layout.addWidget(self.show_trash_chk)
+
         for text, slot in [
             ("+ Add", self._add_provider),
             ("+ Fetch from API", self._fetch_new_provider),
             ("⚡ Health Check", self._health_check_providers),
             ("Import", self._import_providers),
             ("Export", self._export_providers),
-            ("Enable All", lambda: self._set_all_enabled(True)),
-            ("Disable All", lambda: self._set_all_enabled(False))
         ]:
             btn = QPushButton(text)
             btn.clicked.connect(slot)
@@ -85,96 +88,233 @@ class ProvidersTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        # Editing a live row's key cell renames the provider immediately.
+        self.table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.table)
 
         # Status
         self.status_label = QLabel()
         layout.addWidget(self.status_label)
 
-    def _filter_providers(self, text: str):
-        """Filter providers by search text"""
+    # --- data helpers ---
+    def _providers(self) -> dict:
+        return section(self.app.cfg.data, "provider") if self.app.cfg else {}
+
+    def _cfg_path(self):
+        """Path of the loaded config file; None (no file) means no trash."""
+        return getattr(self.app.cfg, "path", None)
+
+    def _trashed(self) -> dict:
+        """Trash entries of this config file whose key is not a live provider.
+        Derived, so undoing a remove hides its entry again."""
+        path = self._cfg_path()
+        if path is None:
+            return {}
+        live = self._providers()
+        return {k: v for k, v in ProviderTrashStore().entries(path).items() if k not in live}
+
+    @staticmethod
+    def _matches(key, cfg, text: str) -> bool:
         if not text:
-            self.refresh()
+            return True
+        if text in key.lower():
+            return True
+        if not isinstance(cfg, dict):
+            return False
+        return any(isinstance(cfg.get(f), str) and text in cfg[f].lower()
+                   for f in ("npm", "name"))
+
+    @staticmethod
+    def _summary(cfg) -> str:
+        cfg = cfg if isinstance(cfg, dict) else {}
+        n_models = len(cfg["models"]) if isinstance(cfg.get("models"), dict) else 0
+        base_url = cfg["options"].get("baseURL", "") if isinstance(cfg.get("options"), dict) else ""
+        return f"{n_models} models  {base_url}"
+
+    def _filter_providers(self, text: str = ""):
+        """Filter providers by search text (the table reads the search box)."""
+        self._update_table()
+
+    def _update_table(self):
+        """Rebuild the table: live rows (search-filtered) first, then the
+        deleted ones when "Show deleted" is checked."""
+        text = self.search_edit.text().lower()
+        providers = self._providers()
+        trashed = self._trashed()
+        live = [(k, v) for k, v in sorted(providers.items()) if self._matches(k, v, text)]
+        dead = ([(k, v) for k, v in sorted(trashed.items()) if self._matches(k, v, text)]
+                if self.show_trash_chk.isChecked() else [])
+
+        prev = self.table.blockSignals(True)   # a rebuild is never an edit
+        try:
+            self.rows = []
+            self.table.setRowCount(0)
+            self.table.setRowCount(len(live) + len(dead))
+            for row, (key, cfg) in enumerate(live):
+                self._fill_live_row(row, key, cfg)
+            for row, (key, entry) in enumerate(dead, start=len(live)):
+                self._fill_trash_row(row, key, entry)
+        finally:
+            self.table.blockSignals(prev)
+        self._update_status(len(providers), len(trashed))
+
+    def _update_status(self, n_live=None, n_trashed=None):
+        n_live = len(self._providers()) if n_live is None else n_live
+        n_trashed = len(self._trashed()) if n_trashed is None else n_trashed
+        text = f"{n_live} providers"
+        if n_trashed:
+            text += f" · {n_trashed} deleted"
+        self.status_label.setText(text)
+
+    def _fill_live_row(self, row, key, cfg):
+        valid = isinstance(cfg, dict)   # non-dict entries are fixed in Raw JSON
+        cfg = cfg if valid else {}
+        self.table.setItem(row, 0, QTableWidgetItem(key))
+
+        npm_edit = MaskedLineEdit(cfg.get("npm", ""), field_name="npm")
+        npm_edit.edit.editingFinished.connect(
+            lambda r=row, w=npm_edit: self._commit_inline(r, "npm", w))
+        npm_edit.setEnabled(valid)
+        self.table.setCellWidget(row, 1, npm_edit)
+
+        name_edit = MaskedLineEdit(cfg.get("name", ""), field_name="name")
+        name_edit.edit.editingFinished.connect(
+            lambda r=row, w=name_edit: self._commit_inline(r, "name", w))
+        name_edit.setEnabled(valid)
+        self.table.setCellWidget(row, 2, name_edit)
+
+        cell = QWidget()
+        cell_layout = QHBoxLayout(cell)
+        cell_layout.setContentsMargins(2, 0, 2, 0)
+        summary = QLabel(self._summary(cfg))
+        summary.setToolTip(self._tooltip_json(cfg))
+        cell_layout.addWidget(summary, 1)
+        # Buttons resolve the key at click time: the key cell renames in place.
+        for text, slot in (("Models...", self._edit_models), ("Options...", self._edit_options)):
+            btn = QPushButton(text)
+            btn.clicked.connect(lambda _, r=row, s=slot: s(self._row_key(r)))
+            btn.setEnabled(valid)
+            cell_layout.addWidget(btn)
+        self.table.setCellWidget(row, 3, cell)
+
+        actions_widget = QWidget()
+        actions_layout = QHBoxLayout(actions_widget)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        for text, slot in (("Edit", self._edit_provider), ("Remove", self._remove_provider)):
+            btn = QPushButton(text)
+            btn.setFixedWidth(60)
+            btn.clicked.connect(lambda _, r=row, s=slot: s(self._row_key(r)))
+            actions_layout.addWidget(btn)
+        self.table.setCellWidget(row, 4, actions_widget)
+
+        self.rows.append((key, npm_edit, name_edit))
+
+    @staticmethod
+    def _tooltip_json(cfg):
+        """Provider JSON for the summary tooltip, with the API key masked."""
+        if not isinstance(cfg, dict):
+            return ""
+        shown = dict(cfg)
+        options = shown.get("options")
+        if isinstance(options, dict) and options.get("apiKey"):
+            options = dict(options)
+            options["apiKey"] = _mask(str(options["apiKey"]))
+            shown["options"] = options
+        return json.dumps(shown, ensure_ascii=False, indent=2)[:4000]
+
+    def _fill_trash_row(self, row, key, entry):
+        """Display-only row for a deleted provider: Restore / Delete permanently."""
+        cfg = entry if isinstance(entry, dict) else {}
+        for col, text in enumerate((key, cfg.get("npm", ""), cfg.get("name", ""),
+                                    self._summary(cfg))):
+            item = QTableWidgetItem(str(text))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            font = item.font()
+            font.setItalic(True)
+            item.setFont(font)
+            item.setForeground(Qt.gray)
+            self.table.setItem(row, col, item)
+
+        actions_widget = QWidget()
+        actions_layout = QHBoxLayout(actions_widget)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        restore_btn = QPushButton("Restore")
+        restore_btn.clicked.connect(lambda _, k=key: self._restore_provider(k))
+        actions_layout.addWidget(restore_btn)
+        purge_btn = QPushButton("Delete permanently")
+        purge_btn.clicked.connect(lambda _, k=key: self._hard_delete_provider(k))
+        actions_layout.addWidget(purge_btn)
+        self.table.setCellWidget(row, 4, actions_widget)
+
+    def _row_key(self, row):
+        return self.rows[row][0] if 0 <= row < len(self.rows) else None
+
+    def _row_of(self, key):
+        return next((i for i, r in enumerate(self.rows) if r[0] == key), None)
+
+    def _set_key_cell(self, item, text):
+        prev = self.table.blockSignals(True)
+        item.setText(text)
+        self.table.blockSignals(prev)
+
+    def _on_item_changed(self, item):
+        """Write-through rename from a live row's key cell."""
+        row = item.row()
+        if item.column() != 0 or not 0 <= row < len(self.rows):
+            return  # deleted rows are display-only and never collected
+        old = self.rows[row][0]
+        new = item.text().strip()
+        if new == old:
+            if item.text() != old:
+                self._set_key_cell(item, old)
             return
+        providers = self._providers()
+        if old not in providers:
+            self._set_key_cell(item, old)
+            return
+        if not new or new in providers:
+            self._set_key_cell(item, old)
+            QMessageBox.warning(self, "Rename Provider",
+                                "Provider key cannot be empty" if not new
+                                else f"Provider '{new}' already exists")
+            return
+        self.app.snapshot_state()
+        providers[new] = providers.pop(old)
+        self.rows[row] = (new,) + tuple(self.rows[row][1:])
+        if item.text() != new:
+            self._set_key_cell(item, new)
+        self.app.mark_dirty()
+        self._update_status()
 
-        text = text.lower()
-        providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
-        filtered = {
-            name: cfg for name, cfg in providers.items()
-            if text in name.lower() or
-               (isinstance(cfg.get("npm"), str) and text in cfg["npm"].lower()) or
-               (isinstance(cfg.get("name"), str) and text in cfg["name"].lower())
-        }
+    _FIELD_COL = {"npm": 1, "name": 2}
 
-        self._update_table(filtered)
+    def _commit_inline(self, row, field, widget):
+        """Write-through for the npm/name cells so a table rebuild (search,
+        dialogs, Show deleted, ...) never drops an inline edit."""
+        if not 0 <= row < len(self.rows) or self.rows[row][self._FIELD_COL[field]] is not widget:
+            return  # stale widget from a previous rebuild
+        prov = self._providers().get(self.rows[row][0])
+        if not isinstance(prov, dict):
+            return
+        value = widget.value()
+        if not self._differs(prov, field, value):
+            return
+        self.app.snapshot_state()
+        self._apply_field(prov, field, value)
+        self.app.mark_dirty()
 
-    def _update_table(self, providers: Optional[dict] = None):
-        """Update table with providers"""
-        if providers is None:
-            providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
+    @staticmethod
+    def _differs(prov: dict, field: str, value: str) -> bool:
+        cur = prov.get(field)
+        return value != ("" if cur is None else str(cur))
 
-        self.table.setRowCount(len(providers))
-        self.rows = []
-
-        for row, (name, cfg) in enumerate(sorted(providers.items())):
-            if not isinstance(cfg, dict):
-                cfg = {}
-
-            # Provider name
-            self.table.setItem(row, 0, QTableWidgetItem(name))
-
-            # npm
-            npm_edit = MaskedLineEdit(cfg.get("npm", ""), field_name="npm")
-            npm_edit.edit.editingFinished.connect(self.app.mark_dirty)
-            self.table.setCellWidget(row, 1, npm_edit)
-
-            # Name
-            name_edit = MaskedLineEdit(cfg.get("name", ""), field_name="name")
-            name_edit.edit.editingFinished.connect(self.app.mark_dirty)
-            self.table.setCellWidget(row, 2, name_edit)
-
-            # Models/Options
-            n_models = len(cfg.get("models", {})) if isinstance(cfg.get("models"), dict) else 0
-            base_url = cfg.get("options", {}).get("baseURL", "") if isinstance(cfg.get("options"), dict) else ""
-
-            cell = QWidget()
-            cell_layout = QHBoxLayout(cell)
-            cell_layout.setContentsMargins(2, 0, 2, 0)
-
-            summary = QLabel(f"{n_models} models  {base_url}")
-            summary.setToolTip(json.dumps(cfg, ensure_ascii=False, indent=2)[:4000])
-            cell_layout.addWidget(summary, 1)
-
-            models_btn = QPushButton("Models...")
-            models_btn.clicked.connect(lambda _, n=name: self._edit_models(n))
-            cell_layout.addWidget(models_btn)
-
-            options_btn = QPushButton("Options...")
-            options_btn.clicked.connect(lambda _, n=name: self._edit_options(n))
-            cell_layout.addWidget(options_btn)
-
-            self.table.setCellWidget(row, 3, cell)
-
-            # Actions
-            actions_widget = QWidget()
-            actions_layout = QHBoxLayout(actions_widget)
-            actions_layout.setContentsMargins(0, 0, 0, 0)
-
-            edit_btn = QPushButton("Edit")
-            edit_btn.setFixedWidth(60)
-            edit_btn.clicked.connect(lambda _, n=name: self._edit_provider(n))
-            actions_layout.addWidget(edit_btn)
-
-            remove_btn = QPushButton("Remove")
-            remove_btn.setFixedWidth(60)
-            remove_btn.clicked.connect(lambda _, n=name: self._remove_provider(n))
-            actions_layout.addWidget(remove_btn)
-
-            self.table.setCellWidget(row, 4, actions_widget)
-
-            self.rows.append((name, npm_edit, name_edit))
-
-        self.status_label.setText(f"{len(providers)} providers")
+    @staticmethod
+    def _apply_field(prov: dict, field: str, value: str):
+        """Set the field, or drop it when empty (never writes "npm": "")."""
+        if value:
+            prov[field] = value
+        else:
+            prov.pop(field, None)
 
     def refresh(self):
         """Refresh table with current data"""
@@ -205,17 +345,10 @@ class ProvidersTab(QWidget):
         self.app.mark_dirty()
         self.refresh()
 
-    def _edit_provider(self, name: Optional[str] = None):
-        """Edit provider"""
+    def _edit_provider(self, name: str):
+        """Rename a provider via a dialog."""
         self.app.snapshot_state()
-        if name is None:
-            selected = self.table.selectedItems()
-            if not selected:
-                QMessageBox.information(self, "Edit", "Please select a provider to edit")
-                return
-            name = selected[0].text()
-
-        providers = section(self.app.cfg.data, "provider")
+        providers = self._providers()
         if name not in providers:
             QMessageBox.warning(self, "Error", f"Provider '{name}' not found")
             return
@@ -242,29 +375,80 @@ class ProvidersTab(QWidget):
         self.app.mark_dirty()
         self.refresh()
 
-    def _remove_provider(self, name: Optional[str] = None):
-        """Remove provider(s)"""
+    def _remove_provider(self, name: str):
+        """Soft delete: move the provider into the trash file, then drop it from
+        the config. It leaves the config file on the next Save."""
+        providers = self._providers()
+        if name not in providers:
+            QMessageBox.warning(self, "Error", f"Provider '{name}' not found")
+            self.refresh()
+            return
+        if not _confirm(self, "Remove Provider",
+                        f"Remove provider '{name}'?\n\n"
+                        "It can be restored via \"Show deleted\"."):
+            return
+
+        entry = copy.deepcopy(providers[name])
+        row = self._row_of(name)
+        if isinstance(entry, dict) and row is not None:
+            # Include inline edits that haven't been committed yet.
+            for fld, widget in zip(("npm", "name"), self.rows[row][1:]):
+                if self._differs(entry, fld, widget.value()):
+                    self._apply_field(entry, fld, widget.value())
+        path = self._cfg_path()
+        try:
+            if path is None:
+                raise OSError("no config file is loaded")
+            ProviderTrashStore().put(path, name, entry)
+        except (OSError, TypeError, ValueError) as e:
+            QMessageBox.critical(self, "Remove Provider",
+                                 f"Could not save '{name}' to the trash file, "
+                                 f"nothing was removed:\n{e}")
+            return
+
         self.app.snapshot_state()
-        if name is None:
-            selected = self.table.selectedItems()
-            if not selected:
-                QMessageBox.information(self, "Remove", "Please select providers to remove")
-                return
-
-            names = {selected[i].text() for i in range(0, len(selected), self.table.columnCount())}
-            if not _confirm(self, "Remove Providers", f"Remove {len(names)} selected providers?"):
-                return
-
-            providers = section(self.app.cfg.data, "provider")
-            for name in names:
-                providers.pop(name, None)
-        else:
-            if not _confirm(self, "Remove Provider", f"Remove provider '{name}'?"):
-                return
-
-            section(self.app.cfg.data, "provider").pop(name, None)
-
+        providers.pop(name, None)
         self.app.mark_dirty()
+        self.refresh()
+
+    def _restore_provider(self, name: str):
+        """Copy a deleted provider back into the config. The trash entry stays
+        until a successful save prunes it, so restore-then-discard loses nothing."""
+        path = self._cfg_path()
+        entry = ProviderTrashStore().entries(path).get(name) if path is not None else None
+        if entry is None:
+            QMessageBox.warning(self, "Restore Provider",
+                                f"'{name}' is no longer in the trash file")
+            self.refresh()
+            return
+        providers = self.app.cfg.data.setdefault("provider", {})
+        if not isinstance(providers, dict):
+            QMessageBox.warning(self, "Restore Provider",
+                                "The config's 'provider' value is not an object; fix it in Raw JSON")
+            return
+        if name in providers:
+            QMessageBox.warning(self, "Restore Provider",
+                                f"Provider '{name}' already exists; rename or remove it first")
+            return
+        self.app.snapshot_state()
+        providers[name] = entry
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _hard_delete_provider(self, name: str):
+        """Permanently drop a deleted provider from the trash file."""
+        path = self._cfg_path()
+        if path is None:
+            return
+        if not _confirm(self, "Delete Permanently",
+                        f"Permanently delete provider '{name}' from the trash?\n\n"
+                        "This cannot be undone."):
+            return
+        try:
+            ProviderTrashStore().discard(path, name)
+        except OSError as e:
+            QMessageBox.critical(self, "Delete Permanently", str(e))
+            return
         self.refresh()
 
     def _import_providers(self):
@@ -345,13 +529,15 @@ class ProvidersTab(QWidget):
         if isinstance(existing_cfg, dict) and isinstance(existing_cfg.get("models"), dict):
             existing_models = existing_cfg["models"]
 
-        base_url = dlg.url_edit.text().strip()
+        # api_base_url() is format-aware: a list/catalog fetch stored the raw
+        # listing URL as options.baseURL, which is not a usable API endpoint.
+        base_url = dlg.api_base_url()
         prov, summary = apply_fetched_provider(
             providers, key, selected,
             base_url=base_url,
             api_key=dlg.apikey_edit.text().strip(),
             save_api_key=dlg.save_apikey_check.isChecked(),
-            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+            npm=npm_for_fetch(dlg._current_adapter(), dlg.url_edit.text().strip()))
 
         removed = []
         if dlg.sync_check.isChecked():
@@ -481,12 +667,6 @@ class ProvidersTab(QWidget):
         except OSError as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
-    def _set_all_enabled(self, enabled: bool):
-        """Enable/disable all providers"""
-        # Providers don't have an enabled flag, but we can add one for UI purposes
-        # This is just a placeholder for potential future functionality
-        QMessageBox.information(self, "Info", "Providers don't have an enabled/disabled state")
-
     def _edit_models(self, name: str):
         """Edit models for provider"""
         self.app.snapshot_state()
@@ -528,34 +708,26 @@ class ProvidersTab(QWidget):
     def _health_check_providers(self):
         """Run connectivity and health check for configured providers"""
         providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
-        dlg = ProviderHealthCheckDialog(self, providers=providers)
+        # Project-scoped {file:...} API keys resolve against the config's dir.
+        cfg_path = str(self.app.cfg.path) if self.app.cfg else ""
+        dlg = ProviderHealthCheckDialog(self, providers=providers, config_path=cfg_path)
         dlg.exec()
 
     def collect(self, data: dict):
-        """Collect data from UI"""
-        providers = data.setdefault("provider", {})
-        seen = set()
-
-        for row in range(self.table.rowCount()):
-            old_name = self.rows[row][0]
-            new_name = self.table.item(row, 0).text().strip()
-
-            if not new_name:
-                continue
-
-            if new_name in seen:
-                raise ValueError(f"Duplicate provider key: {new_name!r}")
-            seen.add(new_name)
-
-            npm_edit = self.rows[row][1]
-            name_edit = self.rows[row][2]
-
-            old_cfg = dict(providers.get(old_name, {}))
-            old_cfg["npm"] = npm_edit.value()
-            if name_edit.value():
-                old_cfg["name"] = name_edit.value()
-            else:
-                old_cfg.pop("name", None)
-
-            providers[new_name] = old_cfg
-
+        """Apply npm/name edits still pending in a focused cell (e.g. Save via
+        shortcut). Committed edits and renames already live in cfg.data
+        (write-through), so untouched fields keep whatever `data` holds (incl.
+        Raw JSON edits) and providers missing from `data` are never recreated."""
+        providers = data.get("provider")
+        if not isinstance(providers, dict):
+            return
+        cfg_providers = self._providers()
+        for key, npm_edit, name_edit in self.rows:
+            prov = providers.get(key)
+            if not isinstance(prov, dict):
+                continue    # removed (e.g. in Raw JSON) or malformed: never resurrect
+            base = cfg_providers.get(key)
+            base = base if isinstance(base, dict) else {}
+            for fld, widget in (("npm", npm_edit), ("name", name_edit)):
+                if self._differs(base, fld, widget.value()):
+                    self._apply_field(prov, fld, widget.value())

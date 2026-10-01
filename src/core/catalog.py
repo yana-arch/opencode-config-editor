@@ -18,8 +18,12 @@ class ModelCatalog:
         self._load_pattern_rules()
 
     def loaded(self) -> bool:
-        """Check if catalog is loaded (including custom models)."""
-        return self.raw is not None or bool(self.custom_models)
+        """Check if a base catalog (file, cache, bundle or pasted text) is loaded.
+
+        Custom models alone do not count: they overlay whatever base catalog is
+        active, and every lazy-load guard must still pull in the base catalog.
+        """
+        return self.raw is not None
 
     def load(self, path: Path):
         """Load catalog from file"""
@@ -41,40 +45,65 @@ class ModelCatalog:
             if CUSTOM_MODELS_FILE.exists():
                 data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
+                    if self.raw is None:
+                        # No base catalog: the indexes hold nothing but custom
+                        # entries, so rebuild them instead of overlaying twice.
+                        self.by_provider = {}
+                        self.flat = {}
+                        self._model_index = {}
+                        self.normalized_index = {}
                     self._apply_custom_models_dict(data)
         except Exception:
             pass
 
     def _apply_custom_models_dict(self, data: dict):
-        """Merge custom models dict with high priority into catalog."""
+        """Merge custom models dict with high priority into catalog.
+
+        Entries are classified one by one: a `{provider: {"models": {...}}}`
+        group, a top-level `{"id":..., "models": {...}}` group and a flat
+        `{model_id: spec}` entry can coexist in the same file. Non-object values
+        are skipped instead of disabling every custom model.
+        """
         self.custom_models = {}
         self.custom_by_provider = {}
 
         flat_custom = {}
         by_prov = {}
 
-        if all(isinstance(v, dict) and "models" in v for v in data.values()):
-            for pid, pdata in data.items():
-                models = pdata.get("models", {})
-                if isinstance(models, dict):
-                    by_prov[pid] = models
-                    for mid, spec in models.items():
-                        flat_custom[mid] = spec
-        elif "models" in data and isinstance(data["models"], dict):
-            pid = data.get("id") or "custom"
-            by_prov[pid] = data["models"]
-            flat_custom.update(data["models"])
-        elif all(isinstance(v, dict) for v in data.values()):
-            for mid, spec in data.items():
-                pid = spec.get("provider") or "custom"
-                by_prov.setdefault(pid, {})[mid] = spec
-                flat_custom[mid] = spec
+        top_models = data.get("models")
+        if isinstance(top_models, dict):
+            pid = data.get("id") if isinstance(data.get("id"), str) else "custom"
+            for mid, spec in top_models.items():
+                if isinstance(spec, dict):
+                    by_prov.setdefault(pid, {})[mid] = spec
+                    flat_custom[mid] = spec
+
+        for mid, value in data.items():
+            if mid == "models":
+                continue
+            if not isinstance(value, dict):
+                continue
+            inner = value.get("models")
+            if isinstance(inner, dict):
+                pid = str(mid)
+                for sub_id, sub_spec in inner.items():
+                    if isinstance(sub_spec, dict):
+                        by_prov.setdefault(pid, {})[sub_id] = sub_spec
+                        flat_custom[sub_id] = sub_spec
+                continue
+            pid = value.get("provider") if isinstance(value.get("provider"), str) else "custom"
+            by_prov.setdefault(pid, {})[mid] = value
+            flat_custom[mid] = value
 
         self.custom_models = flat_custom
         self.custom_by_provider = by_prov
 
         # Overlay on active index
-        for pid, models in by_prov.items():
+        self._overlay_custom_models()
+
+    def _overlay_custom_models(self):
+        """Overlay the current custom models onto the active catalog indexes."""
+        for pid, models in self.custom_by_provider.items():
             if pid not in self.by_provider:
                 self.by_provider[pid] = {}
             for mid, spec in models.items():
@@ -96,6 +125,19 @@ class ModelCatalog:
 
         self._formats_cache = None
 
+    def _reload_after_custom_change(self):
+        """Rebuild the indexes after custom models were added/removed on disk."""
+        if self.raw is not None:
+            self._ingest(self.raw)
+            return
+        # No base catalog: rebuild from scratch out of the file on disk, so a
+        # deleted or renamed model leaves no stale index entry behind.
+        self.by_provider = {}
+        self.flat = {}
+        self._model_index = {}
+        self.normalized_index = {}
+        self._load_custom_models()
+
     def _load_pattern_rules(self):
         """Load pattern rules from PATTERN_RULES_FILE."""
         try:
@@ -111,48 +153,58 @@ class ModelCatalog:
         model_id = str(model_id).strip()
         if not model_id:
             return False
-        current = self.get_all_custom_models()
+        try:
+            current = self.get_all_custom_models()
+        except ValueError:
+            return False
         spec_copy = dict(spec)
         spec_copy["provider"] = provider
         current[model_id] = spec_copy
 
         try:
             CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-            if self.raw:
-                self._ingest(self.raw)
-            else:
-                self._load_custom_models()
+            atomic_write_json(
+                CUSTOM_MODELS_FILE,
+                json.dumps(current, indent=2, ensure_ascii=False),
+            )
+            self._reload_after_custom_change()
             return True
-        except OSError:
+        except (OSError, ValueError):
             return False
 
     def delete_custom_model(self, model_id: str) -> bool:
         """Delete a custom model from CUSTOM_MODELS_FILE."""
-        current = self.get_all_custom_models()
+        try:
+            current = self.get_all_custom_models()
+        except ValueError:
+            return False
         if model_id in current:
             current.pop(model_id, None)
             try:
-                CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-                if self.raw:
-                    self._ingest(self.raw)
-                else:
-                    self.custom_models.pop(model_id, None)
-                    self._formats_cache = None
+                atomic_write_json(
+                    CUSTOM_MODELS_FILE,
+                    json.dumps(current, indent=2, ensure_ascii=False),
+                )
+                self._reload_after_custom_change()
                 return True
-            except OSError:
+            except (OSError, ValueError):
                 return False
         return False
 
     def get_all_custom_models(self) -> Dict[str, dict]:
-        """Get dict of all saved custom models."""
-        try:
-            if CUSTOM_MODELS_FILE.exists():
-                data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    return data
-        except Exception:
-            pass
+        """Get dict of all saved custom models.
+
+        Raises ValueError when the file exists but cannot be parsed, so callers
+        never silently write back a truncated dataset and destroy the models
+        they could not read.
+        """
+        if CUSTOM_MODELS_FILE.exists():
+            data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"{CUSTOM_MODELS_FILE.name} must contain a JSON object."
+                )
+            return data
         return dict(self.custom_models)
 
     def save_pattern_rules(self, rules: List[dict]) -> bool:
@@ -172,7 +224,12 @@ class ModelCatalog:
         return list(self.pattern_rules)
 
     def fetch_online(self, url: Optional[str] = None) -> Tuple[bool, str, int]:
-        """Download latest catalog from online source, update cache, and reload."""
+        """Download latest catalog from online source, update cache, and reload.
+
+        The download is fully validated before anything is replaced: a failed
+        request, unparseable body or unrecognized catalog shape leaves both the
+        in-memory catalog and the on-disk cache untouched.
+        """
         catalog_url = (url or SettingsManager().get_catalog_url() or DEFAULT_CATALOG_URL).strip()
         try:
             req = urllib.request.Request(
@@ -185,8 +242,18 @@ class ModelCatalog:
             if not isinstance(data, dict) or not data:
                 return False, "Downloaded catalog is empty or invalid JSON.", 0
 
+            # Validate the shape on a throwaway catalog first: only a catalog
+            # that ingests cleanly is allowed to overwrite the cache.
+            try:
+                _validate_catalog_data(data)
+            except ValueError as e:
+                return False, f"Downloaded catalog is invalid: {e}", 0
+
             CATALOG_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            CATALOG_CACHE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            atomic_write_json(
+                CATALOG_CACHE,
+                json.dumps(data, indent=2, ensure_ascii=False),
+            )
             self.load(CATALOG_CACHE)
             return True, f"Catalog updated successfully from {catalog_url}!", len(self.flat)
         except Exception as e:
@@ -194,34 +261,7 @@ class ModelCatalog:
 
     def _ingest(self, data: dict):
         """Process catalog data and overlay custom models."""
-        if not isinstance(data, dict) or not data:
-            raise ValueError("Catalog JSON must be a non-empty object.")
-
-        by_provider, flat = {}, {}
-
-        # models.dev-style dump: {providerId: {..., "models": {id: spec}}}
-        if all(isinstance(v, dict) and "models" in v for v in data.values()):
-            for pid, pdata in data.items():
-                models = pdata.get("models", {})
-                if isinstance(models, dict):
-                    by_provider[pid] = dict(models)
-                    for mid, spec in models.items():
-                        flat.setdefault(mid, spec)
-
-        # Single provider dump: {"id":..., "models": {...}}
-        elif "models" in data and isinstance(data["models"], dict):
-            pid = data.get("id") or "provider"
-            by_provider[pid] = dict(data["models"])
-            flat.update(data["models"])
-
-        # Flat map: {modelId: spec}
-        elif all(isinstance(v, dict) for v in data.values()):
-            flat.update(data)
-            # Provide a synthetic provider so the normalized formats still work.
-            by_provider["provider"] = dict(data)
-
-        else:
-            raise ValueError("Unrecognized model catalog format.")
+        by_provider, flat = _parse_catalog_data(data)
 
         self.raw, self.by_provider, self.flat = data, by_provider, flat
         self._formats_cache = None
@@ -290,18 +330,31 @@ class ModelCatalog:
         return [fmt for pmap in self.formats().values() for fmt in pmap.values()]
 
     def find_model(self, model_id: str) -> List["ModelFormat"]:
-        """Match a model id across the catalog, custom models, and pattern rules."""
-        matches = set()
+        """Match a model id across the catalog, custom models, and pattern rules.
 
-        # 1. Exact match
-        if model_id in self._model_index:
-            matches.add(model_id)
+        An id that exists in the catalog resolves to that entry (and nothing
+        else); otherwise the normalized bucket is searched. Ordering is
+        deterministic, so repeated runs pick the same match.
 
+        `_seen_refs` guards pattern-rule reference lookups against re-entering
+        the rule that is currently being applied.
+        """
+        return self._find_model(model_id, _seen_refs=frozenset())
+
+    def _find_model(self, model_id: str, _seen_refs: frozenset) -> List["ModelFormat"]:
+        # Insertion-ordered dict: a deterministic stand-in for a set.
+        matches = {}
+
+        # 1. Exact match wins outright: never widen an id that exists.
+        # `_model_index` also holds alias keys, which have no format of their
+        # own, so only a real model id short-circuits here.
+        if model_id in self.flat:
+            matches[model_id] = None
         # 2. Full normalized match (most precise).
         full = _normalize_model_id(model_id)
-        if full in self.normalized_index:
+        if not matches and full in self.normalized_index:
             for original_id in self.normalized_index[full]:
-                matches.add(original_id)
+                matches[original_id] = None
 
         # 3. Fallback: version-stripped variants
         if not matches:
@@ -310,7 +363,7 @@ class ModelCatalog:
                     continue
                 if key in self.normalized_index:
                     for original_id in self.normalized_index[key]:
-                        matches.add(original_id)
+                        matches[original_id] = None
 
         # 4. Pattern rules match
         if not matches and self.pattern_rules:
@@ -331,8 +384,10 @@ class ModelCatalog:
                     ref_prov = rule.get("reference_provider")
                     ref_mod = rule.get("reference_model")
                     ref_fmt = None
-                    if ref_mod:
-                        mod_matches = self.find_model(ref_mod)
+                    if ref_mod and ref_mod not in _seen_refs:
+                        mod_matches = self._find_model(
+                            ref_mod, _seen_refs | {ref_mod, model_id}
+                        )
                         if mod_matches:
                             ref_fmt = mod_matches[0]
                     if ref_fmt is None and ref_prov:
@@ -742,7 +797,7 @@ def apply_catalog_to_config(catalog, config_providers: dict, *,
                 report.ambiguous.append((prov_name, mid, matches))
                 continue
 
-            merged = _merge_model_spec(spec, build_spec_from_format(chosen), overwrite)
+            merged = _merge_model_spec(spec, build_spec_from_format(chosen, mid), overwrite)
             changed = merged != (spec or {})
             if changed:
                 models[mid] = merged
@@ -805,10 +860,18 @@ _VERSION_SUFFIX = re.compile(
 # Prefixes and suffixes to strip during normalization. Order matters for suffixes.
 _NORM_PREFIXES = ("google/", "google:", "anthropic.", "openai:", "zh-", "en-")
 
-# A leading "namespace" token followed by '/' or ':', e.g. "df/", "anthropic/",
-# "openai:". Stripped so that "df/claude-opus-4.8" collapses to "claude-opus-4.8"
-# and matches catalog entries stored under any other (or no) namespace.
-_NAMESPACE_RE = re.compile(r'^[^/:]+[/:]')
+# A leading "namespace" token followed by '/', e.g. "df/", "anthropic/",
+# "opencode-provider/". Stripped so that "df/claude-opus-4.8" collapses to
+# "claude-opus-4.8" and matches catalog entries stored under any other (or no)
+# namespace.
+#
+# Only a '/' introduces a namespace. A ':' must be kept: in Ollama, Bedrock and
+# OpenRouter ids it separates a model name from a tag or size
+# ("deepseek-r1:free", "amazon.nova-micro-v1:0", "qwen2.5-coder:32b"), and
+# stripping it collapses unrelated families onto the same key.
+_NAMESPACE_RE = re.compile(r'^[^/]+/')
+
+# Same idea for display names: only the path part is a namespace.
 
 # A trailing dotted version (e.g. "4.8", "2.1", "3.5.2") reduced to its major,
 # so "claude-opus-4.8" -> "claude-opus-4" and matches "claude-opus-4".
@@ -830,8 +893,8 @@ def _normalize_model_id(mid: str) -> str:
     a leading namespace token, and trailing version/date/general suffixes stripped."""
     s = str(mid).strip().lower().replace("_", "-")
 
-    # Strip leading namespace/provider tokens ("df/", "anthropic:", ...).
-    # Looped so "df/anthropic/claude" -> "anthropic/claude" -> "claude".
+    # Strip leading path namespaces ("df/anthropic/claude" -> "claude").
+    # A trailing ':tag' is part of the model id and is deliberately kept.
     while _NAMESPACE_RE.match(s):
         s = _NAMESPACE_RE.sub("", s, count=1)
 
@@ -904,9 +967,14 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     """Try to find a catalog format for an unmatched model id.
 
     Order: (a) exact id within the reference provider, (b) normalized-id
-    match anywhere, (c) normalized-id match within the reference provider,
-    (d) longest shared prefix within the reference provider.
+    match within the reference provider, (c) normalized-id match anywhere,
+    (d) version-stripped variants, (e) longest shared prefix within the
+    reference provider.
     Returns a ModelFormat or None. Never raises on a missing catalog.
+
+    Normalized lookups go through the catalog's `normalized_index` instead of
+    re-normalizing every catalog id: `find_model` has already missed this id
+    there, so a full rescan cannot find anything new.
     """
     if catalog is None or not getattr(catalog, "loaded", lambda: False)():
         return None
@@ -922,41 +990,52 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     if not normalized:
         return None
 
-    # (b) full normalized match within the reference provider first.
-    if reference_provider:
-        for cand_id, fmt in formats.get(reference_provider, {}).items():
-            if _normalize_model_id(cand_id) == normalized:
-                return fmt
+    normalized_index = getattr(catalog, "normalized_index", None)
 
-    # (c) full normalized match anywhere in the catalog.
-    for pid, pmap in formats.items():
-        for cand_id, fmt in pmap.items():
-            if _normalize_model_id(cand_id) == normalized:
-                return fmt
-
-    # (b') version-stripped variants within the reference provider.
-    for key in _normalized_match_keys(mid):
-        if key == normalized:
-            continue
-        if reference_provider:
-            for cand_id, fmt in formats.get(reference_provider, {}).items():
-                if _normalize_model_id(cand_id) == key:
-                    return fmt
-
-    # (c') version-stripped variants anywhere in the catalog.
-    for key in _normalized_match_keys(mid):
-        if key == normalized:
-            continue
+    def _lookup(key, provider=None):
+        """First catalog format whose id (or alias) normalizes to `key`."""
+        if normalized_index is not None:
+            for cand_id in normalized_index.get(key, []):
+                for pid in catalog._model_index.get(cand_id, []):
+                    if provider is not None and pid != provider:
+                        continue
+                    fmt = formats.get(pid, {}).get(cand_id)
+                    if fmt is not None:
+                        return fmt
+            return None
+        # Duck-typed catalogs without an index: fall back to a scan.
         for pid, pmap in formats.items():
+            if provider is not None and pid != provider:
+                continue
             for cand_id, fmt in pmap.items():
                 if _normalize_model_id(cand_id) == key:
                     return fmt
+        return None
 
-    # (d) longest shared prefix within the reference provider
+    # (b) full normalized match within the reference provider first.
+    fmt = _lookup(normalized, reference_provider) if reference_provider else None
+    if fmt is not None:
+        return fmt
+
+
+    # (c) full normalized match anywhere in the catalog.
+    fmt = _lookup(normalized)
+    if fmt is not None:
+        return fmt
+
+    # (d) version-stripped variants, most specific key first.
+    for key in _normalized_match_keys(mid):
+        if key == normalized:
+            continue
+        fmt = _lookup(key)
+        if fmt is not None:
+            return fmt
+
+    # (e) longest shared prefix within the reference provider
     if reference_provider:
         pmap = formats.get(reference_provider, {})
         best, best_len = None, 0
-        for cand_id in pmap:
+        for cand_id, fmt in pmap.items():
             cand_norm = _normalize_model_id(cand_id)
             if not cand_norm:
                 continue
@@ -968,9 +1047,54 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
             # Require a meaningful prefix and a remaining "family" shape.
             if common > best_len and common >= min(len(normalized), len(cand_norm)) - 4 \
                     and common >= 4:
-                best, best_len = pmap[cand_id], common
+                best, best_len = fmt, common
         return best
 
     return None
+
+
+def _parse_catalog_data(data: dict):
+    """Split raw catalog JSON into `(by_provider, flat)` model maps.
+
+    Raises ValueError for an empty object or an unrecognized shape, so callers
+    can validate a download before replacing a good cache with it.
+    """
+    if not isinstance(data, dict) or not data:
+        raise ValueError("Catalog JSON must be a non-empty object.")
+
+    by_provider, flat = {}, {}
+
+    # models.dev-style dump: {providerId: {..., "models": {id: spec}}}
+    if all(isinstance(v, dict) and "models" in v for v in data.values()):
+        for pid, pdata in data.items():
+            models = pdata.get("models", {})
+            if isinstance(models, dict):
+                by_provider[pid] = dict(models)
+                for mid, spec in models.items():
+                    flat.setdefault(mid, spec)
+
+    # Single provider dump: {"id":..., "models": {...}}
+    elif "models" in data and isinstance(data["models"], dict):
+        pid = data.get("id") or "provider"
+        by_provider[pid] = dict(data["models"])
+        flat.update(data["models"])
+
+    # Flat map: {modelId: spec}
+    elif all(isinstance(v, dict) for v in data.values()):
+        flat.update(data)
+        # Provide a synthetic provider so the normalized formats still work.
+        by_provider["provider"] = dict(data)
+
+    else:
+        raise ValueError("Unrecognized model catalog format.")
+
+    if not by_provider or not flat:
+        raise ValueError("Catalog contains no models.")
+    return by_provider, flat
+
+
+def _validate_catalog_data(data: dict) -> None:
+    """Raise ValueError unless `data` is a catalog this app can index."""
+    _parse_catalog_data(data)
 
 

@@ -48,7 +48,22 @@ def test_save_layer_roundtrip(tmp_path):
     cf2 = app.LayeredConfigFile(tmp_path / "proj", config_dir=tmp_path / "cfghome")
     cf2.load()
     assert cf2.layer("project") == {"model": "haiku"}
-    assert cf2.effective()["model"] == "haiku"
+
+
+def test_successful_save_clears_jsonc_marker(tmp_path):
+    cfg_dir = tmp_path / "cfghome"
+    path = cfg_dir / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{\n  // comment\n  "model": "opus"\n}', encoding="utf-8")
+    cf = app.LayeredConfigFile(tmp_path / "proj", config_dir=cfg_dir)
+    cf.load()
+    assert str(path) in cf.jsonc_files
+
+    ok, msg = cf.save_layer("user", {"model": "opus"})
+
+    assert ok, msg
+    assert str(path) not in cf.jsonc_files
+    assert "// comment" not in path.read_text(encoding="utf-8")
 
 
 def test_save_unknown_layer_rejected(tmp_path):

@@ -67,6 +67,27 @@ def _confirm_unsaved(win, action="switch layer"):
     return "discard"
 
 
+def _confirm_strip_comments(win, path):
+    """Ask before rewriting a comments-carrying settings file without them.
+
+    Returns True to proceed with the save. Module-level so tests can
+    monkeypatch it (offscreen runs never exec dialogs).
+    """
+    if not HAS_QT:
+        return False
+    box = QMessageBox(win)
+    box.setWindowTitle("Comments will be removed")
+    box.setText(
+        f"{path} contains JSON comments.\n"
+        "Saving from the form rewrites it as plain JSON and every comment is lost."
+    )
+    save_btn = box.addButton("Save anyway", QMessageBox.AcceptRole)
+    cancel_btn = box.addButton(QMessageBox.Cancel)
+    box.setDefaultButton(cancel_btn)
+    box.exec()
+    return box.clickedButton() is save_btn
+
+
 def _layer_change_guarded(tab, combo):
     """Shared layer-combo handler: prompts before discarding unsaved edits."""
     win = tab.app
@@ -130,6 +151,15 @@ def _openclaude_save(win):
         win.status_bar.showMessage(
             "Save blocked: settings file has invalid JSON — fix it in the Raw tab")
         return
+
+    # save_layer rewrites the file with json.dumps, dropping every comment a
+    # JSONC settings file carried. Ask before destroying them.
+    layer_path = layered.layer_files[layer]
+    if str(layer_path) in getattr(layered, "jsonc_files", set()):
+        if not _confirm_strip_comments(win, layer_path):
+            win.status_bar.showMessage(
+                f"Save cancelled: comments kept in {layer_path}")
+            return
 
     base = dict(layered.layer(layer))
     win._agent_settings_tab.collect(base)

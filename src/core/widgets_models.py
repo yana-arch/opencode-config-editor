@@ -166,6 +166,8 @@ class ModelsManagerDialog(QDialog):
         self.provider_key = provider_key
         self.provider_cfg = provider_cfg
         self.models = dict(provider_cfg.get("models", {})) if isinstance(provider_cfg.get("models"), dict) else {}
+        # Options staged by a Fetch from API, committed only on accept.
+        self._pending_options = None
         self.setWindowTitle(f"Models - {provider_key}")
         self.resize(900, 600)
 
@@ -222,16 +224,34 @@ class ModelsManagerDialog(QDialog):
 
         self._update_table()
 
-    def _fetch_from_api(self):
-        """Fetch this provider's model list from its live API endpoint."""
-        self.app.snapshot_state()
-        # Write pending edits through so fetch preview/sync see what the user sees.
-        self.provider_cfg["models"] = dict(self.models)
+    def accept(self):
+        """Commit the working copy: models plus any staged endpoint options."""
+        if self._pending_options is not None:
+            if self._pending_options:
+                self.provider_cfg["options"] = copy.deepcopy(self._pending_options)
+            else:
+                self.provider_cfg.pop("options", None)
+            self._pending_options = None
+        super().accept()
 
-        scope = {self.provider_key: self.provider_cfg}
+    def _fetch_from_api(self):
+        """Fetch this provider's model list from its live API endpoint.
+
+        Nothing here touches the live provider: the fetch runs against a deep
+        copy so that cancelling this dialog (or the Models dialog itself)
+        leaves cfg.data exactly as it was. The result is folded back into
+        self.models, which the Models dialog commits on accept.
+        """
+        self.app.snapshot_state()
+        # Pending in-dialog edits are what the user sees, so the fetch scope
+        # starts from the working copy, not the last committed one.
+        scope = {self.provider_key: copy.deepcopy(self.provider_cfg)}
+        scope[self.provider_key]["models"] = dict(self.models)
+
         dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog,
                                         provider_key=self.provider_key,
-                                        providers=scope)
+                                        providers=scope,
+                                        lock_key=True)
         if dlg.exec() != QDialog.Accepted:
             return
 
@@ -240,13 +260,15 @@ class ModelsManagerDialog(QDialog):
             QMessageBox.information(self, "Fetch", "No models selected.")
             return
 
-        base_url = dlg.url_edit.text().strip()
+        # The dialog owns the policy: a list/catalog format yields '' so
+        # nothing is persisted, and an SDK-style base comes back normalised.
+        base_url = dlg.api_base_url()
         prov, summary = apply_fetched_provider(
             scope, self.provider_key, selected,
             base_url=base_url,
             api_key=dlg.apikey_edit.text().strip(),
             save_api_key=dlg.save_apikey_check.isChecked(),
-            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+            npm=npm_for_fetch(dlg._current_adapter(), dlg.url_edit.text().strip()))
 
         removed = []
         if dlg.sync_check.isChecked():
@@ -263,9 +285,11 @@ class ModelsManagerDialog(QDialog):
                         prov["models"].pop(mid, None)
                     removed = stale
 
+        # The endpoint config is staged on the dialog and committed in accept();
+        # until then the live provider is untouched, so Cancel reverts it all.
+        self._pending_options = copy.deepcopy(prov.get("options", {}))
         self.models = dict(prov["models"])
         self._update_table()
-        self.app.mark_dirty()
 
         if summary["added"]:
             self._match_models(set(summary["added"]))

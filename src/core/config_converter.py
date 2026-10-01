@@ -10,22 +10,25 @@ def detect_config_format(data: dict) -> str:
     if data.get("format") == "omp/v1" or ("$schema" in data and "omp" in str(data["$schema"])):
         return "omp"
 
-    if "provider" in data or "tui" in data or "plugin" in data:
+    # opencode.json (and tui.json) markers win over the OpenClaude settings keys,
+    # which overlap (env, model, ...) with other formats.
+    if "provider" in data or "tui" in data or "plugin" in data or "mcp" in data:
         return "opencode"
 
     if "providerProfiles" in data or "activeProviderProfileId" in data:
         return "openclaude_global"
 
-    if "permissions" in data or "modelLimits" in data or "statusLine" in data:
+    _SETTINGS_KEYS = (
+        "permissions", "modelLimits", "statusLine", "env", "hooks", "model",
+        "includeCoAuthoredBy", "forceLoginMethod", "cleanupPeriodDays",
+    )
+    if any(k in data for k in _SETTINGS_KEYS):
         return "openclaude_settings"
 
     if "mcpServers" in data:
         if len(data) == 1:
             return "claude_desktop"
         return "openclaude_global"
-
-    if "mcp" in data:
-        return "opencode"
 
     return "generic"
 
@@ -44,9 +47,12 @@ def opencode_mcp_to_claude_mcp(opencode_mcp: dict) -> dict:
         if not isinstance(cfg, dict):
             continue
         stype = cfg.get("type", "local")
+        if cfg.get("enabled") is False:
+            continue
         entry = {}
         if stype == "remote":
-            entry["type"] = "sse"
+            # opencode carries no transport hint; streamable HTTP is the modern default
+            entry["type"] = "http"
             entry["url"] = cfg.get("url", "")
             if "headers" in cfg and isinstance(cfg["headers"], dict):
                 entry["headers"] = dict(cfg["headers"])
@@ -61,8 +67,13 @@ def opencode_mcp_to_claude_mcp(opencode_mcp: dict) -> dict:
                 entry["command"] = parts[0]
                 if len(parts) > 1:
                     entry["args"] = parts[1:]
-        if "env" in cfg and isinstance(cfg["env"], dict):
-            entry["env"] = {str(k): str(v) for k, v in cfg["env"].items()}
+            if isinstance(cfg.get("cwd"), str) and cfg["cwd"]:
+                entry["cwd"] = cfg["cwd"]
+        env = cfg.get("environment")
+        if not isinstance(env, dict):
+            env = cfg.get("env")
+        if isinstance(env, dict):
+            entry["env"] = {str(k): str(v) for k, v in env.items()}
         out[name] = entry
     return out
 
@@ -81,7 +92,7 @@ def claude_mcp_to_opencode_mcp(claude_mcp: dict) -> dict:
             entry = {
                 "type": "remote",
                 "url": cfg.get("url", ""),
-                "enabled": True,
+                "enabled": bool(cfg.get("enabled", True)),
             }
             if "headers" in cfg and isinstance(cfg["headers"], dict):
                 entry["headers"] = dict(cfg["headers"])
@@ -94,42 +105,131 @@ def claude_mcp_to_opencode_mcp(claude_mcp: dict) -> dict:
             entry = {
                 "type": "local",
                 "command": cmd_parts,
-                "enabled": True,
+                "enabled": bool(cfg.get("enabled", True)),
             }
-        if "env" in cfg and isinstance(cfg["env"], dict):
-            entry["env"] = {str(k): str(v) for k, v in cfg["env"].items()}
+            if isinstance(cfg.get("cwd"), str) and cfg["cwd"]:
+                entry["cwd"] = cfg["cwd"]
+        env = cfg.get("env")
+        if isinstance(env, dict):
+            entry["environment"] = {str(k): str(v) for k, v in env.items()}
         out[name] = entry
     return out
 
 
+_OC_TOOL_TO_CLAUDE_RULE = {
+    "read": "Read",
+    "edit": "Edit",
+    "write": "Write",
+    "glob": "Glob",
+    "grep": "Grep",
+    "list": "LS",
+    "bash": "Bash",
+    "task": "Task",
+    "todowrite": "TodoWrite",
+    "webfetch": "WebFetch",
+    "websearch": "WebSearch",
+    "lsp": "LSP",
+    "external_directory": "Read",
+}
+_CLAUDE_RULE_TO_OC_TOOL = {
+    "read": "read",
+    "edit": "edit",
+    "write": "edit",
+    "glob": "glob",
+    "grep": "grep",
+    "ls": "list",
+    "bash": "bash",
+    "task": "task",
+    "todowrite": "todowrite",
+    "webfetch": "webfetch",
+    "websearch": "websearch",
+}
+_PERM_ACTIONS = {
+    "allow": "allow",
+    "true": "allow",
+    "deny": "deny",
+    "false": "deny",
+    "block": "deny",
+    "ask": "ask",
+    "prompt": "ask",
+}
+
+
+def _opencode_rule_to_claude(tool: str, pattern, action: str) -> str:
+    base = _OC_TOOL_TO_CLAUDE_RULE.get(str(tool).lower(), str(tool))
+    if pattern is None:
+        return base
+    return f"{base}({pattern})"
+
+
 def opencode_permissions_to_claude(perms: dict) -> dict:
-    """Convert OpenCode permissions to OpenClaude permissions format."""
+    """Convert OpenCode permissions to OpenClaude permissions format.
+
+    Handles both flat actions ("bash": "allow") and per-pattern rule objects
+    ("bash": {"npm run *": "allow"}).
+    """
     out = {"allow": [], "deny": [], "ask": []}
     if not isinstance(perms, dict):
         return out
 
-    for cmd, action in perms.items():
-        act_str = str(action).lower()
-        if act_str in ("allow", "true"):
-            out["allow"].append(cmd)
-        elif act_str in ("deny", "false", "block"):
-            out["deny"].append(cmd)
-        elif act_str in ("ask", "prompt"):
-            out["ask"].append(cmd)
+    def _add(rule: str, action: str):
+        bucket = _PERM_ACTIONS.get(str(action).lower())
+        if bucket:
+            out[bucket].append(rule)
+
+    for tool, value in perms.items():
+        if isinstance(value, dict):
+            for pattern, action in value.items():
+                _add(_opencode_rule_to_claude(tool, pattern, action), action)
+        else:
+            _add(_opencode_rule_to_claude(tool, None, value), value)
+    for rules in out.values():
+        rules.sort()
     return {k: v for k, v in out.items() if v}
 
 
+def _claude_rule_to_opencode(rule: str):
+    """Split a Claude rule into (tool, pattern or None)."""
+    rule = str(rule).strip()
+    if "(" in rule and rule.endswith(")"):
+        base, pattern = rule.split("(", 1)
+        return base.strip(), pattern[:-1]
+    return rule, None
+
+
 def claude_permissions_to_opencode(perms: dict) -> dict:
-    """Convert OpenClaude permissions to OpenCode dictionary format."""
-    out = {}
+    """Convert OpenClaude permissions to OpenCode dictionary format.
+
+    deny takes precedence over ask, which takes precedence over allow
+    (Claude Code evaluates rules in that order).
+    """
+    out: Dict[str, Any] = {}
     if not isinstance(perms, dict):
         return out
-    for cmd in perms.get("allow", []):
-        out[str(cmd)] = "allow"
-    for cmd in perms.get("deny", []):
-        out[str(cmd)] = "deny"
-    for cmd in perms.get("ask", []):
-        out[str(cmd)] = "ask"
+    # Claude evaluates deny, then ask, then allow: write in that order and keep
+    # the strongest action per rule so deny is never downgraded to ask/allow.
+    for bucket in ("deny", "ask", "allow"):
+        rules = perms.get(bucket, [])
+        if isinstance(rules, str) or not isinstance(rules, (list, tuple)):
+            continue
+        for rule in rules:
+            base, pattern = _claude_rule_to_opencode(rule)
+            tool = _CLAUDE_RULE_TO_OC_TOOL.get(base.lower())
+            if tool is None:
+                tool = base
+            if pattern is None:
+                if not isinstance(out.get(tool), dict):
+                    out[tool] = bucket
+            else:
+                nested = out.get(tool)
+                if not isinstance(nested, dict):
+                    if nested in ("allow", "ask", "deny"):
+                        # keep the tool-wide rule and add the narrower pattern
+                        nested = {"*": nested}
+                    else:
+                        nested = {}
+                    out[tool] = nested
+                nested.setdefault(pattern, bucket)
     return out
 
 
@@ -208,36 +308,51 @@ def import_from_omp(
     if not isinstance(omp_data, dict):
         return {}
 
-    comps = set(selected_components or ["providers", "mcp_servers", "plugins", "permissions", "prompts", "settings"])
+    if selected_components is None:
+        comps = {"providers", "mcp_servers", "plugins", "permissions", "prompts", "settings"}
+    else:
+        comps = set(selected_components)
     result: Dict[str, Any] = {}
 
+    def _has(key: str) -> bool:
+        """A selected component is transferred only when the bundle carries data for it."""
+        if key not in comps:
+            return False
+        val = omp_data.get(key)
+        if isinstance(val, (dict, list, str)):
+            return bool(val)
+        return val is not None
     if target == "opencode":
-        if "providers" in comps and "providers" in omp_data and isinstance(omp_data["providers"], dict):
+        if _has("providers") and isinstance(omp_data["providers"], dict):
             result["provider"] = json.loads(json.dumps(omp_data["providers"]))
-        if "mcp_servers" in comps and "mcp_servers" in omp_data and isinstance(omp_data["mcp_servers"], dict):
+        if _has("mcp_servers") and isinstance(omp_data["mcp_servers"], dict):
             result["mcp"] = json.loads(json.dumps(omp_data["mcp_servers"]))
-        if "plugins" in comps and "plugins" in omp_data:
+        if _has("plugins"):
             result["plugin"] = json.loads(json.dumps(omp_data["plugins"]))
-        if "permissions" in comps and "permissions" in omp_data and isinstance(omp_data["permissions"], dict):
+        if _has("permissions") and isinstance(omp_data["permissions"], dict):
             result["permission"] = json.loads(json.dumps(omp_data["permissions"]))
-        if "prompts" in comps and "prompts" in omp_data and isinstance(omp_data["prompts"], dict):
+        if _has("prompts") and isinstance(omp_data["prompts"], dict):
             if "instructions" in omp_data["prompts"]:
                 result["instructions"] = omp_data["prompts"]["instructions"]
-        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+        if _has("settings") and isinstance(omp_data["settings"], dict):
             if "tui" in omp_data["settings"]:
                 result["tui"] = json.loads(json.dumps(omp_data["settings"]["tui"]))
 
     elif target == "openclaude_global":
-        if "mcp_servers" in comps and "mcp_servers" in omp_data and isinstance(omp_data["mcp_servers"], dict):
-            result["mcpServers"] = opencode_mcp_to_claude_mcp(omp_data["mcp_servers"])
-        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+        if _has("mcp_servers") and isinstance(omp_data["mcp_servers"], dict):
+            servers = opencode_mcp_to_claude_mcp(omp_data["mcp_servers"])
+            if servers:
+                result["mcpServers"] = servers
+        if _has("settings") and isinstance(omp_data["settings"], dict):
             if "claude_provider_profiles" in omp_data["settings"]:
                 result["providerProfiles"] = json.loads(json.dumps(omp_data["settings"]["claude_provider_profiles"]))
 
     elif target == "openclaude_settings":
-        if "permissions" in comps and "permissions" in omp_data and isinstance(omp_data["permissions"], dict):
-            result["permissions"] = opencode_permissions_to_claude(omp_data["permissions"])
-        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+        if _has("permissions") and isinstance(omp_data["permissions"], dict):
+            perms = opencode_permissions_to_claude(omp_data["permissions"])
+            if perms:
+                result["permissions"] = perms
+        if _has("settings") and isinstance(omp_data["settings"], dict):
             if "env" in omp_data["settings"]:
                 result["env"] = json.loads(json.dumps(omp_data["settings"]["env"]))
 

@@ -44,6 +44,10 @@ featuring schema validation, import/export, and advanced model management.
   **Status** column marks each row `new`/`existing`, configured specs are never overwritten,
   an opt-in **Sync** checkbox removes models the API no longer lists, and freshly added models
   are catalog-normalized immediately.
+- **Soft-delete providers**: *Remove* moves a provider into the editor's own
+  `~/.config/opencode-config-editor/deleted-providers.json` (mode 0600, it holds API keys)
+  instead of flagging it inside `opencode.json`; it leaves the config file on the next Save.
+  Tick **Show deleted** to *Restore* it or *Delete permanently* (cannot be undone).
 - **Undo/Redo**: Full history support for all operations (100 steps limit).
 - **Bulk Operations**: Enable/disable plugins and MCP servers in batches.
 
@@ -98,14 +102,14 @@ or find "OpenCode Config Editor" in your application menu.
 **Customization:**
 
 ```bash
-# Install from a different repo
-REPO=<owner/repo> sudo bash install.sh --remote
+# Install from a different repo (use flags so it works through sudo)
+sudo bash install.sh --remote --repo <owner/repo>
 
 # Install a specific version (default: latest)
-VERSION=4.0.1 sudo bash install.sh --remote
+sudo bash install.sh --remote --version 4.0.1
 
 # Skip dependency installation
-NO_DEPS=1 sudo bash install.sh --remote
+sudo bash install.sh --remote --no-deps
 ```
 
 **Full help:** `bash install.sh --help`
@@ -177,7 +181,9 @@ The config directory can be redirected with `OPENCLAUDE_CONFIG_DIR` (or legacy
   (`enableAllProjectMcpServers`, `enabled/disabledMcpjsonServers`). Text fields show the
   **inherited** value as a grey placeholder so you can tell which layer a value came from.
 - **Agent Models** — `providerProfiles` (apiKey masked), active-provider picker, fallback
-  chain, agent routing.
+  chain, agent routing. *Remove selected* moves providers into
+  `~/.config/opencode-config-editor/deleted-providers.json` instead of keeping them in
+  `~/.openclaude.json`; tick **Show deleted** to *Restore selected* or *Delete permanently*.
 - **MCP** — all four scopes: `user` → global file, `project` → `.mcp.json`, `local` →
   `projects[file dict].mcpServers`, `policy` → read-only. Edit transport (stdio/http),
   command/url, **args**, env and headers (env/headers are masked since they usually carry

@@ -30,11 +30,13 @@ import urllib.parse
 import ipaddress
 import socket
 import html
+import csv
+import shlex
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from PySide6.QtCore import (
@@ -51,7 +53,7 @@ try:
         QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QSplitter,
         QComboBox, QMessageBox, QFileDialog, QDialogButtonBox, QGroupBox,
         QHeaderView, QToolBar, QDialog, QFrame, QInputDialog,
-        QScrollArea
+        QScrollArea, QGridLayout, QProgressBar
     )
     HAS_QT = True
 except ImportError as _e:
@@ -79,6 +81,7 @@ except ImportError as _e:
     QListWidget = QListWidgetItem = QTreeWidget = QTreeWidgetItem = QSplitter = _DummyQt
     QComboBox = QMessageBox = QFileDialog = QDialogButtonBox = QGroupBox = _DummyQt
     QHeaderView = QToolBar = QDialog = QFrame = QInputDialog = QScrollArea = _DummyQt
+    QGridLayout = QProgressBar = _DummyQt
 
 try:
     import jsonschema
@@ -95,6 +98,9 @@ TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
 SCHEMA_CACHE = USER_CONFIG_DIR / "config-schema.json"
 TUI_SCHEMA_CACHE = USER_CONFIG_DIR / "tui-schema.json"
 PLUGIN_STATE_CACHE = USER_CONFIG_DIR / "plugin-state.json"
+# Soft-deleted providers (opencode + openclaude), kept OUT of the agent config:
+# {str(config_path): {provider_key: entry}}. Holds API keys; written 0600.
+PROVIDER_TRASH_FILE = USER_CONFIG_DIR / "deleted-providers.json"
 SETTINGS_FILE = USER_CONFIG_DIR / "settings.ini"
 CATALOG_CACHE = USER_CONFIG_DIR / "catalog.json"
 CUSTOM_MODELS_FILE = USER_CONFIG_DIR / "custom_models.json"
@@ -364,7 +370,12 @@ class JSONHighlighter(QSyntaxHighlighter):
 
 def strip_jsonc(text: str) -> str:
     """Strip JavaScript-style comments (//... and /*...*/) and trailing commas
-    from a JSON string without breaking string literals."""
+    from a JSON string without breaking string literals.
+
+    A trailing comma is dropped only when the next significant character
+    (outside strings and comments) is `}` or `]`, so anything json.loads
+    accepts round-trips to the same value.
+    """
     if not text:
         return ""
     out = []
@@ -372,6 +383,14 @@ def strip_jsonc(text: str) -> str:
     n = len(text)
     in_string = False
     escape = False
+    # Index in out[] holding a ',' that may turn out to be a trailing comma.
+    pending_comma = -1
+
+    def drop_pending_comma():
+        nonlocal pending_comma
+        if pending_comma >= 0:
+            out[pending_comma] = " "
+            pending_comma = -1
 
     while i < n:
         c = text[i]
@@ -387,6 +406,7 @@ def strip_jsonc(text: str) -> str:
         else:
             if c == '"':
                 in_string = True
+                pending_comma = -1  # a string value confirms the comma is not trailing
                 out.append(c)
                 i += 1
             elif c == '/' and i + 1 < n and text[i + 1] == '/':
@@ -398,20 +418,35 @@ def strip_jsonc(text: str) -> str:
                 while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
                     i += 1
                 i += 2
+            elif c == ',':
+                out.append(c)
+                pending_comma = len(out) - 1
+                i += 1
+            elif c in ' \t\r\n':
+                # Whitespace can never confirm a trailing comma on its own.
+                out.append(c)
+                i += 1
             else:
+                if c in '}]':
+                    drop_pending_comma()
+                else:
+                    pending_comma = -1
                 out.append(c)
                 i += 1
 
-    clean = "".join(out)
-    clean = re.sub(r',\s*(\}|\])', r'\1', clean)
-    return clean
+    return "".join(out)
 
 
 def loads_jsonc(text: str):
-    """Parse a JSON or JSONC string, accepting comments and trailing commas."""
+    """Parse a JSON or JSONC string, accepting a leading BOM, comments and
+    trailing commas."""
     if not isinstance(text, str):
         raise TypeError(f"Expected string, got {type(text)}")
+    if text.startswith("\ufeff"):
+        text = text[1:]
     return json.loads(strip_jsonc(text))
+
+
 
 
 def section(cfg_data, key: str) -> dict:
@@ -515,7 +550,8 @@ class ConfigFile:
     def load(self) -> bool:
         """Load config file with error handling"""
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
+            # utf-8-sig: a UTF-8 BOM (common from Windows editors) must still load.
+            with open(self.path, "r", encoding="utf-8-sig") as f:
                 raw = f.read()
             self.data = loads_jsonc(raw)
             self.error = None
@@ -526,6 +562,9 @@ class ConfigFile:
             return False
         except json.JSONDecodeError as e:
             self.error = f"Invalid JSON: {e}"
+            return False
+        except UnicodeDecodeError as e:
+            self.error = f"Not a UTF-8 text file: {e}"
             return False
         except OSError as e:
             self.error = f"Read error: {e}"
@@ -564,16 +603,28 @@ class ConfigFile:
             atomic_write_json(self.path, content)
 
             self.data = data
+            if self.kind == "opencode":
+                self._prune_provider_trash(data)
             return True, f"Saved to {self.path}"
         except OSError as e:
             return False, f"Save error: {e}"
+
+    def _prune_provider_trash(self, data: dict):
+        """Drop trash entries for providers present in the just-saved file
+        (restored, or re-added). Best-effort: never changes the save result."""
+        present = section(data, "provider").keys()
+        if not present:
+            return
+        try:
+            ProviderTrashStore().prune(self.path, present)
+        except Exception:
+            pass
 
     def export(self, path: Path) -> Tuple[bool, str]:
         """Export config to specified path"""
         try:
             content = json.dumps(self.data, indent=2, ensure_ascii=False) + "\n"
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+            atomic_write_json(path, content)
             return True, f"Exported to {path}"
         except OSError as e:
             return False, f"Export error: {e}"
@@ -583,9 +634,10 @@ class Validator:
 
     def __init__(self):
         self.schemas = {}  # kind -> schema dict
-        self.schema_error = None
-        self.last_schema_fetch = 0
+        self.last_schema_fetch = {}  # kind -> timestamp of last successful load
         self.schema_cache_duration = 86400  # 24 hours
+        self.schema_errors = {}  # kind -> error message
+        self.last_fetch_attempt = {}  # kind -> timestamp of last fetch attempt
 
     def _schema_source(self, kind: str) -> Tuple[str, Path]:
         """Return (url, cache_path) for the given config kind."""
@@ -607,43 +659,65 @@ class Validator:
             return None
 
         current_time = time.time()
-        if self.schemas.get(kind) is not None and (current_time - self.last_schema_fetch) < self.schema_cache_duration:
+        # Per-kind timestamps: a failed tui fetch must not suppress a valid
+        # cached opencode schema, and vice versa.
+        last_ok = self.last_schema_fetch.get(kind, 0)
+        last_try = self.last_fetch_attempt.get(kind, 0)
+
+        if self.schemas.get(kind) is not None and (current_time - last_ok) < self.schema_cache_duration:
             return self.schemas[kind]
 
-        if self.schema_error is not None and (current_time - self.last_schema_fetch) < 3600:  # 1 hour
-            return None
-
-        data = None
+        # Try the on-disk cache. It is always usable; it is only *authoritative*
+        # while fresh, so a stale cache still keeps validating when a fetch fails.
+        cached = None
         try:
-            # Try cache first
             if cache_path.exists():
-                data = json.loads(cache_path.read_text())
-                self.schemas[kind] = data
-                self.last_schema_fetch = current_time
-                return data
+                cached = json.loads(cache_path.read_text())
+                if not (isinstance(cached, dict) and cached):
+                    cached = None
         except Exception:
-            pass
+            cached = None
+
+        # Avoid hammering a failed endpoint, but keep serving the last valid
+        # disk cache during the backoff window.
+        if self.schema_errors.get(kind) and (current_time - last_try) < 3600:
+            return cached
+
+        if cached is not None and (current_time - cache_path.stat().st_mtime) < self.schema_cache_duration:
+            self.schemas[kind] = cached
+            self.last_schema_fetch[kind] = current_time
+            self.schema_errors.pop(kind, None)
+            return cached
 
         # Fetch from network
         try:
             req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
             with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read().decode("utf-8"))
+                fetched = json.loads(r.read().decode("utf-8"))
+
+            # Accept both ordinary object schemas and the real opencode schema,
+            # whose root delegates through $ref/$defs and has no root `type`.
+            is_schema = (isinstance(fetched, dict) and bool(fetched) and
+                         (fetched.get("type") == "object" or "$ref" in fetched or "$defs" in fetched))
+            if not is_schema:
+                raise ValueError("response is not a JSON Schema object")
 
             # Save to cache
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache_path.write_text(json.dumps(data))
+                cache_path.write_text(json.dumps(fetched))
             except OSError:
                 pass
 
-            self.schemas[kind] = data
-            self.last_schema_fetch = current_time
-            return data
+            self.schemas[kind] = fetched
+            self.last_schema_fetch[kind] = current_time
+            self.schema_errors.pop(kind, None)
+            return fetched
         except Exception as e:
-            self.schema_error = f"Could not fetch schema: {e}"
-            self.last_schema_fetch = current_time
-            return None
+            self.schema_errors[kind] = f"Could not fetch schema: {e}"
+            self.last_fetch_attempt[kind] = current_time
+            # Keep serving the last good schema rather than dropping validation.
+            return cached
 
     def validate(self, data: dict, kind: str, known_keys: set = None) -> Tuple[bool, List[str], List[str]]:
         """Validate config.
@@ -688,6 +762,8 @@ class Validator:
 
         if "mcp" in data and not isinstance(data["mcp"], dict):
             errors.append("'mcp' must be an object.")
+            # Non-dict 'mcp' is already a hard error; iterating it would raise.
+            return False, errors
 
         if "plugin" in data and not isinstance(data["plugin"], list):
             errors.append("'plugin' must be an array.")
@@ -717,6 +793,46 @@ def _path_of(e) -> str:
     except Exception:
         return "?"
 
+
+def _merge_legacy_plugin_state(new_path: Path, legacy_name: str) -> None:
+    """Fold the v4.4.0 ~/.cache plugin-state file into the current store.
+
+    Entries already present in `new_path` win. The legacy file is renamed to
+    `<name>.migrated` (never deleted) so the merge is idempotent and a failure
+    leaves the original data in place. Best-effort: never raises.
+    """
+    legacy = Path.home() / ".cache" / APP_NAME / legacy_name
+    try:
+        if not legacy.is_file():
+            return
+        old = loads_jsonc(legacy.read_text(encoding="utf-8"))
+        current = (loads_jsonc(new_path.read_text(encoding="utf-8"))
+                   if new_path.is_file() else {})
+        if not isinstance(old, dict) or not isinstance(current, dict):
+            return
+        merged = dict(current)
+        changed = False
+        for cfg_path, bucket in old.items():
+            if not isinstance(bucket, dict):
+                continue
+            target = merged.get(cfg_path)
+            if not isinstance(target, dict):
+                merged[cfg_path] = dict(bucket)
+                changed = True
+                continue
+            for name, entry in bucket.items():
+                if name not in target:
+                    target[name] = entry
+                    changed = True
+        if changed:
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                new_path, json.dumps(merged, indent=2, ensure_ascii=False) + "\n")
+        legacy.replace(legacy.with_name(legacy.name + ".migrated"))
+    except Exception:
+        pass
+
+
 class PluginStateStore:
     """Remember disabled opencode plugins in the editor cache, keying each by name and
     storing its full entry so re-enabling restores tuple-form options verbatim."""
@@ -724,6 +840,7 @@ class PluginStateStore:
     def __init__(self):
         self.path = PLUGIN_STATE_CACHE
         self._data = {}
+        _merge_legacy_plugin_state(self.path, "plugin-state.json")
         self._load()
 
     def _load(self):
@@ -811,6 +928,81 @@ class PluginStateStore:
             self._data[key] = d
         self._save()
 
+class ProviderTrashStore:
+    """Soft-deleted providers, kept in the editor's own app-data dir instead of
+    the agent config: {str(config_path): {provider_key: entry}}.
+
+    Unlike PluginStateStore this file is the ONLY copy of deleted provider data
+    (API keys included), so: it is re-read on every operation (two windows
+    never clobber each other), written atomically via mkstemp (mode 0600), and
+    write errors raise OSError. An unreadable/invalid file reads as empty but
+    every mutation raises and leaves it untouched; it is never overwritten.
+    """
+
+    def __init__(self, path=None):
+        self.path = Path(path) if path else PROVIDER_TRASH_FILE
+
+    def _read(self) -> dict:
+        """Whole store; {} when absent. Raises OSError when unreadable/invalid."""
+        try:
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError as e:     # JSONDecodeError / UnicodeDecodeError
+            raise OSError(f"Invalid trash file {self.path}: {e}") from e
+        if not isinstance(data, dict):
+            raise OSError(f"Invalid trash file {self.path}: root is not a JSON object")
+        return data
+
+    def _write(self, data: dict):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    def entries(self, cfg_path) -> dict:
+        """Deep copy of {key: entry} for one config file ({} on any read problem)."""
+        try:
+            bucket = self._read().get(str(cfg_path))
+        except OSError:
+            return {}
+        return copy.deepcopy(bucket) if isinstance(bucket, dict) else {}
+
+    def put(self, cfg_path, key: str, entry):
+        data = self._read()
+        bucket = data.setdefault(str(cfg_path), {})
+        if not isinstance(bucket, dict):
+            raise OSError(f"Invalid trash file {self.path}: entry for {cfg_path} is not an object")
+        bucket[key] = entry
+        self._write(data)
+
+    def discard(self, cfg_path, key: str):
+        data = self._read()
+        bucket = data.get(str(cfg_path))
+        if not isinstance(bucket, dict) or key not in bucket:
+            return
+        del bucket[key]
+        if not bucket:
+            del data[str(cfg_path)]
+        self._write(data)
+
+    def prune(self, cfg_path, present_keys) -> int:
+        """Drop entries whose key is in `present_keys`; write only on change."""
+        data = self._read()
+        bucket = data.get(str(cfg_path))
+        if not isinstance(bucket, dict):
+            return 0
+        present = set(present_keys)
+        stale = [k for k in bucket if k in present]
+        if not stale:
+            return 0
+        for k in stale:
+            del bucket[k]
+        if not bucket:
+            del data[str(cfg_path)]
+        self._write(data)
+        return len(stale)
+
 class TuiPluginStateStore:
     """Remember disabled tui plugins in the editor cache, keying each by name and
     storing its full entry so re-enabling restores tuple-form options verbatim."""
@@ -818,6 +1010,7 @@ class TuiPluginStateStore:
     def __init__(self):
         self.path = USER_CONFIG_DIR / "tui-plugin-state.json"
         self._data = {}
+        _merge_legacy_plugin_state(self.path, "tui-plugin-state.json")
         self._load()
 
     def _load(self):
@@ -905,22 +1098,62 @@ def _looks_like_mcp_cfg(v) -> bool:
     """Check if object looks like an MCP config"""
     return isinstance(v, dict) and any(k in v for k in ("type", "command", "url", "enabled"))
 
+
+def _is_opencode_mcp_cfg(v) -> bool:
+    """True for an entry already in opencode's own mcp shape.
+
+    opencode uses type:local with an argv list, or type:remote with a url.
+    Claude Desktop / Cursor instead use a bare 'command' string plus 'args'
+    (and 'env'), or a bare 'url' with no type, which opencode does not accept.
+    """
+    if not _looks_like_mcp_cfg(v):
+        return False
+    if v.get("type") in ("local", "remote"):
+        return True
+    if "command" in v or "url" in v or "args" in v:
+        return False
+    return True   # toggle-only entry, e.g. {"enabled": false}
+
+
 def parse_mcp_import(obj: dict) -> dict:
-    """Parse MCP import from various JSON formats"""
-    if isinstance(obj, dict) and isinstance(obj.get("mcp"), dict) and obj["mcp"]:
+    """Parse MCP import from various JSON formats.
+
+    Accepts opencode entries as-is, and converts Claude Desktop / Cursor
+    entries (bare 'command' + 'args' + 'env', or a bare 'url') through
+    claude_mcp_to_opencode_mcp so the result always matches opencode's schema.
+    """
+    if isinstance(obj, dict) and isinstance(obj.get("mcpServers"), dict) and obj["mcpServers"]:
+        obj = obj["mcpServers"]
+    elif isinstance(obj, dict) and isinstance(obj.get("mcp"), dict) and obj["mcp"]:
         obj = obj["mcp"]
 
-    if isinstance(obj, dict) and obj and all(_looks_like_mcp_cfg(v) for v in obj.values()):
-        return obj
+    if isinstance(obj, dict) and obj and all(isinstance(v, dict) for v in obj.values()):
+        converted = {}
+        for name, entry in obj.items():
+            if _is_opencode_mcp_cfg(entry):
+                converted[name] = entry
+            else:
+                item = claude_mcp_to_opencode_mcp({name: entry})
+                if name not in item:
+                    raise ValueError(f"Unrecognized MCP server entry: {name}")
+                converted[name] = item[name]
+        return converted
 
     if _looks_like_mcp_cfg(obj):
-        key = _slugify(obj.get("name") or obj.get("id") or "server")
-        cfg = {k: v for k, v in obj.items() if k not in ("name", "id")}
-        return {key: cfg}
+        if _is_opencode_mcp_cfg(obj):
+            key = _slugify(obj.get("name") or obj.get("id") or "server")
+            cfg = {k: v for k, v in obj.items() if k not in ("name", "id")}
+            return {key: cfg}
+        converted = claude_mcp_to_opencode_mcp({"server": obj})
+        if converted:
+            key = _slugify(obj.get("name") or obj.get("id") or "server")
+            return {key: converted["server"]}
 
     raise ValueError(
-        "Unrecognized MCP JSON. Expected a server object or a {name: server} map."
+        "Unrecognized MCP JSON. Expected a server object, a {name: server} "
+        "map, a 'mcpServers' wrapper, or a full config with 'mcp'."
     )
+
 
 def merge_dict(base: dict, incoming: dict) -> dict:
     """Merge two configs with special handling for models/options"""
@@ -971,8 +1204,12 @@ class ModelCatalog:
         self._load_pattern_rules()
 
     def loaded(self) -> bool:
-        """Check if catalog is loaded (including custom models)."""
-        return self.raw is not None or bool(self.custom_models)
+        """Check if a base catalog (file, cache, bundle or pasted text) is loaded.
+
+        Custom models alone do not count: they overlay whatever base catalog is
+        active, and every lazy-load guard must still pull in the base catalog.
+        """
+        return self.raw is not None
 
     def load(self, path: Path):
         """Load catalog from file"""
@@ -994,40 +1231,65 @@ class ModelCatalog:
             if CUSTOM_MODELS_FILE.exists():
                 data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
+                    if self.raw is None:
+                        # No base catalog: the indexes hold nothing but custom
+                        # entries, so rebuild them instead of overlaying twice.
+                        self.by_provider = {}
+                        self.flat = {}
+                        self._model_index = {}
+                        self.normalized_index = {}
                     self._apply_custom_models_dict(data)
         except Exception:
             pass
 
     def _apply_custom_models_dict(self, data: dict):
-        """Merge custom models dict with high priority into catalog."""
+        """Merge custom models dict with high priority into catalog.
+
+        Entries are classified one by one: a `{provider: {"models": {...}}}`
+        group, a top-level `{"id":..., "models": {...}}` group and a flat
+        `{model_id: spec}` entry can coexist in the same file. Non-object values
+        are skipped instead of disabling every custom model.
+        """
         self.custom_models = {}
         self.custom_by_provider = {}
 
         flat_custom = {}
         by_prov = {}
 
-        if all(isinstance(v, dict) and "models" in v for v in data.values()):
-            for pid, pdata in data.items():
-                models = pdata.get("models", {})
-                if isinstance(models, dict):
-                    by_prov[pid] = models
-                    for mid, spec in models.items():
-                        flat_custom[mid] = spec
-        elif "models" in data and isinstance(data["models"], dict):
-            pid = data.get("id") or "custom"
-            by_prov[pid] = data["models"]
-            flat_custom.update(data["models"])
-        elif all(isinstance(v, dict) for v in data.values()):
-            for mid, spec in data.items():
-                pid = spec.get("provider") or "custom"
-                by_prov.setdefault(pid, {})[mid] = spec
-                flat_custom[mid] = spec
+        top_models = data.get("models")
+        if isinstance(top_models, dict):
+            pid = data.get("id") if isinstance(data.get("id"), str) else "custom"
+            for mid, spec in top_models.items():
+                if isinstance(spec, dict):
+                    by_prov.setdefault(pid, {})[mid] = spec
+                    flat_custom[mid] = spec
+
+        for mid, value in data.items():
+            if mid == "models":
+                continue
+            if not isinstance(value, dict):
+                continue
+            inner = value.get("models")
+            if isinstance(inner, dict):
+                pid = str(mid)
+                for sub_id, sub_spec in inner.items():
+                    if isinstance(sub_spec, dict):
+                        by_prov.setdefault(pid, {})[sub_id] = sub_spec
+                        flat_custom[sub_id] = sub_spec
+                continue
+            pid = value.get("provider") if isinstance(value.get("provider"), str) else "custom"
+            by_prov.setdefault(pid, {})[mid] = value
+            flat_custom[mid] = value
 
         self.custom_models = flat_custom
         self.custom_by_provider = by_prov
 
         # Overlay on active index
-        for pid, models in by_prov.items():
+        self._overlay_custom_models()
+
+    def _overlay_custom_models(self):
+        """Overlay the current custom models onto the active catalog indexes."""
+        for pid, models in self.custom_by_provider.items():
             if pid not in self.by_provider:
                 self.by_provider[pid] = {}
             for mid, spec in models.items():
@@ -1049,6 +1311,19 @@ class ModelCatalog:
 
         self._formats_cache = None
 
+    def _reload_after_custom_change(self):
+        """Rebuild the indexes after custom models were added/removed on disk."""
+        if self.raw is not None:
+            self._ingest(self.raw)
+            return
+        # No base catalog: rebuild from scratch out of the file on disk, so a
+        # deleted or renamed model leaves no stale index entry behind.
+        self.by_provider = {}
+        self.flat = {}
+        self._model_index = {}
+        self.normalized_index = {}
+        self._load_custom_models()
+
     def _load_pattern_rules(self):
         """Load pattern rules from PATTERN_RULES_FILE."""
         try:
@@ -1064,48 +1339,58 @@ class ModelCatalog:
         model_id = str(model_id).strip()
         if not model_id:
             return False
-        current = self.get_all_custom_models()
+        try:
+            current = self.get_all_custom_models()
+        except ValueError:
+            return False
         spec_copy = dict(spec)
         spec_copy["provider"] = provider
         current[model_id] = spec_copy
 
         try:
             CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-            if self.raw:
-                self._ingest(self.raw)
-            else:
-                self._load_custom_models()
+            atomic_write_json(
+                CUSTOM_MODELS_FILE,
+                json.dumps(current, indent=2, ensure_ascii=False),
+            )
+            self._reload_after_custom_change()
             return True
-        except OSError:
+        except (OSError, ValueError):
             return False
 
     def delete_custom_model(self, model_id: str) -> bool:
         """Delete a custom model from CUSTOM_MODELS_FILE."""
-        current = self.get_all_custom_models()
+        try:
+            current = self.get_all_custom_models()
+        except ValueError:
+            return False
         if model_id in current:
             current.pop(model_id, None)
             try:
-                CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-                if self.raw:
-                    self._ingest(self.raw)
-                else:
-                    self.custom_models.pop(model_id, None)
-                    self._formats_cache = None
+                atomic_write_json(
+                    CUSTOM_MODELS_FILE,
+                    json.dumps(current, indent=2, ensure_ascii=False),
+                )
+                self._reload_after_custom_change()
                 return True
-            except OSError:
+            except (OSError, ValueError):
                 return False
         return False
 
     def get_all_custom_models(self) -> Dict[str, dict]:
-        """Get dict of all saved custom models."""
-        try:
-            if CUSTOM_MODELS_FILE.exists():
-                data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    return data
-        except Exception:
-            pass
+        """Get dict of all saved custom models.
+
+        Raises ValueError when the file exists but cannot be parsed, so callers
+        never silently write back a truncated dataset and destroy the models
+        they could not read.
+        """
+        if CUSTOM_MODELS_FILE.exists():
+            data = loads_jsonc(CUSTOM_MODELS_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"{CUSTOM_MODELS_FILE.name} must contain a JSON object."
+                )
+            return data
         return dict(self.custom_models)
 
     def save_pattern_rules(self, rules: List[dict]) -> bool:
@@ -1125,7 +1410,12 @@ class ModelCatalog:
         return list(self.pattern_rules)
 
     def fetch_online(self, url: Optional[str] = None) -> Tuple[bool, str, int]:
-        """Download latest catalog from online source, update cache, and reload."""
+        """Download latest catalog from online source, update cache, and reload.
+
+        The download is fully validated before anything is replaced: a failed
+        request, unparseable body or unrecognized catalog shape leaves both the
+        in-memory catalog and the on-disk cache untouched.
+        """
         catalog_url = (url or SettingsManager().get_catalog_url() or DEFAULT_CATALOG_URL).strip()
         try:
             req = urllib.request.Request(
@@ -1138,8 +1428,18 @@ class ModelCatalog:
             if not isinstance(data, dict) or not data:
                 return False, "Downloaded catalog is empty or invalid JSON.", 0
 
+            # Validate the shape on a throwaway catalog first: only a catalog
+            # that ingests cleanly is allowed to overwrite the cache.
+            try:
+                _validate_catalog_data(data)
+            except ValueError as e:
+                return False, f"Downloaded catalog is invalid: {e}", 0
+
             CATALOG_CACHE.parent.mkdir(parents=True, exist_ok=True)
-            CATALOG_CACHE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            atomic_write_json(
+                CATALOG_CACHE,
+                json.dumps(data, indent=2, ensure_ascii=False),
+            )
             self.load(CATALOG_CACHE)
             return True, f"Catalog updated successfully from {catalog_url}!", len(self.flat)
         except Exception as e:
@@ -1147,34 +1447,7 @@ class ModelCatalog:
 
     def _ingest(self, data: dict):
         """Process catalog data and overlay custom models."""
-        if not isinstance(data, dict) or not data:
-            raise ValueError("Catalog JSON must be a non-empty object.")
-
-        by_provider, flat = {}, {}
-
-        # models.dev-style dump: {providerId: {..., "models": {id: spec}}}
-        if all(isinstance(v, dict) and "models" in v for v in data.values()):
-            for pid, pdata in data.items():
-                models = pdata.get("models", {})
-                if isinstance(models, dict):
-                    by_provider[pid] = dict(models)
-                    for mid, spec in models.items():
-                        flat.setdefault(mid, spec)
-
-        # Single provider dump: {"id":..., "models": {...}}
-        elif "models" in data and isinstance(data["models"], dict):
-            pid = data.get("id") or "provider"
-            by_provider[pid] = dict(data["models"])
-            flat.update(data["models"])
-
-        # Flat map: {modelId: spec}
-        elif all(isinstance(v, dict) for v in data.values()):
-            flat.update(data)
-            # Provide a synthetic provider so the normalized formats still work.
-            by_provider["provider"] = dict(data)
-
-        else:
-            raise ValueError("Unrecognized model catalog format.")
+        by_provider, flat = _parse_catalog_data(data)
 
         self.raw, self.by_provider, self.flat = data, by_provider, flat
         self._formats_cache = None
@@ -1243,18 +1516,31 @@ class ModelCatalog:
         return [fmt for pmap in self.formats().values() for fmt in pmap.values()]
 
     def find_model(self, model_id: str) -> List["ModelFormat"]:
-        """Match a model id across the catalog, custom models, and pattern rules."""
-        matches = set()
+        """Match a model id across the catalog, custom models, and pattern rules.
 
-        # 1. Exact match
-        if model_id in self._model_index:
-            matches.add(model_id)
+        An id that exists in the catalog resolves to that entry (and nothing
+        else); otherwise the normalized bucket is searched. Ordering is
+        deterministic, so repeated runs pick the same match.
 
+        `_seen_refs` guards pattern-rule reference lookups against re-entering
+        the rule that is currently being applied.
+        """
+        return self._find_model(model_id, _seen_refs=frozenset())
+
+    def _find_model(self, model_id: str, _seen_refs: frozenset) -> List["ModelFormat"]:
+        # Insertion-ordered dict: a deterministic stand-in for a set.
+        matches = {}
+
+        # 1. Exact match wins outright: never widen an id that exists.
+        # `_model_index` also holds alias keys, which have no format of their
+        # own, so only a real model id short-circuits here.
+        if model_id in self.flat:
+            matches[model_id] = None
         # 2. Full normalized match (most precise).
         full = _normalize_model_id(model_id)
-        if full in self.normalized_index:
+        if not matches and full in self.normalized_index:
             for original_id in self.normalized_index[full]:
-                matches.add(original_id)
+                matches[original_id] = None
 
         # 3. Fallback: version-stripped variants
         if not matches:
@@ -1263,7 +1549,7 @@ class ModelCatalog:
                     continue
                 if key in self.normalized_index:
                     for original_id in self.normalized_index[key]:
-                        matches.add(original_id)
+                        matches[original_id] = None
 
         # 4. Pattern rules match
         if not matches and self.pattern_rules:
@@ -1284,8 +1570,10 @@ class ModelCatalog:
                     ref_prov = rule.get("reference_provider")
                     ref_mod = rule.get("reference_model")
                     ref_fmt = None
-                    if ref_mod:
-                        mod_matches = self.find_model(ref_mod)
+                    if ref_mod and ref_mod not in _seen_refs:
+                        mod_matches = self._find_model(
+                            ref_mod, _seen_refs | {ref_mod, model_id}
+                        )
                         if mod_matches:
                             ref_fmt = mod_matches[0]
                     if ref_fmt is None and ref_prov:
@@ -1695,7 +1983,7 @@ def apply_catalog_to_config(catalog, config_providers: dict, *,
                 report.ambiguous.append((prov_name, mid, matches))
                 continue
 
-            merged = _merge_model_spec(spec, build_spec_from_format(chosen), overwrite)
+            merged = _merge_model_spec(spec, build_spec_from_format(chosen, mid), overwrite)
             changed = merged != (spec or {})
             if changed:
                 models[mid] = merged
@@ -1758,10 +2046,18 @@ _VERSION_SUFFIX = re.compile(
 # Prefixes and suffixes to strip during normalization. Order matters for suffixes.
 _NORM_PREFIXES = ("google/", "google:", "anthropic.", "openai:", "zh-", "en-")
 
-# A leading "namespace" token followed by '/' or ':', e.g. "df/", "anthropic/",
-# "openai:". Stripped so that "df/claude-opus-4.8" collapses to "claude-opus-4.8"
-# and matches catalog entries stored under any other (or no) namespace.
-_NAMESPACE_RE = re.compile(r'^[^/:]+[/:]')
+# A leading "namespace" token followed by '/', e.g. "df/", "anthropic/",
+# "opencode-provider/". Stripped so that "df/claude-opus-4.8" collapses to
+# "claude-opus-4.8" and matches catalog entries stored under any other (or no)
+# namespace.
+#
+# Only a '/' introduces a namespace. A ':' must be kept: in Ollama, Bedrock and
+# OpenRouter ids it separates a model name from a tag or size
+# ("deepseek-r1:free", "amazon.nova-micro-v1:0", "qwen2.5-coder:32b"), and
+# stripping it collapses unrelated families onto the same key.
+_NAMESPACE_RE = re.compile(r'^[^/]+/')
+
+# Same idea for display names: only the path part is a namespace.
 
 # A trailing dotted version (e.g. "4.8", "2.1", "3.5.2") reduced to its major,
 # so "claude-opus-4.8" -> "claude-opus-4" and matches "claude-opus-4".
@@ -1783,8 +2079,8 @@ def _normalize_model_id(mid: str) -> str:
     a leading namespace token, and trailing version/date/general suffixes stripped."""
     s = str(mid).strip().lower().replace("_", "-")
 
-    # Strip leading namespace/provider tokens ("df/", "anthropic:", ...).
-    # Looped so "df/anthropic/claude" -> "anthropic/claude" -> "claude".
+    # Strip leading path namespaces ("df/anthropic/claude" -> "claude").
+    # A trailing ':tag' is part of the model id and is deliberately kept.
     while _NAMESPACE_RE.match(s):
         s = _NAMESPACE_RE.sub("", s, count=1)
 
@@ -1857,9 +2153,14 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     """Try to find a catalog format for an unmatched model id.
 
     Order: (a) exact id within the reference provider, (b) normalized-id
-    match anywhere, (c) normalized-id match within the reference provider,
-    (d) longest shared prefix within the reference provider.
+    match within the reference provider, (c) normalized-id match anywhere,
+    (d) version-stripped variants, (e) longest shared prefix within the
+    reference provider.
     Returns a ModelFormat or None. Never raises on a missing catalog.
+
+    Normalized lookups go through the catalog's `normalized_index` instead of
+    re-normalizing every catalog id: `find_model` has already missed this id
+    there, so a full rescan cannot find anything new.
     """
     if catalog is None or not getattr(catalog, "loaded", lambda: False)():
         return None
@@ -1875,41 +2176,52 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
     if not normalized:
         return None
 
-    # (b) full normalized match within the reference provider first.
-    if reference_provider:
-        for cand_id, fmt in formats.get(reference_provider, {}).items():
-            if _normalize_model_id(cand_id) == normalized:
-                return fmt
+    normalized_index = getattr(catalog, "normalized_index", None)
 
-    # (c) full normalized match anywhere in the catalog.
-    for pid, pmap in formats.items():
-        for cand_id, fmt in pmap.items():
-            if _normalize_model_id(cand_id) == normalized:
-                return fmt
-
-    # (b') version-stripped variants within the reference provider.
-    for key in _normalized_match_keys(mid):
-        if key == normalized:
-            continue
-        if reference_provider:
-            for cand_id, fmt in formats.get(reference_provider, {}).items():
-                if _normalize_model_id(cand_id) == key:
-                    return fmt
-
-    # (c') version-stripped variants anywhere in the catalog.
-    for key in _normalized_match_keys(mid):
-        if key == normalized:
-            continue
+    def _lookup(key, provider=None):
+        """First catalog format whose id (or alias) normalizes to `key`."""
+        if normalized_index is not None:
+            for cand_id in normalized_index.get(key, []):
+                for pid in catalog._model_index.get(cand_id, []):
+                    if provider is not None and pid != provider:
+                        continue
+                    fmt = formats.get(pid, {}).get(cand_id)
+                    if fmt is not None:
+                        return fmt
+            return None
+        # Duck-typed catalogs without an index: fall back to a scan.
         for pid, pmap in formats.items():
+            if provider is not None and pid != provider:
+                continue
             for cand_id, fmt in pmap.items():
                 if _normalize_model_id(cand_id) == key:
                     return fmt
+        return None
 
-    # (d) longest shared prefix within the reference provider
+    # (b) full normalized match within the reference provider first.
+    fmt = _lookup(normalized, reference_provider) if reference_provider else None
+    if fmt is not None:
+        return fmt
+
+
+    # (c) full normalized match anywhere in the catalog.
+    fmt = _lookup(normalized)
+    if fmt is not None:
+        return fmt
+
+    # (d) version-stripped variants, most specific key first.
+    for key in _normalized_match_keys(mid):
+        if key == normalized:
+            continue
+        fmt = _lookup(key)
+        if fmt is not None:
+            return fmt
+
+    # (e) longest shared prefix within the reference provider
     if reference_provider:
         pmap = formats.get(reference_provider, {})
         best, best_len = None, 0
-        for cand_id in pmap:
+        for cand_id, fmt in pmap.items():
             cand_norm = _normalize_model_id(cand_id)
             if not cand_norm:
                 continue
@@ -1921,10 +2233,55 @@ def _find_fallback(mid: str, reference_provider: Optional[str], catalog):
             # Require a meaningful prefix and a remaining "family" shape.
             if common > best_len and common >= min(len(normalized), len(cand_norm)) - 4 \
                     and common >= 4:
-                best, best_len = pmap[cand_id], common
+                best, best_len = fmt, common
         return best
 
     return None
+
+
+def _parse_catalog_data(data: dict):
+    """Split raw catalog JSON into `(by_provider, flat)` model maps.
+
+    Raises ValueError for an empty object or an unrecognized shape, so callers
+    can validate a download before replacing a good cache with it.
+    """
+    if not isinstance(data, dict) or not data:
+        raise ValueError("Catalog JSON must be a non-empty object.")
+
+    by_provider, flat = {}, {}
+
+    # models.dev-style dump: {providerId: {..., "models": {id: spec}}}
+    if all(isinstance(v, dict) and "models" in v for v in data.values()):
+        for pid, pdata in data.items():
+            models = pdata.get("models", {})
+            if isinstance(models, dict):
+                by_provider[pid] = dict(models)
+                for mid, spec in models.items():
+                    flat.setdefault(mid, spec)
+
+    # Single provider dump: {"id":..., "models": {...}}
+    elif "models" in data and isinstance(data["models"], dict):
+        pid = data.get("id") or "provider"
+        by_provider[pid] = dict(data["models"])
+        flat.update(data["models"])
+
+    # Flat map: {modelId: spec}
+    elif all(isinstance(v, dict) for v in data.values()):
+        flat.update(data)
+        # Provide a synthetic provider so the normalized formats still work.
+        by_provider["provider"] = dict(data)
+
+    else:
+        raise ValueError("Unrecognized model catalog format.")
+
+    if not by_provider or not flat:
+        raise ValueError("Catalog contains no models.")
+    return by_provider, flat
+
+
+def _validate_catalog_data(data: dict) -> None:
+    """Raise ValueError unless `data` is a catalog this app can index."""
+    _parse_catalog_data(data)
 
 
 # Provider model-list fetching (adapters, SSRF guard, response parsing)
@@ -2029,7 +2386,9 @@ def apply_fetched_provider(providers, key, selected, base_url="", api_key="",
     """Merge fetched models into providers[key], persisting the endpoint config.
 
     - creates the entry with `npm` when missing (an existing npm is kept)
-    - writes options.baseURL from the URL the models were fetched from
+    - writes options.baseURL from the URL the models were fetched from; an
+      empty base_url (list/catalog formats) never writes and never clears an
+      existing options.baseURL
     - writes options.apiKey only when save_api_key is true and a key was given;
       an existing apiKey is never deleted
     - existing model specs are never overwritten (API listings carry id/name
@@ -2068,6 +2427,56 @@ def apply_fetched_provider(providers, key, selected, base_url="", api_key="",
         if save_api_key and api_key:
             opts["apiKey"] = api_key
     return prov, {"added": sorted(added), "kept": sorted(kept), "removed": removed}
+
+def api_base_url_for(adapter: str, base_url: str) -> str:
+    """The options.baseURL to persist for a fetch, or '' for list formats.
+
+    List/catalog formats (models.dev, generic) fetched a listing URL that is
+    *not* an API base, so nothing is persisted for them. Every API-style
+    format persists its base; for anthropic/gemini the version segment is
+    part of the base the AI SDK expects (Anthropic normalises a bare host,
+    Google does not), so it is added when missing.
+    """
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    preset = FETCH_ADAPTERS.get(adapter, FETCH_ADAPTERS["generic"])
+    if adapter in ("models_dev", "generic"):
+        return ""
+    version = _version_segment(preset["suffix"]) if preset.get("suffix") else ""
+    if not version or _has_version_segment(base, version):
+        return base
+    return f"{base}/{version}"
+
+
+def _version_segment(suffix: str) -> str:
+    """'v1/models' -> 'v1'; '' when the suffix carries no version segment."""
+    first = (suffix or "").strip("/").split("/")[0]
+    return first if re.fullmatch(r"v\d+[a-z0-9]*", first or "") else ""
+
+
+def _has_version_segment(base: str, version: str) -> bool:
+    """True when the last path segment of base already is the version."""
+    path = urllib.parse.urlparse(base).path.rstrip("/")
+    return path.rsplit("/", 1)[-1] == version
+
+
+def _join_fetch_suffix(base: str, suffix: str) -> str:
+    """Append an adapter suffix without duplicating the version segment.
+
+    An SDK base may already carry its version ('https://api.x/v1', '.../v1beta');
+    joining 'v1/models' onto it must yield '.../v1/models', not '.../v1/v1/models'.
+    """
+    base = (base or "").strip().rstrip("/")
+    suffix = (suffix or "").strip().strip("/")
+    if not suffix:
+        return base
+    if base.endswith(suffix):
+        return base
+    version = _version_segment(suffix)
+    if version and _has_version_segment(base, version):
+        return f"{base}/{suffix.split('/', 1)[1]}"
+    return f"{base}/{suffix}"
 
 
 def _is_local_host(host: str) -> bool:
@@ -2113,15 +2522,13 @@ def _validate_fetch_url(url: str, allow_local: bool):
 
 
 def _build_fetch_url(spec: ProviderFetchSpec) -> str:
-    """Combine base_url + adapter suffix (+ query key for Gemini)."""
+    """Combine base_url + adapter suffix (+ query key for Gemini).
+
+    The join is version-aware: a base that already ends in the adapter's
+    version segment ('/v1', '/v1beta') is not doubled.
+    """
     preset = FETCH_ADAPTERS.get(spec.adapter, FETCH_ADAPTERS["generic"])
-    base = spec.base_url.rstrip("/")
-    suffix = preset["suffix"]
-    # Only append the suffix when the base doesn't already include it.
-    if suffix and not base.endswith(suffix.rstrip("/")):
-        url = base + suffix
-    else:
-        url = base
+    url = _join_fetch_suffix(spec.base_url, preset["suffix"])
     if preset["auth"] == "query-key" and spec.api_key:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}key={urllib.parse.quote(spec.api_key)}"
@@ -2208,8 +2615,93 @@ def parse_fetched_models(data, spec: ProviderFetchSpec) -> dict:
     return out
 
 
+MAX_FETCH_PAGES = 20
+
+
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-runs the SSRF guard on every redirect target.
+
+    urllib follows 30x to any host and would replay the Authorization /
+    x-api-key headers. Each hop is re-validated with the same guard, and
+    credentials are stripped when the origin changes.
+    """
+
+    def __init__(self, allow_local: bool):
+        super().__init__()
+        self.allow_local = allow_local
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_fetch_url(newurl, self.allow_local)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        old = urllib.parse.urlparse(req.full_url)
+        target = urllib.parse.urlparse(newurl)
+        if (old.scheme, old.hostname) != (target.scheme, target.hostname):
+            sensitive = {"authorization", "x-api-key", "proxy-authorization", "cookie"}
+            for key in list(new.headers):
+                if key.lower() in sensitive:
+                    new.headers.pop(key, None)
+        return new
+
+
+def _guarded_opener(allow_local: bool):
+    """An opener that applies _GuardedRedirectHandler to every request."""
+    return urllib.request.build_opener(_GuardedRedirectHandler(allow_local))
+
+
+def _next_page_url(data, spec: ProviderFetchSpec, current_url: str) -> str:
+    """URL of the next page, or '' when this was the last one."""
+    if not isinstance(data, dict):
+        return ""
+    parts = urllib.parse.urlsplit(current_url)
+    if spec.adapter == "anthropic":
+        if not data.get("has_more"):
+            return ""
+        token = data.get("last_id") or data.get("after_id")
+        if not token:
+            return ""
+        query = {"before_id": "", "after_id": str(token)}
+    elif spec.adapter == "gemini":
+        token = data.get("nextPageToken")
+        if not token:
+            return ""
+        query = {"pageToken": str(token)}
+    else:
+        return ""
+    params = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))
+    params.update({k: v for k, v in query.items() if v})
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(params),
+         parts.fragment))
+
+
+def _read_page(url, headers, spec, opener):
+    """One HTTP(S) request, through the injected opener or the guarded one."""
+    if opener is not None:
+        raw = opener(url, headers, spec.timeout)
+    else:
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with _guarded_opener(spec.allow_local).open(req, timeout=spec.timeout) as r:
+                raw = r.read()
+        except FetchError:
+            raise
+        except Exception as e:  # urllib raises many subclasses; surface uniformly
+            raise FetchError(f"Request failed: {e}") from e
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise FetchError(f"Response was not valid JSON: {e}") from e
+
+
 def fetch_provider_models(spec: ProviderFetchSpec, *, opener=None) -> dict:
     """Fetch and normalize a provider's model list. Returns {model_id: spec}.
+
+    Follows Anthropic (has_more/last_id) and Gemini (nextPageToken)
+    pagination up to MAX_FETCH_PAGES.
 
     `opener` is an optional callable(url, headers, timeout) -> bytes, injected
     for testing so no real network call is made.
@@ -2218,34 +2710,20 @@ def fetch_provider_models(spec: ProviderFetchSpec, *, opener=None) -> dict:
     _validate_fetch_url(url, spec.allow_local)
     headers = _build_fetch_headers(spec)
 
-    if opener is not None:
-        raw = opener(url, headers, spec.timeout)
-    else:
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=spec.timeout) as r:
-                raw = r.read()
-        except Exception as e:  # urllib raises many subclasses; surface uniformly
-            raise FetchError(f"Request failed: {e}") from e
-
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="replace")
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise FetchError(f"Response was not valid JSON: {e}") from e
-
-    return parse_fetched_models(data, spec)
+    merged: dict = {}
+    for _page in range(MAX_FETCH_PAGES):
+        data = _read_page(url, headers, spec, opener)
+        merged.update(parse_fetched_models(data, spec))
+        next_url = _next_page_url(data, spec, url)
+        if not next_url:
+            return merged
+        _validate_fetch_url(next_url, spec.allow_local)
+        url = next_url
+    return merged
 
 
 # Connectivity and Health Check module for Provider APIs
 # ---------------------------------------------------------------------------
-import json
-import time
-import urllib.parse
-import urllib.request
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 
 
 @dataclass
@@ -2264,6 +2742,64 @@ class ConnectionTestResult:
             count_str = f" ({self.model_count} models found)" if self.model_count is not None else ""
             return f"✓ Connected in {self.latency_ms:.0f}ms{count_str}"
         return f"✗ Failed: {self.message}"
+
+
+
+# opencode config variables: '{env:VAR}' and '{file:path}'
+# https://opencode.ai/docs/config/#variables
+_PLACEHOLDER_RE = re.compile(r"\{(env|file):([^{}]*)\}")
+
+
+def _resolve_one_placeholder(kind: str, arg: str, config_dir: Optional[Path]) -> str:
+    if kind == "env":
+        return os.environ.get(arg, "")
+    path = Path(arg.strip()).expanduser()
+    if not path.is_absolute():
+        path = Path(config_dir) / path
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def resolve_config_placeholders(value: str, config_dir: Optional[Path] = None) -> str:
+    """Expand opencode's {env:VAR} / {file:path} config variables in a string.
+
+    An unset variable or an unreadable file expands to an empty string, as
+    opencode does. Relative {file:} paths resolve against the config file's
+    directory (config_dir); '~' and absolute paths are used as-is.
+    """
+    if not isinstance(value, str) or "{" not in value:
+        return value
+    return _PLACEHOLDER_RE.sub(
+        lambda m: _resolve_one_placeholder(m.group(1), m.group(2), config_dir), value
+    )
+
+
+def _redact_url_secrets(url: str) -> str:
+    """Mask credentials carried in the query string (e.g. Gemini's ?key=)."""
+    return re.sub(r"([?&](?:key|api_key|apikey|token|access_token)=)[^&]*",
+                  r"\1***", url or "")
+
+
+
+def _sanitize_secret(text: str, secret: str) -> str:
+    """Strip the configured key out of text that is shown in the UI.
+
+    urllib echoes the request line and the header block back in its errors (a
+    base URL with a space, a key with a newline), so a bare str(e) can leak
+    the credential into the Diagnostic Log. The key is masked both literally
+    and in the repr-escaped form urllib prints for invalid header values.
+    """
+    out = _redact_url_secrets(text or "")
+    if not secret:
+        return out
+    out = out.replace(secret, "***")
+    for line in secret.splitlines():
+        stripped = line.strip()
+        if len(stripped) >= 4:
+            out = out.replace(stripped, "***")
+    return out
 
 
 def test_provider_connection(
@@ -2295,6 +2831,7 @@ def test_provider_connection(
     )
 
     t0 = time.perf_counter()
+    url = ""
     try:
         url = _build_fetch_url(spec)
         _validate_fetch_url(url, spec.allow_local)
@@ -2329,11 +2866,12 @@ def test_provider_connection(
 
     except FetchError as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
+        text = _sanitize_secret(str(e), spec.api_key)
         return ConnectionTestResult(
             success=False,
             latency_ms=latency_ms,
-            message=str(e),
-            raw_error=str(e),
+            message=text,
+            raw_error=text,
         )
     except urllib.error.HTTPError as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -2343,15 +2881,15 @@ def test_provider_connection(
         elif e.code == 403:
             msg = "HTTP 403: Forbidden (Access denied or insufficient permissions)"
         elif e.code == 404:
-            msg = f"HTTP 404: Endpoint not found ({url})"
+            msg = f"HTTP 404: Endpoint not found ({_redact_url_secrets(url)})"
         elif e.code == 429:
             msg = "HTTP 429: Rate limited or quota exhausted"
         return ConnectionTestResult(
             success=False,
             latency_ms=latency_ms,
             status_code=e.code,
-            message=msg,
-            raw_error=str(e),
+            message=_sanitize_secret(msg, spec.api_key),
+            raw_error=_sanitize_secret(str(e), spec.api_key),
         )
     except urllib.error.URLError as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -2361,21 +2899,19 @@ def test_provider_connection(
         return ConnectionTestResult(
             success=False,
             latency_ms=latency_ms,
-            message=f"Network error: {reason}",
-            raw_error=str(e),
+            message=_sanitize_secret(f"Network error: {reason}", spec.api_key),
+            raw_error=_sanitize_secret(str(e), spec.api_key),
         )
     except Exception as e:
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return ConnectionTestResult(
             success=False,
             latency_ms=latency_ms,
-            message=f"Error: {e}",
-            raw_error=str(e),
+            message=_sanitize_secret(f"Error: {e}", spec.api_key),
+            raw_error=_sanitize_secret(str(e), spec.api_key),
         )
 # MCP Server Templates and Hub Catalog
 # ---------------------------------------------------------------------------
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -2420,7 +2956,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-github"],
         env_keys={"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxxxxxxxxxxx"},
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/github",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/github",
     ),
     MCPTemplate(
         id="brave-search",
@@ -2430,7 +2966,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-brave-search"],
         env_keys={"BRAVE_API_KEY": "BSAxxxxxxxxxxxx"},
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/brave-search",
     ),
     MCPTemplate(
         id="fetch",
@@ -2438,7 +2974,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         category="Data & Web",
         description="Fetch web pages, extract content, and convert HTML to clean markdown for reading.",
         transport_type="local",
-        command=["npx", "-y", "@modelcontextprotocol/server-fetch"],
+        command=["uvx", "mcp-server-fetch"],
         doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
     ),
     MCPTemplate(
@@ -2449,7 +2985,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-postgres", "{connection_string}"],
         default_args=["postgresql://user:password@localhost:5432/my_database"],
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres",
     ),
     MCPTemplate(
         id="sqlite",
@@ -2459,7 +2995,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         transport_type="local",
         command=["uvx", "mcp-server-sqlite", "--db-path", "{db_path}"],
         default_args=["/path/to/database.db"],
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/sqlite",
     ),
     MCPTemplate(
         id="puppeteer",
@@ -2468,7 +3004,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         description="Headless browser automation to interact with dynamic web pages, take screenshots, and execute JavaScript.",
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-puppeteer"],
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/puppeteer",
     ),
     MCPTemplate(
         id="git",
@@ -2487,7 +3023,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         description="Dynamic, multi-step structured reasoning tool for complex problem solving and debugging.",
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/sequential-thinking",
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
     ),
     MCPTemplate(
         id="context7",
@@ -2495,7 +3031,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         category="Developer Tools",
         description="Up-to-date documentation and API reference lookup engine for popular libraries.",
         transport_type="local",
-        command=["npx", "-y", "context7-mcp"],
+        command=["npx", "-y", "@upstash/context7-mcp"],
         doc_url="https://context7.com",
     ),
     MCPTemplate(
@@ -2532,7 +3068,7 @@ def instantiate_opencode_mcp(
     if template.transport_type == "remote":
         res: Dict[str, Any] = {
             "type": "remote",
-            "url": url_value.strip() or template.url,
+            "url": url_value.strip(),
             "enabled": True,
         }
         return res
@@ -2551,7 +3087,10 @@ def instantiate_opencode_mcp(
     }
     clean_env = {k: v.strip() for k, v in env_values.items() if v.strip()}
     if clean_env:
-        config["env"] = clean_env
+        # opencode's McpLocalConfig names this field "environment" (the live
+        # schema at https://opencode.ai/config.json sets additionalProperties:
+        # false, so "env" is dropped silently).
+        config["environment"] = clean_env
 
     return config
 
@@ -2570,7 +3109,7 @@ def instantiate_openclaude_mcp(
     if template.transport_type == "remote":
         return {
             "type": "sse",
-            "url": url_value.strip() or template.url,
+            "url": url_value.strip(),
         }
 
     cmd_list = []
@@ -2607,22 +3146,25 @@ def detect_config_format(data: dict) -> str:
     if data.get("format") == "omp/v1" or ("$schema" in data and "omp" in str(data["$schema"])):
         return "omp"
 
-    if "provider" in data or "tui" in data or "plugin" in data:
+    # opencode.json (and tui.json) markers win over the OpenClaude settings keys,
+    # which overlap (env, model, ...) with other formats.
+    if "provider" in data or "tui" in data or "plugin" in data or "mcp" in data:
         return "opencode"
 
     if "providerProfiles" in data or "activeProviderProfileId" in data:
         return "openclaude_global"
 
-    if "permissions" in data or "modelLimits" in data or "statusLine" in data:
+    _SETTINGS_KEYS = (
+        "permissions", "modelLimits", "statusLine", "env", "hooks", "model",
+        "includeCoAuthoredBy", "forceLoginMethod", "cleanupPeriodDays",
+    )
+    if any(k in data for k in _SETTINGS_KEYS):
         return "openclaude_settings"
 
     if "mcpServers" in data:
         if len(data) == 1:
             return "claude_desktop"
         return "openclaude_global"
-
-    if "mcp" in data:
-        return "opencode"
 
     return "generic"
 
@@ -2641,9 +3183,12 @@ def opencode_mcp_to_claude_mcp(opencode_mcp: dict) -> dict:
         if not isinstance(cfg, dict):
             continue
         stype = cfg.get("type", "local")
+        if cfg.get("enabled") is False:
+            continue
         entry = {}
         if stype == "remote":
-            entry["type"] = "sse"
+            # opencode carries no transport hint; streamable HTTP is the modern default
+            entry["type"] = "http"
             entry["url"] = cfg.get("url", "")
             if "headers" in cfg and isinstance(cfg["headers"], dict):
                 entry["headers"] = dict(cfg["headers"])
@@ -2658,8 +3203,13 @@ def opencode_mcp_to_claude_mcp(opencode_mcp: dict) -> dict:
                 entry["command"] = parts[0]
                 if len(parts) > 1:
                     entry["args"] = parts[1:]
-        if "env" in cfg and isinstance(cfg["env"], dict):
-            entry["env"] = {str(k): str(v) for k, v in cfg["env"].items()}
+            if isinstance(cfg.get("cwd"), str) and cfg["cwd"]:
+                entry["cwd"] = cfg["cwd"]
+        env = cfg.get("environment")
+        if not isinstance(env, dict):
+            env = cfg.get("env")
+        if isinstance(env, dict):
+            entry["env"] = {str(k): str(v) for k, v in env.items()}
         out[name] = entry
     return out
 
@@ -2678,7 +3228,7 @@ def claude_mcp_to_opencode_mcp(claude_mcp: dict) -> dict:
             entry = {
                 "type": "remote",
                 "url": cfg.get("url", ""),
-                "enabled": True,
+                "enabled": bool(cfg.get("enabled", True)),
             }
             if "headers" in cfg and isinstance(cfg["headers"], dict):
                 entry["headers"] = dict(cfg["headers"])
@@ -2691,42 +3241,131 @@ def claude_mcp_to_opencode_mcp(claude_mcp: dict) -> dict:
             entry = {
                 "type": "local",
                 "command": cmd_parts,
-                "enabled": True,
+                "enabled": bool(cfg.get("enabled", True)),
             }
-        if "env" in cfg and isinstance(cfg["env"], dict):
-            entry["env"] = {str(k): str(v) for k, v in cfg["env"].items()}
+            if isinstance(cfg.get("cwd"), str) and cfg["cwd"]:
+                entry["cwd"] = cfg["cwd"]
+        env = cfg.get("env")
+        if isinstance(env, dict):
+            entry["environment"] = {str(k): str(v) for k, v in env.items()}
         out[name] = entry
     return out
 
 
+_OC_TOOL_TO_CLAUDE_RULE = {
+    "read": "Read",
+    "edit": "Edit",
+    "write": "Write",
+    "glob": "Glob",
+    "grep": "Grep",
+    "list": "LS",
+    "bash": "Bash",
+    "task": "Task",
+    "todowrite": "TodoWrite",
+    "webfetch": "WebFetch",
+    "websearch": "WebSearch",
+    "lsp": "LSP",
+    "external_directory": "Read",
+}
+_CLAUDE_RULE_TO_OC_TOOL = {
+    "read": "read",
+    "edit": "edit",
+    "write": "edit",
+    "glob": "glob",
+    "grep": "grep",
+    "ls": "list",
+    "bash": "bash",
+    "task": "task",
+    "todowrite": "todowrite",
+    "webfetch": "webfetch",
+    "websearch": "websearch",
+}
+_PERM_ACTIONS = {
+    "allow": "allow",
+    "true": "allow",
+    "deny": "deny",
+    "false": "deny",
+    "block": "deny",
+    "ask": "ask",
+    "prompt": "ask",
+}
+
+
+def _opencode_rule_to_claude(tool: str, pattern, action: str) -> str:
+    base = _OC_TOOL_TO_CLAUDE_RULE.get(str(tool).lower(), str(tool))
+    if pattern is None:
+        return base
+    return f"{base}({pattern})"
+
+
 def opencode_permissions_to_claude(perms: dict) -> dict:
-    """Convert OpenCode permissions to OpenClaude permissions format."""
+    """Convert OpenCode permissions to OpenClaude permissions format.
+
+    Handles both flat actions ("bash": "allow") and per-pattern rule objects
+    ("bash": {"npm run *": "allow"}).
+    """
     out = {"allow": [], "deny": [], "ask": []}
     if not isinstance(perms, dict):
         return out
 
-    for cmd, action in perms.items():
-        act_str = str(action).lower()
-        if act_str in ("allow", "true"):
-            out["allow"].append(cmd)
-        elif act_str in ("deny", "false", "block"):
-            out["deny"].append(cmd)
-        elif act_str in ("ask", "prompt"):
-            out["ask"].append(cmd)
+    def _add(rule: str, action: str):
+        bucket = _PERM_ACTIONS.get(str(action).lower())
+        if bucket:
+            out[bucket].append(rule)
+
+    for tool, value in perms.items():
+        if isinstance(value, dict):
+            for pattern, action in value.items():
+                _add(_opencode_rule_to_claude(tool, pattern, action), action)
+        else:
+            _add(_opencode_rule_to_claude(tool, None, value), value)
+    for rules in out.values():
+        rules.sort()
     return {k: v for k, v in out.items() if v}
 
 
+def _claude_rule_to_opencode(rule: str):
+    """Split a Claude rule into (tool, pattern or None)."""
+    rule = str(rule).strip()
+    if "(" in rule and rule.endswith(")"):
+        base, pattern = rule.split("(", 1)
+        return base.strip(), pattern[:-1]
+    return rule, None
+
+
 def claude_permissions_to_opencode(perms: dict) -> dict:
-    """Convert OpenClaude permissions to OpenCode dictionary format."""
-    out = {}
+    """Convert OpenClaude permissions to OpenCode dictionary format.
+
+    deny takes precedence over ask, which takes precedence over allow
+    (Claude Code evaluates rules in that order).
+    """
+    out: Dict[str, Any] = {}
     if not isinstance(perms, dict):
         return out
-    for cmd in perms.get("allow", []):
-        out[str(cmd)] = "allow"
-    for cmd in perms.get("deny", []):
-        out[str(cmd)] = "deny"
-    for cmd in perms.get("ask", []):
-        out[str(cmd)] = "ask"
+    # Claude evaluates deny, then ask, then allow: write in that order and keep
+    # the strongest action per rule so deny is never downgraded to ask/allow.
+    for bucket in ("deny", "ask", "allow"):
+        rules = perms.get(bucket, [])
+        if isinstance(rules, str) or not isinstance(rules, (list, tuple)):
+            continue
+        for rule in rules:
+            base, pattern = _claude_rule_to_opencode(rule)
+            tool = _CLAUDE_RULE_TO_OC_TOOL.get(base.lower())
+            if tool is None:
+                tool = base
+            if pattern is None:
+                if not isinstance(out.get(tool), dict):
+                    out[tool] = bucket
+            else:
+                nested = out.get(tool)
+                if not isinstance(nested, dict):
+                    if nested in ("allow", "ask", "deny"):
+                        # keep the tool-wide rule and add the narrower pattern
+                        nested = {"*": nested}
+                    else:
+                        nested = {}
+                    out[tool] = nested
+                nested.setdefault(pattern, bucket)
     return out
 
 
@@ -2805,36 +3444,51 @@ def import_from_omp(
     if not isinstance(omp_data, dict):
         return {}
 
-    comps = set(selected_components or ["providers", "mcp_servers", "plugins", "permissions", "prompts", "settings"])
+    if selected_components is None:
+        comps = {"providers", "mcp_servers", "plugins", "permissions", "prompts", "settings"}
+    else:
+        comps = set(selected_components)
     result: Dict[str, Any] = {}
 
+    def _has(key: str) -> bool:
+        """A selected component is transferred only when the bundle carries data for it."""
+        if key not in comps:
+            return False
+        val = omp_data.get(key)
+        if isinstance(val, (dict, list, str)):
+            return bool(val)
+        return val is not None
     if target == "opencode":
-        if "providers" in comps and "providers" in omp_data and isinstance(omp_data["providers"], dict):
+        if _has("providers") and isinstance(omp_data["providers"], dict):
             result["provider"] = json.loads(json.dumps(omp_data["providers"]))
-        if "mcp_servers" in comps and "mcp_servers" in omp_data and isinstance(omp_data["mcp_servers"], dict):
+        if _has("mcp_servers") and isinstance(omp_data["mcp_servers"], dict):
             result["mcp"] = json.loads(json.dumps(omp_data["mcp_servers"]))
-        if "plugins" in comps and "plugins" in omp_data:
+        if _has("plugins"):
             result["plugin"] = json.loads(json.dumps(omp_data["plugins"]))
-        if "permissions" in comps and "permissions" in omp_data and isinstance(omp_data["permissions"], dict):
+        if _has("permissions") and isinstance(omp_data["permissions"], dict):
             result["permission"] = json.loads(json.dumps(omp_data["permissions"]))
-        if "prompts" in comps and "prompts" in omp_data and isinstance(omp_data["prompts"], dict):
+        if _has("prompts") and isinstance(omp_data["prompts"], dict):
             if "instructions" in omp_data["prompts"]:
                 result["instructions"] = omp_data["prompts"]["instructions"]
-        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+        if _has("settings") and isinstance(omp_data["settings"], dict):
             if "tui" in omp_data["settings"]:
                 result["tui"] = json.loads(json.dumps(omp_data["settings"]["tui"]))
 
     elif target == "openclaude_global":
-        if "mcp_servers" in comps and "mcp_servers" in omp_data and isinstance(omp_data["mcp_servers"], dict):
-            result["mcpServers"] = opencode_mcp_to_claude_mcp(omp_data["mcp_servers"])
-        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+        if _has("mcp_servers") and isinstance(omp_data["mcp_servers"], dict):
+            servers = opencode_mcp_to_claude_mcp(omp_data["mcp_servers"])
+            if servers:
+                result["mcpServers"] = servers
+        if _has("settings") and isinstance(omp_data["settings"], dict):
             if "claude_provider_profiles" in omp_data["settings"]:
                 result["providerProfiles"] = json.loads(json.dumps(omp_data["settings"]["claude_provider_profiles"]))
 
     elif target == "openclaude_settings":
-        if "permissions" in comps and "permissions" in omp_data and isinstance(omp_data["permissions"], dict):
-            result["permissions"] = opencode_permissions_to_claude(omp_data["permissions"])
-        if "settings" in comps and "settings" in omp_data and isinstance(omp_data["settings"], dict):
+        if _has("permissions") and isinstance(omp_data["permissions"], dict):
+            perms = opencode_permissions_to_claude(omp_data["permissions"])
+            if perms:
+                result["permissions"] = perms
+        if _has("settings") and isinstance(omp_data["settings"], dict):
             if "env" in omp_data["settings"]:
                 result["env"] = json.loads(json.dumps(omp_data["settings"]["env"]))
 
@@ -2936,6 +3590,9 @@ class MaskedLineEdit(QWidget):
         # (e.g. env/headers cells whose VALUES may carry API keys).
         self.is_secret = bool(self.SECRET_HINT.search(field_name)) if secret is None else bool(secret)
         self._real_value = str(value) if value is not None else ""
+        # What we last pushed into the line edit; lets _user_modified() tell an
+        # untouched secret apart from a user edit without re-deriving the mask.
+        self._rendered = ""
         self.toggle_btn = None
 
         layout = QHBoxLayout(self)
@@ -2943,7 +3600,8 @@ class MaskedLineEdit(QWidget):
 
         self.edit = QLineEdit()
         self.edit.setPlaceholderText(placeholder)
-        self.edit.setText(self._display_value())
+        self._rendered = self._display_value()
+        self.edit.setText(self._rendered)
         # QLineEdit.textChanged carries a str, but our own textChanged is
         # declared arg-less, so it must NOT be used as the slot directly:
         # PySide6 raises "textChanged() only accepts 0 argument(s), 1 given!"
@@ -2967,9 +3625,14 @@ class MaskedLineEdit(QWidget):
         return self.toggle_btn is not None and self.toggle_btn.isChecked()
 
     def _user_modified(self) -> bool:
-        """True when the edit text differs from the masked rendering of the
-        stored value (i.e. the user typed something)."""
-        return self.edit.text() != _mask(self._real_value)
+        """True when the visible text differs from the last value rendering.
+
+        Tracking the rendering explicitly (rather than recomputing it) is what
+        makes toggling reliable: the eye state has already flipped by the time
+        _toggle_visibility runs, so a recomputed display would compare the text
+        against the wrong side of the toggle.
+        """
+        return self.edit.text() != self._rendered
 
     def _display_value(self) -> str:
         """Get display value (masked if secret)"""
@@ -2978,21 +3641,29 @@ class MaskedLineEdit(QWidget):
         return _mask(self._real_value)
 
     def _toggle_visibility(self, checked: bool):
-        """Toggle visibility without clobbering anything the user typed."""
-        modified = self._user_modified()
-        if checked and not modified and self.edit.text() != self._real_value:
-            self.edit.setText(self._real_value)
-        elif not checked and not modified:
-            self.edit.setText(_mask(self._real_value))
+        """Show/hide the secret without losing a typed edit in either direction.
+
+        The eye state has already flipped when this runs, so _user_modified()
+        compares against the *previous* rendering, and the text the user typed
+        (masked or not) becomes the new value to protect.
+        """
+        if self._user_modified():
+            self._real_value = self.edit.text()
+        self._render()
+
+    def _render(self):
+        """Push the current value into the line edit for the current eye state."""
+        self._rendered = self._display_value()
+        self.edit.setText(self._rendered)
 
     def set_value(self, value):
         """Set value"""
         self._real_value = str(value) if value is not None else ""
-        self.edit.setText(self._display_value())
+        self._render()
 
     def value(self) -> str:
-        """Get current value: what the user typed, or the stored secret while
-        the (untouched) display is still masked."""
+        """Get current value: the stored secret while the (untouched) display is
+        still masked, otherwise what the user typed - masked edits included."""
         if self.is_secret and not self._revealed() and not self._user_modified():
             return self._real_value
         return self.edit.text()
@@ -3508,6 +4179,8 @@ class ModelsManagerDialog(QDialog):
         self.provider_key = provider_key
         self.provider_cfg = provider_cfg
         self.models = dict(provider_cfg.get("models", {})) if isinstance(provider_cfg.get("models"), dict) else {}
+        # Options staged by a Fetch from API, committed only on accept.
+        self._pending_options = None
         self.setWindowTitle(f"Models - {provider_key}")
         self.resize(900, 600)
 
@@ -3564,16 +4237,34 @@ class ModelsManagerDialog(QDialog):
 
         self._update_table()
 
-    def _fetch_from_api(self):
-        """Fetch this provider's model list from its live API endpoint."""
-        self.app.snapshot_state()
-        # Write pending edits through so fetch preview/sync see what the user sees.
-        self.provider_cfg["models"] = dict(self.models)
+    def accept(self):
+        """Commit the working copy: models plus any staged endpoint options."""
+        if self._pending_options is not None:
+            if self._pending_options:
+                self.provider_cfg["options"] = copy.deepcopy(self._pending_options)
+            else:
+                self.provider_cfg.pop("options", None)
+            self._pending_options = None
+        super().accept()
 
-        scope = {self.provider_key: self.provider_cfg}
+    def _fetch_from_api(self):
+        """Fetch this provider's model list from its live API endpoint.
+
+        Nothing here touches the live provider: the fetch runs against a deep
+        copy so that cancelling this dialog (or the Models dialog itself)
+        leaves cfg.data exactly as it was. The result is folded back into
+        self.models, which the Models dialog commits on accept.
+        """
+        self.app.snapshot_state()
+        # Pending in-dialog edits are what the user sees, so the fetch scope
+        # starts from the working copy, not the last committed one.
+        scope = {self.provider_key: copy.deepcopy(self.provider_cfg)}
+        scope[self.provider_key]["models"] = dict(self.models)
+
         dlg = FetchProviderModelsDialog(self, catalog=self.app.model_catalog,
                                         provider_key=self.provider_key,
-                                        providers=scope)
+                                        providers=scope,
+                                        lock_key=True)
         if dlg.exec() != QDialog.Accepted:
             return
 
@@ -3582,13 +4273,15 @@ class ModelsManagerDialog(QDialog):
             QMessageBox.information(self, "Fetch", "No models selected.")
             return
 
-        base_url = dlg.url_edit.text().strip()
+        # The dialog owns the policy: a list/catalog format yields '' so
+        # nothing is persisted, and an SDK-style base comes back normalised.
+        base_url = dlg.api_base_url()
         prov, summary = apply_fetched_provider(
             scope, self.provider_key, selected,
             base_url=base_url,
             api_key=dlg.apikey_edit.text().strip(),
             save_api_key=dlg.save_apikey_check.isChecked(),
-            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+            npm=npm_for_fetch(dlg._current_adapter(), dlg.url_edit.text().strip()))
 
         removed = []
         if dlg.sync_check.isChecked():
@@ -3605,9 +4298,11 @@ class ModelsManagerDialog(QDialog):
                         prov["models"].pop(mid, None)
                     removed = stale
 
+        # The endpoint config is staged on the dialog and committed in accept();
+        # until then the live provider is untouched, so Cancel reverts it all.
+        self._pending_options = copy.deepcopy(prov.get("options", {}))
         self.models = dict(prov["models"])
         self._update_table()
-        self.app.mark_dirty()
 
         if summary["added"]:
             self._match_models(set(summary["added"]))
@@ -4544,6 +5239,23 @@ class MatchFormatPreviewDialog(QDialog):
                 out.append(self.entries[row])
         return out
 
+# Default base URL per fetch adapter. Gemini's API lives under /v1beta.
+_FETCH_BASE_URL_DEFAULTS = {
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "models_dev": "https://models.dev/api.json",
+    "generic": "",
+}
+
+
+_APIKEY_PLACEHOLDER_RE = re.compile(r"\{(?:env|file):[^{}]*\}")
+
+
+def _has_placeholder(value: str) -> bool:
+    """True if `value` uses opencode's {env:VAR} / {file:path} references."""
+    return isinstance(value, str) and bool(_APIKEY_PLACEHOLDER_RE.search(value))
+
 class _ModelFetchWorker(QThread):
     """Runs fetch_provider_models off the UI thread."""
     finished_ok = Signal(dict)
@@ -4561,11 +5273,37 @@ class _ModelFetchWorker(QThread):
             self.failed.emit(str(e))
 
 
+class _CatalogSyncWorker(QThread):
+    """Runs ModelCatalog.fetch_online off the UI thread.
+
+    Downloading, JSONC-stripping and re-parsing a multi-megabyte catalog all
+    take long enough to freeze the window, so the download never runs on the
+    GUI thread. Reuse this worker from anywhere else that updates the catalog.
+    """
+    finished_ok = Signal(str, int)   # message, model count
+    failed = Signal(str)             # error message
+
+    def __init__(self, catalog, url=None):
+        super().__init__()
+        self.catalog = catalog
+        self.url = url
+
+    def run(self):
+        try:
+            ok, msg, count = self.catalog.fetch_online(self.url)
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        if ok:
+            self.finished_ok.emit(msg, count)
+        else:
+            self.failed.emit(msg)
+
+
 class FetchProviderModelsDialog(QDialog):
     """Fetch a provider's model list from its API and preview the results."""
-
     def __init__(self, parent, provider_key: str = "new-provider", catalog=None,
-                 providers=None):
+                 providers=None, lock_key: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Fetch Provider Models from API")
         self.resize(720, 560)
@@ -4573,6 +5311,10 @@ class FetchProviderModelsDialog(QDialog):
         self.provider_key = provider_key
         self.providers = providers  # full provider map, for existing-status display
         self._worker = None
+        self._lock_key = lock_key
+        self._fetched_signature = None  # (url, api key, adapter) the table matches
+        self._auto_base_url = ""   # last base URL we auto-filled from a default
+        self._closed = False
 
         # Silently load the bundled catalog so the Reference combo can be filled.
         self.catalog = catalog
@@ -4582,6 +5324,10 @@ class FetchProviderModelsDialog(QDialog):
 
         form = QFormLayout()
         self.key_edit = QLineEdit(provider_key)
+        # The fetch is always for this provider; letting the key be edited only
+        # mislabels the Status column, since the result is applied to
+        # provider_key regardless (F11).
+        self.key_edit.setReadOnly(lock_key)
         self.key_edit.textChanged.connect(self._apply_status)
         form.addRow("Provider key:", self.key_edit)
 
@@ -4604,13 +5350,22 @@ class FetchProviderModelsDialog(QDialog):
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://api.openai.com/v1")
+        self.url_edit.textChanged.connect(self._invalidate_fetch)
         form.addRow("Base URL:", self.url_edit)
 
         self.apikey_edit = QLineEdit()
         self.apikey_edit.setEchoMode(QLineEdit.Password)
         self.apikey_edit.setPlaceholderText("(sent as a header to fetch the model list)")
+        self.apikey_edit.textChanged.connect(self._invalidate_fetch)
+        self.apikey_edit.setReadOnly(lock_key)
+        if lock_key:
+            self.apikey_edit.setToolTip(
+                "This provider already has an API key configured; it is reused as-is.")
         form.addRow("API key:", self.apikey_edit)
 
+        # Saving a reference like "{env:OPENAI_API_KEY}" would freeze the
+        # variable name into the config; the checkbox default is set in
+        # _prefill_from_provider once the stored key is known.
         self.save_apikey_check = QCheckBox("Save API key to config (options.apiKey)")
         self.save_apikey_check.setChecked(True)
         self.save_apikey_check.setToolTip(
@@ -4680,10 +5435,53 @@ class FetchProviderModelsDialog(QDialog):
 
         self._on_format_change()
         self._prefill_from_provider()
+        # Re-apply the adapter-dependent state now that the stored URL/key are
+        # in place (a locked key needs a non-empty value to stay usable).
+        self._on_format_change()
+
+    # Providers whose npm package determines the API shape even before the
+    # stored options are read: guessing the format first stops an Anthropic
+    # key from being sent to an OpenAI endpoint.
+    _NPM_ADAPTER = {
+        "@ai-sdk/anthropic": "anthropic",
+        "@ai-sdk/google": "gemini",
+        "@ai-sdk/openai": "openai",
+    }
+    _PROVIDER_ID_ADAPTER = {
+        "anthropic": "anthropic",
+        "google": "gemini",
+        "gemini": "gemini",
+        "openai": "openai",
+        "google-generative-ai": "gemini",
+    }
+
+    def _infer_adapter_from_provider(self) -> str:
+        """Best-guess API format from the provider's npm package or id."""
+        if not isinstance(self.providers, dict):
+            return ""
+        prov = self.providers.get(self.provider_key)
+        if not isinstance(prov, dict):
+            return ""
+        npm = prov.get("npm")
+        if isinstance(npm, str) and npm in self._NPM_ADAPTER:
+            return self._NPM_ADAPTER[npm]
+        pid = str(self.provider_key or "").lower()
+        return self._PROVIDER_ID_ADAPTER.get(pid, "")
+
+    def _select_adapter(self, adapter: str):
+        idx = self.format_combo.findData(adapter)
+        if idx >= 0:
+            self.format_combo.setCurrentIndex(idx)
 
     def _prefill_from_provider(self):
         """Pre-fill URL/key from the target provider's saved options, so
         re-fetching an existing provider starts from its real endpoint."""
+        # Infer the format before reading the stored options: prefilling first
+        # would send an Anthropic key to the default OpenAI URL.
+        inferred = self._infer_adapter_from_provider()
+        if inferred:
+            self._select_adapter(inferred)
+
         if not isinstance(self.providers, dict):
             return
         prov = self.providers.get(self.provider_key)
@@ -4694,7 +5492,10 @@ class FetchProviderModelsDialog(QDialog):
             self.url_edit.setText(str(opts["baseURL"]))
         key = opts.get("apiKey")
         if isinstance(key, str) and key:
+            # Keep "{env:…}"/"{file:…}" verbatim so Save writes it back
+            # unchanged; it is only resolved when building the request.
             self.apikey_edit.setText(key)
+            self.save_apikey_check.setChecked(not _has_placeholder(key))
 
     def _current_adapter(self) -> str:
         return self.format_combo.currentData()
@@ -4708,23 +5509,52 @@ class FetchProviderModelsDialog(QDialog):
     def _on_format_change(self):
         adapter = self._current_adapter()
         self.generic_box.setVisible(adapter == "generic")
-        # Sensible default base URLs per adapter.
-        defaults = {
-            "openai": "https://api.openai.com/v1",
-            "anthropic": "https://api.anthropic.com",
-            "gemini": "https://generativelanguage.googleapis.com",
-            "models_dev": "https://models.dev/api.json",
-            "generic": "",
-        }
-        if not self.url_edit.text().strip() or self.url_edit.text() in defaults.values():
-            self.url_edit.setText(defaults.get(adapter, ""))
-        self.apikey_edit.setEnabled(adapter != "models_dev")
+        # Replace the URL only while it is still the default we last applied, so
+        # switching format never clobbers a URL the user typed.
+        if not self.url_edit.text().strip() or self.url_edit.text() == self._auto_base_url:
+            self.url_edit.setText(_FETCH_BASE_URL_DEFAULTS.get(adapter, ""))
+        self._auto_base_url = self.url_edit.text()
+        # A locked key stays usable (it is the provider's existing key); only
+        # *editing* it is blocked.
+        self.apikey_edit.setEnabled(
+            adapter != "models_dev" and (not self._lock_key or bool(self.apikey_edit.text())))
+        self._invalidate_fetch()
+
+    def _request_signature(self):
+        """What the current table contents were fetched with."""
+        return (self.url_edit.text().strip(),
+                self.apikey_edit.text(),
+                self._current_adapter())
+
+    def _invalidate_fetch(self, *_):
+        """Changing the endpoint, key or format makes the table stale."""
+        if self._fetched_signature is None:
+            return
+        if self._request_signature() == self._fetched_signature:
+            return
+        self._fetched_signature = None
+        self.fetched_models = {}
+        self.table.setRowCount(0)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        self.status_label.setText("Settings changed — fetch again")
+
+    def api_base_url(self) -> str:
+        """The URL to store as the fetched provider's ``options.baseURL``.
+
+        API-style formats keep their base URL, normalised with the version
+        segment the AI SDK expects; list/catalog formats (models.dev, generic
+        JSON) store nothing. The policy lives in api_base_url_for.
+        """
+        return api_base_url_for(self._current_adapter(),
+                                self.url_edit.text().strip())
 
     def _build_spec(self) -> ProviderFetchSpec:
         return ProviderFetchSpec(
             base_url=self.url_edit.text().strip(),
             adapter=self._current_adapter(),
-            api_key=self.apikey_edit.text(),
+            # Only the outgoing request resolves {env:}/{file:} references;
+            # the field itself keeps the reference text for Save.
+            api_key=resolve_config_placeholders(self.apikey_edit.text()),
             items_path=self.items_path_edit.text().strip(),
             id_field=self.id_field_edit.text().strip(),
             name_field=self.name_field_edit.text().strip(),
@@ -4743,16 +5573,27 @@ class FetchProviderModelsDialog(QDialog):
         self._worker.start()
 
     def _on_fetched(self, models: dict):
+        # The dialog may have been closed (or the settings changed) while the
+        # request was in flight; that result is no longer wanted.
+        if self._closed:
+            return
         self.fetched_models = models
+        self._fetched_signature = self._request_signature()
         self.fetch_btn.setEnabled(True)
         self.status_label.setText(f"Fetched {len(models)} models")
         self._populate(models)
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(models))
 
     def _on_failed(self, msg: str):
+        if self._closed:
+            return
         self.fetch_btn.setEnabled(True)
         self.status_label.setText("Fetch failed")
         QMessageBox.warning(self, "Fetch Error", msg)
+
+    def closeEvent(self, event):
+        self._closed = True
+        super().closeEvent(event)
 
     def _populate(self, models: dict):
         self.table.setRowCount(len(models))
@@ -5091,7 +5932,6 @@ class ModelCatalogDialog(QDialog):
                                                             "model_id": f.model_id}
                                for f in rows], f, indent=2, ensure_ascii=False)
             else:
-                import csv
                 with open(path, "w", encoding="utf-8", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow(["provider", "model_id", "name", "context",
@@ -5263,8 +6103,11 @@ class EditCustomModelDialog(QDialog):
         self.result_model_id = ""
         self.result_provider = ""
         self.result_spec = {}
+        # Fields the dialog does not expose (cost, aliases, extra modalities,
+        # ...) are carried over untouched when the spec is rebuilt.
+        self._original_spec = dict(spec or {})
 
-        spec = spec or {}
+        spec = dict(self._original_spec)
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
@@ -5293,14 +6136,14 @@ class EditCustomModelDialog(QDialog):
         self.ctx_spin = QSpinBox()
         self.ctx_spin.setRange(0, 10000000)
         self.ctx_spin.setSingleStep(4000)
-        self.ctx_spin.setValue(int(limit.get("context", 128000)))
+        self.ctx_spin.setValue(int(limit["context"]) if isinstance(limit.get("context"), (int, float)) else 128000)
         form.addRow("Context Window (tokens):", self.ctx_spin)
 
         # Output limit
         self.out_spin = QSpinBox()
         self.out_spin.setRange(0, 1000000)
         self.out_spin.setSingleStep(1000)
-        self.out_spin.setValue(int(limit.get("output", 8192)))
+        self.out_spin.setValue(int(limit["output"]) if isinstance(limit.get("output"), (int, float)) else 8192)
         form.addRow("Max Output Tokens:", self.out_spin)
 
         # Features
@@ -5314,6 +6157,13 @@ class EditCustomModelDialog(QDialog):
         self.tools_cb.setChecked(bool(spec.get("tool_call", True)))
         self.temp_cb = QCheckBox("Temperature Control")
         self.temp_cb.setChecked(bool(spec.get("temperature", True)))
+        # Flags absent from the stored spec are only written when the user
+        # actually toggles them, so an unedited OK never invents them.
+        self._initial_feature_state = {
+            key: box.isChecked()
+            for key, box in (("attachment", self.att_cb), ("reasoning", self.reas_cb),
+                             ("tool_call", self.tools_cb), ("temperature", self.temp_cb))
+        }
 
         feat_layout.addWidget(self.att_cb, 0, 0)
         feat_layout.addWidget(self.reas_cb, 0, 1)
@@ -5362,32 +6212,44 @@ class EditCustomModelDialog(QDialog):
         name = self.name_edit.text().strip() or humanize_model_id(mid)
         prov = self.prov_edit.text().strip() or "custom"
 
-        in_mods = ["text"]
+        # Start from the stored spec so fields this dialog does not show
+        # (cost, aliases, extra modalities, ...) survive an unedited OK.
+        spec = dict(self._original_spec)
+
+        limit = dict(spec["limit"]) if isinstance(spec.get("limit"), dict) else {}
+        limit["context"] = self.ctx_spin.value()
+        limit["output"] = self.out_spin.value()
+        spec["limit"] = limit
+
+        spec["name"] = name
+        spec["provider"] = prov
+
+        # Booleans: keep stored flags as they are, and only introduce a flag
+        # the user actually toggled (never flip "absent" into "true").
+        for key, box in (("attachment", self.att_cb),
+                         ("reasoning", self.reas_cb),
+                         ("tool_call", self.tools_cb),
+                         ("temperature", self.temp_cb)):
+            if key in spec:
+                spec[key] = box.isChecked()
+            elif box.isChecked() != self._initial_feature_state[key]:
+                spec[key] = box.isChecked()
+
+        mods = dict(spec["modalities"]) if isinstance(spec.get("modalities"), dict) else {}
+        known_in = {"text", "image", "audio"}
+        known_out = {"text", "image"}
+        in_mods = [m for m in mods.get("input", []) if m not in known_in]
+        out_mods = [m for m in mods.get("output", []) if m not in known_out]
+        in_mods.insert(0, "text")
         if self.mod_in_image.isChecked():
-            in_mods.append("image")
-        if self.mod_in_audio.isChecked():
+            in_mods.insert(1, "image")
+        if self.mod_in_audio.isChecked() and "audio" not in in_mods:
             in_mods.append("audio")
-
-        out_mods = ["text"]
-        if self.mod_out_image.isChecked():
+        out_mods.insert(0, "text")
+        if self.mod_out_image.isChecked() and "image" not in out_mods:
             out_mods.append("image")
-
-        spec = {
-            "name": name,
-            "provider": prov,
-            "limit": {
-                "context": self.ctx_spin.value(),
-                "output": self.out_spin.value(),
-            },
-            "attachment": self.att_cb.isChecked(),
-            "reasoning": self.reas_cb.isChecked(),
-            "tool_call": self.tools_cb.isChecked(),
-            "temperature": self.temp_cb.isChecked(),
-            "modalities": {
-                "input": in_mods,
-                "output": out_mods,
-            }
-        }
+        if "modalities" in spec:
+            spec["modalities"] = {"input": in_mods, "output": out_mods}
 
         self.result_model_id = mid
         self.result_provider = prov
@@ -5467,7 +6329,7 @@ class CustomCatalogManagerDialog(QDialog):
         self.resize(900, 600)
         self.catalog = catalog
         self.settings = SettingsManager()
-
+        self._sync_worker = None
         layout = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
@@ -5532,13 +6394,24 @@ class CustomCatalogManagerDialog(QDialog):
 
         self._refresh_custom_models_table()
 
+    def _read_custom_models(self, warn: bool = False) -> dict:
+        """Read the custom-model file; an unparseable file yields an empty map
+        plus a warning instead of raising through the dialog's UI paths."""
+        try:
+            return self.catalog.get_all_custom_models()
+        except ValueError as e:
+            if warn:
+                QMessageBox.warning(self, "Custom Models File Error", str(e))
+            return {}
+
     def _refresh_custom_models_table(self):
-        models = self.catalog.get_all_custom_models()
+        models = self._read_custom_models(warn=True)
         self._populate_custom_models_table(models)
 
     def _populate_custom_models_table(self, models: dict):
         self.custom_table.setRowCount(len(models))
         for row, (mid, spec) in enumerate(sorted(models.items())):
+            spec = spec if isinstance(spec, dict) else {}
             self.custom_table.setItem(row, 0, QTableWidgetItem(mid))
             self.custom_table.setItem(row, 1, QTableWidgetItem(spec.get("name") or humanize_model_id(mid)))
             self.custom_table.setItem(row, 2, QTableWidgetItem(spec.get("provider", "custom")))
@@ -5558,7 +6431,7 @@ class CustomCatalogManagerDialog(QDialog):
             self.custom_table.setItem(row, 5, QTableWidgetItem(", ".join(feats) if feats else "—"))
 
     def _filter_custom_models(self, text: str):
-        all_models = self.catalog.get_all_custom_models()
+        all_models = self._read_custom_models()
         if not text:
             self._populate_custom_models_table(all_models)
             return
@@ -5585,7 +6458,7 @@ class CustomCatalogManagerDialog(QDialog):
         if not mid_item:
             return
         mid = mid_item.text()
-        all_models = self.catalog.get_all_custom_models()
+        all_models = self._read_custom_models()
         spec = all_models.get(mid, {})
         dlg = EditCustomModelDialog(self, mid, spec, spec.get("provider", "custom"))
         if dlg.exec() == QDialog.Accepted and dlg.result_model_id:
@@ -5613,21 +6486,44 @@ class CustomCatalogManagerDialog(QDialog):
         )
         if dlg.exec() == QDialog.Accepted and dlg.result_data:
             data = dlg.result_data
-            if isinstance(data, dict):
+            if not isinstance(data, dict):
+                QMessageBox.warning(self, "Import Error",
+                                    "Custom models JSON must be an object.")
+                return
+            # Reject anything that is not `{model_id: {spec}}` before writing:
+            # a stray "$schema" string would be saved and then break the loader.
+            invalid = [k for k, v in data.items() if not isinstance(v, dict)]
+            if invalid:
+                QMessageBox.warning(
+                    self, "Import Error",
+                    "These entries are not model objects and were not imported: "
+                    + ", ".join(sorted(map(str, invalid))[:10]),
+                )
+                return
+            if not data:
+                QMessageBox.warning(self, "Import Error", "No custom models found.")
+                return
+            try:
                 current = self.catalog.get_all_custom_models()
-                current.update(data)
-                try:
-                    CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-                    self.catalog._load_custom_models()
-                    self._refresh_custom_models_table()
-                    self._refresh_status()
-                    QMessageBox.information(self, "Import", f"Imported {len(data)} custom model(s).")
-                except Exception as e:
-                    QMessageBox.warning(self, "Import Error", str(e))
+            except ValueError as e:
+                QMessageBox.warning(self, "Import Error", str(e))
+                return
+            current.update(data)
+            try:
+                CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(
+                    CUSTOM_MODELS_FILE,
+                    json.dumps(current, indent=2, ensure_ascii=False),
+                )
+                self.catalog._reload_after_custom_change()
+                self._refresh_custom_models_table()
+                self._refresh_status()
+                QMessageBox.information(self, "Import", f"Imported {len(data)} custom model(s).")
+            except Exception as e:
+                QMessageBox.warning(self, "Import Error", str(e))
 
     def _export_custom_models(self):
-        models = self.catalog.get_all_custom_models()
+        models = self._read_custom_models()
         if not models:
             QMessageBox.information(self, "Export", "No custom models to export.")
             return
@@ -5775,35 +6671,47 @@ class CustomCatalogManagerDialog(QDialog):
     def _update_sync_info(self):
         src = self.catalog.source or "None"
         cnt = len(self.catalog.flat)
-        custom_cnt = len(self.catalog.get_all_custom_models())
+        try:
+            custom_cnt = len(self.catalog.get_all_custom_models())
+        except ValueError:
+            custom_cnt = -1
         rules_cnt = len(self.catalog.get_all_pattern_rules())
         last = self.catalog.last_updated or "Never"
+        custom_label = "unreadable — fix or delete custom_models.json" if custom_cnt < 0 \
+            else f"{custom_cnt:,}"
         self.sync_info.setText(
             f"<b>Active Catalog Source:</b> {src}<br>"
             f"<b>Total Catalog Models:</b> {cnt:,}<br>"
-            f"<b>User Custom Models:</b> {custom_cnt:,}<br>"
+            f"<b>User Custom Models:</b> {custom_label}<br>"
             f"<b>Active Pattern Rules:</b> {rules_cnt:,}<br>"
             f"<b>Last Loaded / Updated:</b> {last}"
         )
 
     def _sync_online(self):
+        """Start the online catalog update on a worker thread."""
         url = self.url_edit.text().strip()
         self.settings.set_catalog_url(url)
         self.sync_btn.setEnabled(False)
         self.sync_btn.setText("Updating...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ok, msg, count = self.catalog.fetch_online(url)
-            if ok:
-                QMessageBox.information(self, "Catalog Update", msg)
-                self._update_sync_info()
-                self._refresh_status()
-            else:
-                QMessageBox.warning(self, "Catalog Update Error", msg)
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.sync_btn.setEnabled(True)
-            self.sync_btn.setText("🔄 Update Catalog Online Now")
+        self._sync_worker = _CatalogSyncWorker(self.catalog, url)
+        self._sync_worker.finished_ok.connect(self._on_sync_ok)
+        self._sync_worker.failed.connect(self._on_sync_failed)
+        self._sync_worker.start()
+
+    def _on_sync_ok(self, msg: str, count: int):
+        QApplication.restoreOverrideCursor()
+        self.sync_btn.setEnabled(True)
+        self.sync_btn.setText("🔄 Update Catalog Online Now")
+        QMessageBox.information(self, "Catalog Update", msg)
+        self._update_sync_info()
+        self._refresh_status()
+
+    def _on_sync_failed(self, msg: str):
+        QApplication.restoreOverrideCursor()
+        self.sync_btn.setEnabled(True)
+        self.sync_btn.setText("🔄 Update Catalog Online Now")
+        QMessageBox.warning(self, "Catalog Update Error", msg)
 
     def _load_local_catalog(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -5821,7 +6729,10 @@ class CustomCatalogManagerDialog(QDialog):
 
     def _refresh_status(self):
         cnt = len(self.catalog.flat)
-        custom_cnt = len(self.catalog.get_all_custom_models())
+        try:
+            custom_cnt = len(self.catalog.get_all_custom_models())
+        except ValueError:
+            custom_cnt = "error"
         rules_cnt = len(self.catalog.get_all_pattern_rules())
         self.status_lbl.setText(
             f"Catalog: {cnt:,} models | Custom: {custom_cnt} | Pattern Rules: {rules_cnt}"
@@ -5830,54 +6741,99 @@ class CustomCatalogManagerDialog(QDialog):
 
 # Connectivity & Health Check GUI Components
 # ---------------------------------------------------------------------------
-import json
-from typing import Dict, Optional
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
-    QMessageBox, QTextEdit, QGroupBox, QSplitter
-)
+
+# Exact npm packages whose endpoints can be tested with an API key, and the
+# matching fetch adapter. Package names are matched whole (not by substring) so
+# e.g. '@ai-sdk/google-vertex' is never probed against AI Studio.
+_KNOWN_PROVIDER_PACKAGES = {
+    "@ai-sdk/anthropic": "anthropic",
+    "@ai-sdk/openai": "openai",
+    "@ai-sdk/openai-compatible": "openai",
+    "@ai-sdk/google": "gemini",
+}
+
+# Default endpoint per first-party package, keyed by npm name (not by adapter)
+# so '@ai-sdk/openai-compatible' can be excluded.
+_PACKAGE_DEFAULT_URLS = {
+    "@ai-sdk/anthropic": "https://api.anthropic.com",
+    "@ai-sdk/openai": "https://api.openai.com/v1",
+    "@ai-sdk/google": "https://generativelanguage.googleapis.com",
+}
+
+# Default endpoint per adapter, for providers that are configured with just a
+# key (the docs' own 'provider.anthropic.options.apiKey' example has no npm
+# and no baseURL). The key is the provider id opencode ships under.
+_BUILTIN_PROVIDERS = {
+    "anthropic": ("anthropic", "https://api.anthropic.com"),
+    "openai": ("openai", "https://api.openai.com/v1"),
+    "google": ("gemini", "https://generativelanguage.googleapis.com"),
+}
+
+
+def resolve_provider_target(key: str, pdata: dict, config_dir: Optional[Path] = None):
+    """Work out which endpoint and adapter to test for one provider entry.
+
+    Returns (adapter, base_url, api_key, error). 'error' is non-empty when the
+    provider cannot be tested at all (no endpoint and no known package); the
+    placeholder variables in options are expanded here.
+    """
+    opts = pdata.get("options") if isinstance(pdata.get("options"), dict) else {}
+    base_url = resolve_config_placeholders(opts.get("baseURL", ""), config_dir)
+    api_key = resolve_config_placeholders(opts.get("apiKey", ""), config_dir)
+    npm = pdata.get("npm", "") or ""
+    if not isinstance(npm, str):
+        npm = ""
+
+    adapter = _KNOWN_PROVIDER_PACKAGES.get(npm)
+    if adapter is None and npm not in ("", None):
+        # Unknown package: only test it if it configures its own baseURL.
+        return "openai", base_url, api_key, ""
+
+    if adapter is None:
+        builtin = _BUILTIN_PROVIDERS.get(key)
+        if builtin is None:
+            return "openai", base_url, api_key, ""
+        adapter, default_url = builtin
+        return adapter, base_url or default_url, api_key, ""
+
+    # Only the first-party packages get a default endpoint. openai-compatible
+    # is excluded on purpose: it fronts other vendors (OpenRouter, Ollama,
+    # vLLM), so defaulting it to api.openai.com would ship the user's key to
+    # the wrong vendor. It must configure its own baseURL.
+    default_url = _PACKAGE_DEFAULT_URLS.get(npm)
+    return adapter, base_url or (default_url or ""), api_key, ""
 
 
 class ProviderPingWorker(QThread):
     """Background worker to test a provider connection without freezing the GUI."""
     finished_one = Signal(str, object)  # provider_key, ConnectionTestResult
 
-    def __init__(self, providers_to_test: Dict[str, dict]):
+    def __init__(self, providers_to_test: Dict[str, dict], config_dir: Optional[Path] = None):
         super().__init__()
         self.providers_to_test = providers_to_test
+        self.config_dir = config_dir
 
     def run(self):
         for key, pdata in self.providers_to_test.items():
+            if self.isInterruptionRequested():
+                return
             if not isinstance(pdata, dict):
                 continue
-            opts = pdata.get("options", {}) if isinstance(pdata.get("options"), dict) else {}
-            base_url = opts.get("baseURL", "")
-            api_key = opts.get("apiKey", "")
-            npm = pdata.get("npm", "")
 
-            # Guess adapter
-            adapter = "openai"
-            if "anthropic" in npm:
-                adapter = "anthropic"
-            elif "google" in npm:
-                adapter = "gemini"
+            adapter, base_url, api_key, error = resolve_provider_target(
+                key, pdata, self.config_dir
+            )
 
-            # If no base_url specified, use default for known npm
-            if not base_url:
-                if "anthropic" in npm:
-                    base_url = "https://api.anthropic.com"
-                elif "openai" in npm and not "openai-compatible" in npm:
-                    base_url = "https://api.openai.com/v1"
-                elif "google" in npm:
-                    base_url = "https://generativelanguage.googleapis.com"
-
-            if not base_url:
-                res = ConnectionTestResult(
-                    success=False,
-                    message="No baseURL configured for this provider.",
-                )
+            if error:
+                res = ConnectionTestResult(success=False, message=error)
+            elif not base_url:
+                npm = pdata.get("npm", "") or ""
+                if npm:
+                    msg = (f"'{npm}' cannot be tested: configure options.baseURL "
+                           "in the provider to test this endpoint.")
+                else:
+                    msg = "No baseURL configured for this provider."
+                res = ConnectionTestResult(success=False, message=msg)
             else:
                 res = test_provider_connection(
                     base_url=base_url,
@@ -5892,13 +6848,20 @@ class ProviderPingWorker(QThread):
 class ProviderHealthCheckDialog(QDialog):
     """Dialog to run live health checks on all configured providers."""
 
-    def __init__(self, parent=None, providers: Optional[dict] = None, auto_run: bool = True):
+    def __init__(self, parent=None, providers: Optional[dict] = None, auto_run: bool = True,
+                 config_path: Optional[str] = None):
         super().__init__(parent)
         self.setWindowTitle("⚡ Provider Connectivity & Health Check")
         self.setMinimumSize(780, 520)
         self.providers = providers or {}
         self.results: Dict[str, ConnectionTestResult] = {}
         self.worker: Optional[ProviderPingWorker] = None
+        # {file:} paths resolve relative to the config file being edited; the
+        # default is the global opencode config dir.
+        if config_path:
+            self.config_dir = Path(config_path).expanduser().parent
+        else:
+            self.config_dir = Path.home() / ".config" / "opencode"
 
         layout = QVBoxLayout(self)
 
@@ -5965,9 +6928,40 @@ class ProviderHealthCheckDialog(QDialog):
             self.run_tests()
 
     def _stop_worker(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(1500)
+        """Stop the running worker cooperatively and wait for it to unwind.
+
+        QThread.terminate() is never used: killing a thread mid-request can
+        deadlock the interpreter's own locks and freeze the editor.
+        """
+        worker = self.worker
+        if not worker or not worker.isRunning():
+            self.worker = None
+            return
+        # Parent the thread to the dialog so Qt keeps it alive while it drains.
+        worker.setParent(self)
+        worker.requestInterruption()
+        try:
+            worker.finished_one.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        if worker.wait(3000):
+            # Fully unwound: safe to drop the last reference.
+            self.worker = None
+        # else: a request is still blocked (DNS, dropped SYN, silent server).
+        # Keep the reference and let _on_all_finished clear it, otherwise the
+        # QThread is destroyed while running and the process aborts.
+
+    def _busy(self) -> bool:
+        return bool(self.worker and self.worker.isRunning())
+
+    def _set_running(self, running: bool):
+        """Keep both start buttons disabled for the whole run."""
+        self.run_btn.setEnabled(not running)
+        self.retest_sel_btn.setEnabled(not running)
+        if running:
+            self.progress.show()
+        else:
+            self.progress.hide()
 
     def closeEvent(self, event):
         self._stop_worker()
@@ -5995,9 +6989,10 @@ class ProviderHealthCheckDialog(QDialog):
         if not self.providers:
             QMessageBox.information(self, "No Providers", "No providers configured to test.")
             return
+        if self._busy():
+            return
 
-        self.run_btn.setEnabled(False)
-        self.progress.show()
+        self._set_running(True)
         self.progress.setRange(0, len(self.providers))
         self.progress.setValue(0)
 
@@ -6006,7 +7001,7 @@ class ProviderHealthCheckDialog(QDialog):
             self.table.setItem(r, 2, QTableWidgetItem("-"))
             self.table.setItem(r, 3, QTableWidgetItem("-"))
 
-        self.worker = ProviderPingWorker(self.providers)
+        self.worker = ProviderPingWorker(self.providers, self.config_dir)
         self.worker.finished_one.connect(self._on_provider_tested)
         self.worker.finished.connect(self._on_all_finished)
         self.worker.start()
@@ -6016,6 +7011,8 @@ class ProviderHealthCheckDialog(QDialog):
         if not selected_rows:
             QMessageBox.information(self, "Selection", "Please select a provider row to test.")
             return
+        if self._busy():
+            return
 
         subset = {}
         for r in selected_rows:
@@ -6024,7 +7021,8 @@ class ProviderHealthCheckDialog(QDialog):
                 subset[key] = self.providers[key]
                 self.table.setItem(r, 1, QTableWidgetItem("Testing..."))
 
-        self.worker = ProviderPingWorker(subset)
+        self._set_running(True)
+        self.worker = ProviderPingWorker(subset, self.config_dir)
         self.worker.finished_one.connect(self._on_provider_tested)
         self.worker.finished.connect(self._on_all_finished)
         self.worker.start()
@@ -6055,8 +7053,8 @@ class ProviderHealthCheckDialog(QDialog):
         self._on_selection_changed()
 
     def _on_all_finished(self):
-        self.run_btn.setEnabled(True)
-        self.progress.hide()
+        self.worker = None
+        self._set_running(False)
 
     def _on_selection_changed(self):
         selected = self.table.selectedItems()
@@ -6066,35 +7064,32 @@ class ProviderHealthCheckDialog(QDialog):
         key = self.table.item(row, 0).text()
         res = self.results.get(key)
         if not res:
-            self.detail_text.setHtml(f"<h3>{key}</h3><p>Testing or not yet run...</p>")
+            self.detail_text.setHtml(
+                f"<h3>{html.escape(key)}</h3><p>Testing or not yet run...</p>"
+            )
             return
 
+        # Escape every provider-controlled value: raw errors look like
+        # '<urlopen error ...>', which setHtml() would swallow as a tag.
+        esc_key = html.escape(key)
         color = "green" if res.success else "red"
-        html = f"<h3>Provider: <span style='color:{color}'>{key}</span></h3>"
-        html += f"<p><b>Status:</b> {'SUCCESS' if res.success else 'FAILED'}</p>"
-        html += f"<p><b>Latency:</b> {res.latency_ms:.1f} ms</p>"
-        html += f"<p><b>Message:</b> {res.message}</p>"
+        out = f"<h3>Provider: <span style='color:{color}'>{esc_key}</span></h3>"
+        out += f"<p><b>Status:</b> {'SUCCESS' if res.success else 'FAILED'}</p>"
+        out += f"<p><b>Latency:</b> {res.latency_ms:.1f} ms</p>"
+        out += f"<p><b>Message:</b> {html.escape(res.message)}</p>"
 
         if res.models:
-            html += f"<h4>Discovered Models ({len(res.models)}):</h4><ul>"
+            out += f"<h4>Discovered Models ({len(res.models)}):</h4><ul>"
             for m in res.models:
-                html += f"<li><code>{m}</code></li>"
-            html += "</ul>"
+                out += f"<li><code>{html.escape(str(m))}</code></li>"
+            out += "</ul>"
         elif res.raw_error:
-            html += f"<h4>Diagnostic Log:</h4><pre style='background:#f5f5f5; padding:6px;'>{res.raw_error}</pre>"
+            out += ("<h4>Diagnostic Log:</h4>"
+                    f"<pre style='background:#f5f5f5; padding:6px;'>{html.escape(res.raw_error)}</pre>")
 
-        self.detail_text.setHtml(html)
+        self.detail_text.setHtml(out)
 # MCP Template Hub GUI Dialog
 # ---------------------------------------------------------------------------
-import json
-from typing import Dict, Optional
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QListWidget, QListWidgetItem, QComboBox,
-    QGroupBox, QTextEdit, QSplitter, QFileDialog, QMessageBox,
-    QFormLayout, QWidget
-)
 
 
 class MCPTemplateHubDialog(QDialog):
@@ -6164,7 +7159,7 @@ class MCPTemplateHubDialog(QDialog):
         self.param_form.addRow("Server Key:", self.key_edit)
 
         self.param_widgets: Dict[str, QLineEdit] = {}
-        self.env_widgets: Dict[str, QLineEdit] = {}
+        self.env_widgets: Dict[str, MaskedLineEdit] = {}
         self.url_edit: Optional[QLineEdit] = None
 
         right_lay.addWidget(self.param_group)
@@ -6223,6 +7218,10 @@ class MCPTemplateHubDialog(QDialog):
 
         if self.template_list.count() > 0:
             self.template_list.setCurrentRow(0)
+        else:
+            # Nothing can be selected, so nothing may stay installable.
+            self.selected_template = None
+            self._clear_result()
 
     def _on_template_selected(self, row: int):
         if row < 0:
@@ -6236,11 +7235,16 @@ class MCPTemplateHubDialog(QDialog):
             return
 
         self.selected_template = tmpl
+        # Block the signal: key_edit's textChanged would otherwise preview the
+        # previous template's params (or a deleted widget) mid-rebuild.
+        self.key_edit.blockSignals(True)
         self.key_edit.setText(tmpl.id)
+        self.key_edit.blockSignals(False)
 
         # Update description
         doc_html = f"<br><a href='{tmpl.doc_url}'>Documentation</a>" if tmpl.doc_url else ""
         self.desc_label.setText(f"<b>{tmpl.name}</b> ({tmpl.category})<br>{tmpl.description}{doc_html}")
+        self.desc_label.setOpenExternalLinks(True)
 
         # Clear and rebuild dynamic parameter form
         while self.param_form.rowCount() > 1:
@@ -6248,9 +7252,13 @@ class MCPTemplateHubDialog(QDialog):
 
         self.param_widgets.clear()
         self.env_widgets.clear()
+        self.url_edit = None  # the previous remote row's QLineEdit is deleted below
 
         if tmpl.transport_type == "remote":
-            self.url_edit = QLineEdit(tmpl.url)
+            # Example URL as a hint only: a prefilled example would pass the
+            # blank check and install a server pointing at a dummy endpoint.
+            self.url_edit = QLineEdit()
+            self.url_edit.setPlaceholderText(tmpl.url)
             self.url_edit.textChanged.connect(self._update_preview)
             self.param_form.addRow("Server URL:", self.url_edit)
         else:
@@ -6259,6 +7267,8 @@ class MCPTemplateHubDialog(QDialog):
                 if "{" in part and "}" in part:
                     param_name = part[part.find("{") + 1 : part.find("}")]
                     p_edit = QLineEdit()
+                    if tmpl.default_args:
+                        p_edit.setPlaceholderText(tmpl.default_args[0])
                     p_edit.textChanged.connect(self._update_preview)
 
                     # Add file / dir picker button if applicable
@@ -6267,24 +7277,33 @@ class MCPTemplateHubDialog(QDialog):
                     if "directory" in param_name or "path" in param_name or "repo" in param_name:
                         browse_btn = QPushButton("Browse...")
                         browse_btn.setFixedWidth(70)
-                        browse_btn.clicked.connect(lambda _, pe=p_edit: self._browse_path(pe))
+                        browse_btn.setProperty(
+                            "picker_mode", "file" if param_name.endswith("db_path") else "dir"
+                        )
+                        browse_btn.clicked.connect(lambda _, pe=p_edit, b=browse_btn: self._browse_path(pe, b.property("picker_mode")))
                         row_box.addWidget(browse_btn)
 
                     self.param_form.addRow(f"Arg ({param_name}):", row_box)
                     self.param_widgets[param_name] = p_edit
 
-            # Env keys
+            # Env keys (masked: these carry API tokens)
             for k, placeholder in tmpl.env_keys.items():
-                env_edit = QLineEdit()
-                env_edit.setPlaceholderText(placeholder)
+                env_edit = MaskedLineEdit(field_name=k, placeholder=placeholder, secret=True)
                 env_edit.textChanged.connect(self._update_preview)
                 self.param_form.addRow(f"Env ({k}):", env_edit)
                 self.env_widgets[k] = env_edit
 
         self._update_preview()
 
-    def _browse_path(self, target_edit: QLineEdit):
-        path = QFileDialog.getExistingDirectory(self, "Select Directory")
+    def _browse_path(self, target_edit: QLineEdit, mode: str = "dir"):
+        if mode == "file":
+            # Only a path is chosen (an existing db or a new file); nothing is
+            # written here, so skip the misleading "overwrite?" prompt.
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Select File", target_edit.text(),
+                options=QFileDialog.Option.DontConfirmOverwrite)
+        else:
+            path = QFileDialog.getExistingDirectory(self, "Select Directory")
         if path:
             target_edit.setText(path)
 
@@ -6294,7 +7313,7 @@ class MCPTemplateHubDialog(QDialog):
 
         key = self.key_edit.text().strip() or self.selected_template.id
         args_vals = {k: w.text().strip() for k, w in self.param_widgets.items()}
-        env_vals = {k: w.text().strip() for k, w in self.env_widgets.items()}
+        env_vals = {k: w.value().strip() for k, w in self.env_widgets.items()}
         url_val = self.url_edit.text().strip() if self.url_edit else ""
 
         if self.target_mode == "openclaude":
@@ -6308,24 +7327,72 @@ class MCPTemplateHubDialog(QDialog):
 
         self.result_server_key = key
         self.result_server_config = cfg
-        self.preview_edit.setPlainText(json.dumps({key: cfg}, indent=2, ensure_ascii=False))
+        # Redact secrets in the preview only; the result keeps the real values.
+        # This covers env values, URL query tokens, and credentials embedded in
+        # DSNs such as postgresql://user:password@host/db.
+        secret_values = [
+            widget.text().strip()
+            for name, widget in self.param_widgets.items()
+            if MaskedLineEdit.SECRET_HINT.search(name) and widget.text().strip()
+        ]
+
+        def redact(value):
+            if isinstance(value, str):
+                value = re.sub(
+                    r"(?i)([a-z][a-z0-9+.-]*://[^:/@\s]+:)([^@\s]+)(@)",
+                    r"\1***\3", value)
+                value = re.sub(
+                    r"([?&](?:key|api_key|apikey|token|access_token|password|secret)=)[^&]*",
+                    r"\1***", value, flags=re.I)
+                for secret in secret_values:
+                    value = value.replace(secret, "***")
+                return value
+            if isinstance(value, dict):
+                return {k: redact(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [redact(v) for v in value]
+            return value
+
+        shown = redact(cfg)
+        for env_key in ("env", "environment"):
+            if env_key in shown:
+                shown[env_key] = {
+                    k: _mask(v) if (self.env_widgets.get(k) and self.env_widgets[k].is_secret) else v
+                    for k, v in shown[env_key].items()
+                }
+        self.preview_edit.setPlainText(
+            json.dumps({key: shown}, indent=2, ensure_ascii=False))
+        self.install_btn.setEnabled(True)
+
+    def _blank_required(self) -> Optional[str]:
+        """Label of the first required field left blank, else None."""
+        if self.selected_template and self.selected_template.transport_type == "remote":
+            return None if (self.url_edit and self.url_edit.text().strip()) else "Server URL"
+        for name, w in self.param_widgets.items():
+            if not w.text().strip():
+                return f"Arg ({name})"
+        return None
+
+    def _clear_result(self):
+        self.result_server_key = ""
+        self.result_server_config = {}
+        self.install_btn.setEnabled(False)
+        self.preview_edit.clear()
 
     def _on_install(self):
+        missing = self._blank_required()
+        if missing:
+            QMessageBox.warning(self, "Error", f"{missing} cannot be empty.")
+            return
         if not self.result_server_key:
             QMessageBox.warning(self, "Error", "Server key cannot be empty.")
             return
         self.accept()
 # Universal Cross-Config Converter GUI Dialog
 # ---------------------------------------------------------------------------
-import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QCheckBox, QTextEdit, QGroupBox, QSplitter,
-    QFileDialog, QMessageBox, QTabWidget, QWidget, QApplication
-)
+
+
+_OMP_COMPONENTS = ("providers", "mcp_servers", "plugins", "permissions", "prompts", "settings")
 
 
 class CrossConfigConverterDialog(QDialog):
@@ -6337,6 +7404,8 @@ class CrossConfigConverterDialog(QDialog):
         self.setMinimumSize(920, 620)
         self.app_context = app_context
         self.source_data: Dict[str, Any] = {}
+        self.source_valid = False
+        self.unmapped_keys: List[str] = []
         self.converted_data: Dict[str, Any] = {}
 
         layout = QVBoxLayout(self)
@@ -6426,6 +7495,11 @@ class CrossConfigConverterDialog(QDialog):
         self.out_editor = QTextEdit()
         self.out_editor.setReadOnly(True)
         out_lay.addWidget(self.out_editor)
+        self.unmapped_label = QLabel("")
+        self.unmapped_label.setWordWrap(True)
+        self.unmapped_label.setStyleSheet("color: #b26a00;")
+        self.unmapped_label.setVisible(False)
+        out_lay.addWidget(self.unmapped_label)
 
         out_btns = QHBoxLayout()
         copy_btn = QPushButton("📋 Copy Result")
@@ -6470,14 +7544,19 @@ class CrossConfigConverterDialog(QDialog):
             else:
                 self.src_editor.setPlainText("{\n  \"provider\": {}\n}")
         elif src_type == "active_openclaude":
-            if self.app_context and hasattr(self.app_context, "cf"):
-                # Layered config file
-                cf = self.app_context.cf
-                combined = {
-                    "settings": cf.effective(),
-                    "global": cf.global_data,
-                    "project_mcp": cf.project_mcp,
-                }
+            layered = getattr(self.app_context, "oc_layered", None) if self.app_context else None
+            if layered is not None:
+                combined = dict(layered.global_data or {})
+                for key, val in (layered.effective() or {}).items():
+                    combined.setdefault(key, val)
+                # .mcp.json holds {"mcpServers": {...}}; merge just the servers,
+                # or they end up double-nested under mcpServers.mcpServers.
+                project_servers = (layered.project_mcp or {}).get("mcpServers")
+                if isinstance(project_servers, dict) and project_servers:
+                    existing = combined.get("mcpServers")
+                    combined["mcpServers"] = (
+                        {**existing, **project_servers} if isinstance(existing, dict) else dict(project_servers)
+                    )
                 self.src_editor.setPlainText(json.dumps(combined, indent=2, ensure_ascii=False))
             else:
                 self.src_editor.setPlainText("{\n  \"mcpServers\": {}\n}")
@@ -6504,20 +7583,38 @@ class CrossConfigConverterDialog(QDialog):
         text = self.src_editor.toPlainText().strip()
         if not text:
             self.source_data = {}
+            self.converted_data = {}
+            self.source_valid = False
             self.out_editor.clear()
             return
         try:
-            self.source_data = loads_jsonc(text)
-            self._run_conversion()
+            data = loads_jsonc(text)
         except Exception:
+            self.source_valid = False
+            self.source_data = {}
+            self.converted_data = {}
             self.out_editor.setPlainText("// Invalid JSON input in source editor")
+            return
+        if not isinstance(data, dict):
+            self.source_valid = False
+            self.source_data = {}
+            self.converted_data = {}
+            self.out_editor.setPlainText("// Source JSON must be an object")
+            return
+        self.source_valid = True
+        self.source_data = data
+        self._run_conversion()
 
     def _get_selected_components(self) -> List[str]:
         return [k for k, chk in self.comp_checks.items() if chk.isChecked()]
 
     def _run_conversion(self):
         if not self.source_data:
+            self.converted_data = {}
+            self.unmapped_keys = []
             self.out_editor.clear()
+            self.unmapped_label.setText("")
+            self.unmapped_label.setVisible(False)
             return
 
         target_fmt = self.tgt_format_combo.currentData()
@@ -6539,6 +7636,8 @@ class CrossConfigConverterDialog(QDialog):
 
         # 2. Convert OMP bundle to target format
         if target_fmt == "omp":
+            # OMP is the intermediate format itself: honour the component filter
+            omp_bundle = {k: v for k, v in omp_bundle.items() if k not in _OMP_COMPONENTS or k in comps}
             self.converted_data = omp_bundle
         elif target_fmt == "claude_desktop":
             mcp_data = import_from_omp(omp_bundle, "openclaude_global", comps)
@@ -6546,7 +7645,28 @@ class CrossConfigConverterDialog(QDialog):
         else:
             self.converted_data = import_from_omp(omp_bundle, target_fmt, comps)
 
+        self.unmapped_keys = self._find_unmapped_keys(src_fmt)
+        if self.unmapped_keys:
+            self.unmapped_label.setText(
+                "Not transferred (no mapping for this target): " + ", ".join(self.unmapped_keys)
+            )
+            self.unmapped_label.setVisible(True)
+        else:
+            self.unmapped_label.setText("")
+            self.unmapped_label.setVisible(False)
         self.out_editor.setPlainText(json.dumps(self.converted_data, indent=2, ensure_ascii=False))
+
+    def _find_unmapped_keys(self, src_fmt: str) -> List[str]:
+        """Top-level source keys the conversion has no mapping for."""
+        handled = {
+            "opencode": {"provider", "mcp", "plugin", "permission", "instructions", "tui"},
+            "openclaude_global": {"mcpServers", "providerProfiles"},
+            "openclaude_settings": {"permissions", "env"},
+            "claude_desktop": {"mcpServers"},
+        }.get(src_fmt, set())
+        if src_fmt == "omp":
+            handled = set(_OMP_COMPONENTS)
+        return sorted(str(k) for k in self.source_data if str(k) not in handled)
 
     def _copy_result(self):
         text = self.out_editor.toPlainText()
@@ -6555,6 +7675,9 @@ class CrossConfigConverterDialog(QDialog):
             QMessageBox.information(self, "Copied", "Converted configuration copied to clipboard.")
 
     def _save_to_file(self):
+        if not self.source_valid or not self.converted_data:
+            QMessageBox.warning(self, "No Data", "Nothing to save: fix the source JSON first.")
+            return
         target_fmt = self.tgt_format_combo.currentData()
         default_name = f"{target_fmt}-config.json"
         path, _ = QFileDialog.getSaveFileName(
@@ -6563,13 +7686,24 @@ class CrossConfigConverterDialog(QDialog):
         )
         if not path:
             return
+        target = Path(path)
         try:
-            Path(path).write_text(self.out_editor.toPlainText(), encoding="utf-8")
+            payload = json.loads(json.dumps(self.converted_data))
+            # Merge into an existing file so unrelated keys (app state, other
+            # sections) survive; only keys the conversion produced are written.
+            if target.is_file():
+                existing = loads_jsonc(target.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    payload = deep_merge(existing, copy.deepcopy(payload))
+            atomic_write_json(target, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
             QMessageBox.information(self, "Saved", f"Exported successfully to {path}")
         except Exception as e:
             QMessageBox.warning(self, "Save Error", f"Failed to save file: {e}")
 
     def _apply_to_active(self):
+        if not self.source_valid:
+            QMessageBox.warning(self, "No Data", "Fix the source JSON before applying.")
+            return
         if not self.converted_data:
             QMessageBox.warning(self, "No Data", "No converted data to apply.")
             return
@@ -6577,43 +7711,61 @@ class CrossConfigConverterDialog(QDialog):
         if not self.app_context:
             QMessageBox.warning(self, "Error", "No active editor instance found.")
             return
-
         target_fmt = self.tgt_format_combo.currentData()
+
+        # Apply merges into in-memory data (or writes straight to disk for OpenClaude) and
+        # then reloads the tabs. Any pending form/Raw edit lives only in the tab widgets
+        # until Save, so refresh would silently drop it. Settle those edits first.
+        if target_fmt == "opencode":
+            unsaved = (
+                bool(getattr(self.app_context, "dirty_oc", False))
+                or bool(getattr(self.app_context, "dirty_tui", False))
+                or bool(getattr(getattr(self.app_context, "tab_raw", None), "_modified", False))
+            )
+        else:
+            unsaved = (
+                bool(getattr(self.app_context, "oc_form_dirty", False))
+                or bool(getattr(getattr(self.app_context, "_agent_raw_tab", None), "_modified", False))
+            )
+        if unsaved:
+            action = _confirm_unsaved(self.app_context, "apply the converted configuration")
+            if action == "cancel":
+                return
+            if action == "save":
+                self.app_context._save()
 
         if target_fmt == "opencode" and getattr(self.app_context, "cfg", None):
             if not _confirm(self, "Apply Config", "Merge converted settings into current OpenCode configuration?"):
                 return
-            self.app_context.snapshot_state()
-            for k, v in self.converted_data.items():
-                if isinstance(v, dict) and isinstance(self.app_context.cfg.data.get(k), dict):
-                    self.app_context.cfg.data[k].update(v)
-                else:
-                    self.app_context.cfg.data[k] = v
-            self.app_context.mark_dirty()
-            if hasattr(self.app_context, "refresh_all_tabs"):
-                self.app_context.refresh_all_tabs()
+            self.app_context.snapshot_state("opencode")
+            self.app_context.cfg.data = deep_merge(
+                self.app_context.cfg.data, copy.deepcopy(self.converted_data)
+            )
+            self.app_context.mark_dirty("opencode")
+            self.app_context.refresh_tabs()
             QMessageBox.information(self, "Success", "Applied converted settings to OpenCode configuration.")
             self.accept()
 
-        elif "openclaude" in target_fmt and hasattr(self.app_context, "cf"):
+        elif "openclaude" in target_fmt:
+            layered = getattr(self.app_context, "oc_layered", None)
+            if layered is None:
+                QMessageBox.information(
+                    self, "Format Mismatch",
+                    f"Please export to file or copy result to use with {target_fmt}.",
+                )
+                return
             if not _confirm(self, "Apply Config", "Apply converted settings into current OpenClaude configuration?"):
                 return
-            cf = self.app_context.cf
             if target_fmt == "openclaude_global":
-                for k, v in self.converted_data.items():
-                    if isinstance(v, dict) and isinstance(cf.global_data.get(k), dict):
-                        cf.global_data[k].update(v)
-                    else:
-                        cf.global_data[k] = v
-                cf.save_global(cf.global_data)
-            elif target_fmt == "openclaude_settings":
-                user_layer = cf.layers.get("user", {})
-                for k, v in self.converted_data.items():
-                    if isinstance(v, dict) and isinstance(user_layer.get(k), dict):
-                        user_layer[k].update(v)
-                    else:
-                        user_layer[k] = v
-                cf.save_layer("user", user_layer)
+                merged = deep_merge(dict(layered.global_data or {}), copy.deepcopy(self.converted_data))
+                ok, msg = layered.save_global(merged)
+            else:
+                merged = deep_merge(dict(layered.layer("user") or {}), copy.deepcopy(self.converted_data))
+                ok, msg = layered.save_layer("user", merged)
+            if not ok:
+                QMessageBox.warning(self, "Save Error", msg)
+                return
+            self.app_context.refresh_tabs()
             QMessageBox.information(self, "Success", "Applied converted settings to OpenClaude configuration.")
             self.accept()
         else:
@@ -6664,12 +7816,12 @@ def match_models_against_catalog(key, models_dict, catalog, reference_provider=N
 
 # Providers tab
 class ProvidersTab(QWidget):
-    """Enhanced providers tab with search and bulk operations"""
+    """Providers tab: search, inline edits, soft delete via the trash file."""
 
     def __init__(self, app):
         super().__init__()
         self.app = app
-        self.rows = []  # (provider_name, npm_edit, name_edit)
+        self.rows = []  # live rows only: (provider_key, npm_edit, name_edit)
 
         layout = QVBoxLayout(self)
 
@@ -6681,14 +7833,17 @@ class ProvidersTab(QWidget):
         self.search_edit.textChanged.connect(self._filter_providers)
         top_layout.addWidget(self.search_edit)
 
+        self.show_trash_chk = QCheckBox("Show deleted")
+        self.show_trash_chk.setToolTip(f"Removed providers are kept in {PROVIDER_TRASH_FILE}")
+        self.show_trash_chk.toggled.connect(lambda _: self._update_table())
+        top_layout.addWidget(self.show_trash_chk)
+
         for text, slot in [
             ("+ Add", self._add_provider),
             ("+ Fetch from API", self._fetch_new_provider),
             ("⚡ Health Check", self._health_check_providers),
             ("Import", self._import_providers),
             ("Export", self._export_providers),
-            ("Enable All", lambda: self._set_all_enabled(True)),
-            ("Disable All", lambda: self._set_all_enabled(False))
         ]:
             btn = QPushButton(text)
             btn.clicked.connect(slot)
@@ -6705,96 +7860,233 @@ class ProvidersTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)
+        # Editing a live row's key cell renames the provider immediately.
+        self.table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.table)
 
         # Status
         self.status_label = QLabel()
         layout.addWidget(self.status_label)
 
-    def _filter_providers(self, text: str):
-        """Filter providers by search text"""
+    # --- data helpers ---
+    def _providers(self) -> dict:
+        return section(self.app.cfg.data, "provider") if self.app.cfg else {}
+
+    def _cfg_path(self):
+        """Path of the loaded config file; None (no file) means no trash."""
+        return getattr(self.app.cfg, "path", None)
+
+    def _trashed(self) -> dict:
+        """Trash entries of this config file whose key is not a live provider.
+        Derived, so undoing a remove hides its entry again."""
+        path = self._cfg_path()
+        if path is None:
+            return {}
+        live = self._providers()
+        return {k: v for k, v in ProviderTrashStore().entries(path).items() if k not in live}
+
+    @staticmethod
+    def _matches(key, cfg, text: str) -> bool:
         if not text:
-            self.refresh()
+            return True
+        if text in key.lower():
+            return True
+        if not isinstance(cfg, dict):
+            return False
+        return any(isinstance(cfg.get(f), str) and text in cfg[f].lower()
+                   for f in ("npm", "name"))
+
+    @staticmethod
+    def _summary(cfg) -> str:
+        cfg = cfg if isinstance(cfg, dict) else {}
+        n_models = len(cfg["models"]) if isinstance(cfg.get("models"), dict) else 0
+        base_url = cfg["options"].get("baseURL", "") if isinstance(cfg.get("options"), dict) else ""
+        return f"{n_models} models  {base_url}"
+
+    def _filter_providers(self, text: str = ""):
+        """Filter providers by search text (the table reads the search box)."""
+        self._update_table()
+
+    def _update_table(self):
+        """Rebuild the table: live rows (search-filtered) first, then the
+        deleted ones when "Show deleted" is checked."""
+        text = self.search_edit.text().lower()
+        providers = self._providers()
+        trashed = self._trashed()
+        live = [(k, v) for k, v in sorted(providers.items()) if self._matches(k, v, text)]
+        dead = ([(k, v) for k, v in sorted(trashed.items()) if self._matches(k, v, text)]
+                if self.show_trash_chk.isChecked() else [])
+
+        prev = self.table.blockSignals(True)   # a rebuild is never an edit
+        try:
+            self.rows = []
+            self.table.setRowCount(0)
+            self.table.setRowCount(len(live) + len(dead))
+            for row, (key, cfg) in enumerate(live):
+                self._fill_live_row(row, key, cfg)
+            for row, (key, entry) in enumerate(dead, start=len(live)):
+                self._fill_trash_row(row, key, entry)
+        finally:
+            self.table.blockSignals(prev)
+        self._update_status(len(providers), len(trashed))
+
+    def _update_status(self, n_live=None, n_trashed=None):
+        n_live = len(self._providers()) if n_live is None else n_live
+        n_trashed = len(self._trashed()) if n_trashed is None else n_trashed
+        text = f"{n_live} providers"
+        if n_trashed:
+            text += f" · {n_trashed} deleted"
+        self.status_label.setText(text)
+
+    def _fill_live_row(self, row, key, cfg):
+        valid = isinstance(cfg, dict)   # non-dict entries are fixed in Raw JSON
+        cfg = cfg if valid else {}
+        self.table.setItem(row, 0, QTableWidgetItem(key))
+
+        npm_edit = MaskedLineEdit(cfg.get("npm", ""), field_name="npm")
+        npm_edit.edit.editingFinished.connect(
+            lambda r=row, w=npm_edit: self._commit_inline(r, "npm", w))
+        npm_edit.setEnabled(valid)
+        self.table.setCellWidget(row, 1, npm_edit)
+
+        name_edit = MaskedLineEdit(cfg.get("name", ""), field_name="name")
+        name_edit.edit.editingFinished.connect(
+            lambda r=row, w=name_edit: self._commit_inline(r, "name", w))
+        name_edit.setEnabled(valid)
+        self.table.setCellWidget(row, 2, name_edit)
+
+        cell = QWidget()
+        cell_layout = QHBoxLayout(cell)
+        cell_layout.setContentsMargins(2, 0, 2, 0)
+        summary = QLabel(self._summary(cfg))
+        summary.setToolTip(self._tooltip_json(cfg))
+        cell_layout.addWidget(summary, 1)
+        # Buttons resolve the key at click time: the key cell renames in place.
+        for text, slot in (("Models...", self._edit_models), ("Options...", self._edit_options)):
+            btn = QPushButton(text)
+            btn.clicked.connect(lambda _, r=row, s=slot: s(self._row_key(r)))
+            btn.setEnabled(valid)
+            cell_layout.addWidget(btn)
+        self.table.setCellWidget(row, 3, cell)
+
+        actions_widget = QWidget()
+        actions_layout = QHBoxLayout(actions_widget)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        for text, slot in (("Edit", self._edit_provider), ("Remove", self._remove_provider)):
+            btn = QPushButton(text)
+            btn.setFixedWidth(60)
+            btn.clicked.connect(lambda _, r=row, s=slot: s(self._row_key(r)))
+            actions_layout.addWidget(btn)
+        self.table.setCellWidget(row, 4, actions_widget)
+
+        self.rows.append((key, npm_edit, name_edit))
+
+    @staticmethod
+    def _tooltip_json(cfg):
+        """Provider JSON for the summary tooltip, with the API key masked."""
+        if not isinstance(cfg, dict):
+            return ""
+        shown = dict(cfg)
+        options = shown.get("options")
+        if isinstance(options, dict) and options.get("apiKey"):
+            options = dict(options)
+            options["apiKey"] = _mask(str(options["apiKey"]))
+            shown["options"] = options
+        return json.dumps(shown, ensure_ascii=False, indent=2)[:4000]
+
+    def _fill_trash_row(self, row, key, entry):
+        """Display-only row for a deleted provider: Restore / Delete permanently."""
+        cfg = entry if isinstance(entry, dict) else {}
+        for col, text in enumerate((key, cfg.get("npm", ""), cfg.get("name", ""),
+                                    self._summary(cfg))):
+            item = QTableWidgetItem(str(text))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            font = item.font()
+            font.setItalic(True)
+            item.setFont(font)
+            item.setForeground(Qt.gray)
+            self.table.setItem(row, col, item)
+
+        actions_widget = QWidget()
+        actions_layout = QHBoxLayout(actions_widget)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        restore_btn = QPushButton("Restore")
+        restore_btn.clicked.connect(lambda _, k=key: self._restore_provider(k))
+        actions_layout.addWidget(restore_btn)
+        purge_btn = QPushButton("Delete permanently")
+        purge_btn.clicked.connect(lambda _, k=key: self._hard_delete_provider(k))
+        actions_layout.addWidget(purge_btn)
+        self.table.setCellWidget(row, 4, actions_widget)
+
+    def _row_key(self, row):
+        return self.rows[row][0] if 0 <= row < len(self.rows) else None
+
+    def _row_of(self, key):
+        return next((i for i, r in enumerate(self.rows) if r[0] == key), None)
+
+    def _set_key_cell(self, item, text):
+        prev = self.table.blockSignals(True)
+        item.setText(text)
+        self.table.blockSignals(prev)
+
+    def _on_item_changed(self, item):
+        """Write-through rename from a live row's key cell."""
+        row = item.row()
+        if item.column() != 0 or not 0 <= row < len(self.rows):
+            return  # deleted rows are display-only and never collected
+        old = self.rows[row][0]
+        new = item.text().strip()
+        if new == old:
+            if item.text() != old:
+                self._set_key_cell(item, old)
             return
+        providers = self._providers()
+        if old not in providers:
+            self._set_key_cell(item, old)
+            return
+        if not new or new in providers:
+            self._set_key_cell(item, old)
+            QMessageBox.warning(self, "Rename Provider",
+                                "Provider key cannot be empty" if not new
+                                else f"Provider '{new}' already exists")
+            return
+        self.app.snapshot_state()
+        providers[new] = providers.pop(old)
+        self.rows[row] = (new,) + tuple(self.rows[row][1:])
+        if item.text() != new:
+            self._set_key_cell(item, new)
+        self.app.mark_dirty()
+        self._update_status()
 
-        text = text.lower()
-        providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
-        filtered = {
-            name: cfg for name, cfg in providers.items()
-            if text in name.lower() or
-               (isinstance(cfg.get("npm"), str) and text in cfg["npm"].lower()) or
-               (isinstance(cfg.get("name"), str) and text in cfg["name"].lower())
-        }
+    _FIELD_COL = {"npm": 1, "name": 2}
 
-        self._update_table(filtered)
+    def _commit_inline(self, row, field, widget):
+        """Write-through for the npm/name cells so a table rebuild (search,
+        dialogs, Show deleted, ...) never drops an inline edit."""
+        if not 0 <= row < len(self.rows) or self.rows[row][self._FIELD_COL[field]] is not widget:
+            return  # stale widget from a previous rebuild
+        prov = self._providers().get(self.rows[row][0])
+        if not isinstance(prov, dict):
+            return
+        value = widget.value()
+        if not self._differs(prov, field, value):
+            return
+        self.app.snapshot_state()
+        self._apply_field(prov, field, value)
+        self.app.mark_dirty()
 
-    def _update_table(self, providers: Optional[dict] = None):
-        """Update table with providers"""
-        if providers is None:
-            providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
+    @staticmethod
+    def _differs(prov: dict, field: str, value: str) -> bool:
+        cur = prov.get(field)
+        return value != ("" if cur is None else str(cur))
 
-        self.table.setRowCount(len(providers))
-        self.rows = []
-
-        for row, (name, cfg) in enumerate(sorted(providers.items())):
-            if not isinstance(cfg, dict):
-                cfg = {}
-
-            # Provider name
-            self.table.setItem(row, 0, QTableWidgetItem(name))
-
-            # npm
-            npm_edit = MaskedLineEdit(cfg.get("npm", ""), field_name="npm")
-            npm_edit.edit.editingFinished.connect(self.app.mark_dirty)
-            self.table.setCellWidget(row, 1, npm_edit)
-
-            # Name
-            name_edit = MaskedLineEdit(cfg.get("name", ""), field_name="name")
-            name_edit.edit.editingFinished.connect(self.app.mark_dirty)
-            self.table.setCellWidget(row, 2, name_edit)
-
-            # Models/Options
-            n_models = len(cfg.get("models", {})) if isinstance(cfg.get("models"), dict) else 0
-            base_url = cfg.get("options", {}).get("baseURL", "") if isinstance(cfg.get("options"), dict) else ""
-
-            cell = QWidget()
-            cell_layout = QHBoxLayout(cell)
-            cell_layout.setContentsMargins(2, 0, 2, 0)
-
-            summary = QLabel(f"{n_models} models  {base_url}")
-            summary.setToolTip(json.dumps(cfg, ensure_ascii=False, indent=2)[:4000])
-            cell_layout.addWidget(summary, 1)
-
-            models_btn = QPushButton("Models...")
-            models_btn.clicked.connect(lambda _, n=name: self._edit_models(n))
-            cell_layout.addWidget(models_btn)
-
-            options_btn = QPushButton("Options...")
-            options_btn.clicked.connect(lambda _, n=name: self._edit_options(n))
-            cell_layout.addWidget(options_btn)
-
-            self.table.setCellWidget(row, 3, cell)
-
-            # Actions
-            actions_widget = QWidget()
-            actions_layout = QHBoxLayout(actions_widget)
-            actions_layout.setContentsMargins(0, 0, 0, 0)
-
-            edit_btn = QPushButton("Edit")
-            edit_btn.setFixedWidth(60)
-            edit_btn.clicked.connect(lambda _, n=name: self._edit_provider(n))
-            actions_layout.addWidget(edit_btn)
-
-            remove_btn = QPushButton("Remove")
-            remove_btn.setFixedWidth(60)
-            remove_btn.clicked.connect(lambda _, n=name: self._remove_provider(n))
-            actions_layout.addWidget(remove_btn)
-
-            self.table.setCellWidget(row, 4, actions_widget)
-
-            self.rows.append((name, npm_edit, name_edit))
-
-        self.status_label.setText(f"{len(providers)} providers")
+    @staticmethod
+    def _apply_field(prov: dict, field: str, value: str):
+        """Set the field, or drop it when empty (never writes "npm": "")."""
+        if value:
+            prov[field] = value
+        else:
+            prov.pop(field, None)
 
     def refresh(self):
         """Refresh table with current data"""
@@ -6825,17 +8117,10 @@ class ProvidersTab(QWidget):
         self.app.mark_dirty()
         self.refresh()
 
-    def _edit_provider(self, name: Optional[str] = None):
-        """Edit provider"""
+    def _edit_provider(self, name: str):
+        """Rename a provider via a dialog."""
         self.app.snapshot_state()
-        if name is None:
-            selected = self.table.selectedItems()
-            if not selected:
-                QMessageBox.information(self, "Edit", "Please select a provider to edit")
-                return
-            name = selected[0].text()
-
-        providers = section(self.app.cfg.data, "provider")
+        providers = self._providers()
         if name not in providers:
             QMessageBox.warning(self, "Error", f"Provider '{name}' not found")
             return
@@ -6862,29 +8147,80 @@ class ProvidersTab(QWidget):
         self.app.mark_dirty()
         self.refresh()
 
-    def _remove_provider(self, name: Optional[str] = None):
-        """Remove provider(s)"""
+    def _remove_provider(self, name: str):
+        """Soft delete: move the provider into the trash file, then drop it from
+        the config. It leaves the config file on the next Save."""
+        providers = self._providers()
+        if name not in providers:
+            QMessageBox.warning(self, "Error", f"Provider '{name}' not found")
+            self.refresh()
+            return
+        if not _confirm(self, "Remove Provider",
+                        f"Remove provider '{name}'?\n\n"
+                        "It can be restored via \"Show deleted\"."):
+            return
+
+        entry = copy.deepcopy(providers[name])
+        row = self._row_of(name)
+        if isinstance(entry, dict) and row is not None:
+            # Include inline edits that haven't been committed yet.
+            for fld, widget in zip(("npm", "name"), self.rows[row][1:]):
+                if self._differs(entry, fld, widget.value()):
+                    self._apply_field(entry, fld, widget.value())
+        path = self._cfg_path()
+        try:
+            if path is None:
+                raise OSError("no config file is loaded")
+            ProviderTrashStore().put(path, name, entry)
+        except (OSError, TypeError, ValueError) as e:
+            QMessageBox.critical(self, "Remove Provider",
+                                 f"Could not save '{name}' to the trash file, "
+                                 f"nothing was removed:\n{e}")
+            return
+
         self.app.snapshot_state()
-        if name is None:
-            selected = self.table.selectedItems()
-            if not selected:
-                QMessageBox.information(self, "Remove", "Please select providers to remove")
-                return
-
-            names = {selected[i].text() for i in range(0, len(selected), self.table.columnCount())}
-            if not _confirm(self, "Remove Providers", f"Remove {len(names)} selected providers?"):
-                return
-
-            providers = section(self.app.cfg.data, "provider")
-            for name in names:
-                providers.pop(name, None)
-        else:
-            if not _confirm(self, "Remove Provider", f"Remove provider '{name}'?"):
-                return
-
-            section(self.app.cfg.data, "provider").pop(name, None)
-
+        providers.pop(name, None)
         self.app.mark_dirty()
+        self.refresh()
+
+    def _restore_provider(self, name: str):
+        """Copy a deleted provider back into the config. The trash entry stays
+        until a successful save prunes it, so restore-then-discard loses nothing."""
+        path = self._cfg_path()
+        entry = ProviderTrashStore().entries(path).get(name) if path is not None else None
+        if entry is None:
+            QMessageBox.warning(self, "Restore Provider",
+                                f"'{name}' is no longer in the trash file")
+            self.refresh()
+            return
+        providers = self.app.cfg.data.setdefault("provider", {})
+        if not isinstance(providers, dict):
+            QMessageBox.warning(self, "Restore Provider",
+                                "The config's 'provider' value is not an object; fix it in Raw JSON")
+            return
+        if name in providers:
+            QMessageBox.warning(self, "Restore Provider",
+                                f"Provider '{name}' already exists; rename or remove it first")
+            return
+        self.app.snapshot_state()
+        providers[name] = entry
+        self.app.mark_dirty()
+        self.refresh()
+
+    def _hard_delete_provider(self, name: str):
+        """Permanently drop a deleted provider from the trash file."""
+        path = self._cfg_path()
+        if path is None:
+            return
+        if not _confirm(self, "Delete Permanently",
+                        f"Permanently delete provider '{name}' from the trash?\n\n"
+                        "This cannot be undone."):
+            return
+        try:
+            ProviderTrashStore().discard(path, name)
+        except OSError as e:
+            QMessageBox.critical(self, "Delete Permanently", str(e))
+            return
         self.refresh()
 
     def _import_providers(self):
@@ -6965,13 +8301,15 @@ class ProvidersTab(QWidget):
         if isinstance(existing_cfg, dict) and isinstance(existing_cfg.get("models"), dict):
             existing_models = existing_cfg["models"]
 
-        base_url = dlg.url_edit.text().strip()
+        # api_base_url() is format-aware: a list/catalog fetch stored the raw
+        # listing URL as options.baseURL, which is not a usable API endpoint.
+        base_url = dlg.api_base_url()
         prov, summary = apply_fetched_provider(
             providers, key, selected,
             base_url=base_url,
             api_key=dlg.apikey_edit.text().strip(),
             save_api_key=dlg.save_apikey_check.isChecked(),
-            npm=npm_for_fetch(dlg._current_adapter(), base_url))
+            npm=npm_for_fetch(dlg._current_adapter(), dlg.url_edit.text().strip()))
 
         removed = []
         if dlg.sync_check.isChecked():
@@ -7101,12 +8439,6 @@ class ProvidersTab(QWidget):
         except OSError as e:
             QMessageBox.warning(self, "Export Error", str(e))
 
-    def _set_all_enabled(self, enabled: bool):
-        """Enable/disable all providers"""
-        # Providers don't have an enabled flag, but we can add one for UI purposes
-        # This is just a placeholder for potential future functionality
-        QMessageBox.information(self, "Info", "Providers don't have an enabled/disabled state")
-
     def _edit_models(self, name: str):
         """Edit models for provider"""
         self.app.snapshot_state()
@@ -7148,38 +8480,43 @@ class ProvidersTab(QWidget):
     def _health_check_providers(self):
         """Run connectivity and health check for configured providers"""
         providers = section(self.app.cfg.data, "provider") if self.app.cfg else {}
-        dlg = ProviderHealthCheckDialog(self, providers=providers)
+        # Project-scoped {file:...} API keys resolve against the config's dir.
+        cfg_path = str(self.app.cfg.path) if self.app.cfg else ""
+        dlg = ProviderHealthCheckDialog(self, providers=providers, config_path=cfg_path)
         dlg.exec()
 
     def collect(self, data: dict):
-        """Collect data from UI"""
-        providers = data.setdefault("provider", {})
-        seen = set()
-
-        for row in range(self.table.rowCount()):
-            old_name = self.rows[row][0]
-            new_name = self.table.item(row, 0).text().strip()
-
-            if not new_name:
-                continue
-
-            if new_name in seen:
-                raise ValueError(f"Duplicate provider key: {new_name!r}")
-            seen.add(new_name)
-
-            npm_edit = self.rows[row][1]
-            name_edit = self.rows[row][2]
-
-            old_cfg = dict(providers.get(old_name, {}))
-            old_cfg["npm"] = npm_edit.value()
-            if name_edit.value():
-                old_cfg["name"] = name_edit.value()
-            else:
-                old_cfg.pop("name", None)
-
-            providers[new_name] = old_cfg
-
+        """Apply npm/name edits still pending in a focused cell (e.g. Save via
+        shortcut). Committed edits and renames already live in cfg.data
+        (write-through), so untouched fields keep whatever `data` holds (incl.
+        Raw JSON edits) and providers missing from `data` are never recreated."""
+        providers = data.get("provider")
+        if not isinstance(providers, dict):
+            return
+        cfg_providers = self._providers()
+        for key, npm_edit, name_edit in self.rows:
+            prov = providers.get(key)
+            if not isinstance(prov, dict):
+                continue    # removed (e.g. in Raw JSON) or malformed: never resurrect
+            base = cfg_providers.get(key)
+            base = base if isinstance(base, dict) else {}
+            for fld, widget in (("npm", npm_edit), ("name", name_edit)):
+                if self._differs(base, fld, widget.value()):
+                    self._apply_field(prov, fld, widget.value())
 # MCP servers tab
+
+def _mcp_matches(cfg, text: str) -> bool:
+    """Search-text match over a server entry; non-dict entries never match."""
+    if not isinstance(cfg, dict):
+        return False
+    if text in str(cfg.get("type", "")).lower():
+        return True
+    if text in str(cfg.get("url", "")).lower():
+        return True
+    if isinstance(cfg.get("command"), list):
+        return any(text in str(c).lower() for c in cfg["command"])
+    return False
+
 class MCPHeadersDialog(QDialog):
     """Edit the `headers` map (name -> value) of a remote MCP server.
 
@@ -7222,7 +8559,10 @@ class MCPHeadersDialog(QDialog):
         r = self.table.rowCount()
         self.table.insertRow(r)
         self.table.setItem(r, 0, QTableWidgetItem(name))
-        self.table.setItem(r, 1, QTableWidgetItem(value))
+        item = QTableWidgetItem(_mask(str(value)) if value else "")
+        # The real value lives in UserRole so it can round-trip unedited.
+        item.setData(Qt.UserRole, str(value))
+        self.table.setItem(r, 1, item)
 
     def _add(self):
         name, ok = QInputDialog.getText(self, "Header", "Header name:")
@@ -7241,9 +8581,16 @@ class MCPHeadersDialog(QDialog):
             name = self.table.item(r, 0)
             value = self.table.item(r, 1)
             n = name.text().strip() if name else ""
-            v = value.text() if value else ""
-            if n:
-                out[n] = v
+            if not n:
+                continue
+            if value is None:
+                out[n] = ""
+                continue
+            # An untouched cell still shows the mask; take the stored secret.
+            # Once the user types (or clears), the text is what they meant.
+            shown = value.text()
+            real = str(value.data(Qt.UserRole) or "")
+            out[n] = real if shown == _mask(real) else shown
         return out
 
 
@@ -7297,17 +8644,14 @@ class McpTab(QWidget):
     def _filter_servers(self, text: str):
         """Filter servers by search text"""
         if not text:
-            self.refresh()
+            self._update_table()
             return
 
         text = text.lower()
         mcp = self.app.cfg.data.get("mcp", {}) if self.app.cfg else {}
         filtered = {
             name: cfg for name, cfg in mcp.items()
-            if text in name.lower() or
-               (isinstance(cfg.get("type"), str) and text in cfg["type"].lower()) or
-               (isinstance(cfg.get("url"), str) and text in cfg["url"].lower()) or
-               (isinstance(cfg.get("command"), list) and any(text in str(c).lower() for c in cfg["command"]))
+            if text in name.lower() or _mcp_matches(cfg, text)
         }
 
         self._update_table(filtered)
@@ -7331,18 +8675,23 @@ class McpTab(QWidget):
             self.table.setCellWidget(row, 0, enabled_check)
             self.cbs[name] = enabled_check
 
-            # Name
-            self.table.setItem(row, 1, QTableWidgetItem(name))
+            # Name / Type are not round-trippable from the table (the key is
+            # the map key, and type decides the entry's shape), so read-only.
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 1, name_item)
 
-            # Type
-            self.table.setItem(row, 2, QTableWidgetItem(str(cfg.get("type", ""))))
+            type_item = QTableWidgetItem(str(cfg.get("type", "")))
+            type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 2, type_item)
 
-            # Command/URL
+            # Command/URL. Local commands are argv lists, and shlex.split
+            # round-trips exactly what the join displayed.
             if cfg.get("type") == "local":
                 cmd = " ".join(cfg.get("command", []))
             else:
                 cmd = cfg.get("url", "")
-            self.table.setItem(row, 3, QTableWidgetItem(cmd))
+            self.table.setItem(row, 3, QTableWidgetItem(str(cmd or "")))
 
             # Actions
             actions_widget = QWidget()
@@ -7369,8 +8718,17 @@ class McpTab(QWidget):
         self.status_label.setText(f"{len(servers)} servers")
 
     def refresh(self):
-        """Refresh table with current data"""
-        self._update_table()
+        """Refresh the table, keeping the active search filter applied."""
+        self._filter_servers(self.search_edit.text())
+
+    def _visible_names(self) -> dict:
+        """{name: cfg} for the rows currently shown in the table."""
+        mcp = (self.app.cfg.data.get("mcp", {}) if self.app.cfg else {})
+        return {
+            name: mcp[name] for name in
+            (self.table.item(r, 1).text() for r in range(self.table.rowCount()))
+            if name in mcp
+        }
 
     def _add_server(self):
         """Add new MCP server"""
@@ -7449,7 +8807,9 @@ class McpTab(QWidget):
             QMessageBox.warning(self, "Error", f"Server '{name}' not found")
             return
 
-        if cfg.get("type") == "local":
+        # Headers only exist on type=remote entries; a type-less toggle entry
+        # ({enabled: false}) matches no schema branch once headers are added.
+        if cfg.get("type") != "remote":
             QMessageBox.information(
                 self, "Headers", "Headers apply to remote MCP servers only."
             )
@@ -7558,21 +8918,27 @@ class McpTab(QWidget):
             QMessageBox.warning(self, "Export Error", str(e))
 
     def _set_all_enabled(self, enabled: bool):
-        """Enable/disable all servers"""
+        """Enable/disable every dict entry (non-dict entries are left alone)"""
         self.app.snapshot_state()
         mcp = self.app.cfg.data.get("mcp", {})
+        changed = False
         for name in mcp:
-            mcp[name]["enabled"] = enabled
-        self.app.mark_dirty()
+            if isinstance(mcp[name], dict):
+                mcp[name]["enabled"] = enabled
+                changed = True
+        if changed:
+            self.app.mark_dirty()
         self.refresh()
 
     def _toggle_enabled(self, name: str):
         """Toggle enabled state for server"""
-        self.app.snapshot_state()
         mcp = self.app.cfg.data.get("mcp", {})
-        if name in mcp:
-            mcp[name]["enabled"] = self.cbs[name].isChecked()
+        cfg = mcp.get(name)
+        if isinstance(cfg, dict) and name in self.cbs:
+            self.app.snapshot_state()
+            cfg["enabled"] = self.cbs[name].isChecked()
             self.app.mark_dirty()
+
 
     def _open_mcp_hub(self):
         """Open MCP Template Hub to install curated MCP servers"""
@@ -7593,9 +8959,35 @@ class McpTab(QWidget):
             QMessageBox.information(self, "Installed", f"MCP server '{key}' installed successfully.")
 
     def collect(self, data: dict):
-        """Collect data from UI"""
-        # Enabled states are already applied live
-        pass
+        """Write the Command/URL column back into cfg.data['mcp'].
+
+        Name and Type are read-only in the table, so only column 3 can carry
+        an edit. Remote entries take the cell text as their url; local entries
+        are re-split with shlex so what was displayed round-trips.
+        """
+        mcp = self.app.cfg.data.get("mcp", {})
+        changed = False
+        for r in range(self.table.rowCount()):
+            name_item = self.table.item(r, 1)
+            cell = self.table.item(r, 3)
+            if name_item is None or cell is None:
+                continue
+            name = name_item.text()
+            cfg = mcp.get(name)
+            if not isinstance(cfg, dict):
+                continue
+            text = cell.text().strip()
+            if cfg.get("type") == "local":
+                new = shlex.split(text) if text else []
+                if cfg.get("command") != new:
+                    cfg["command"] = new
+                    changed = True
+            elif cfg.get("url", "") != text:
+                cfg["url"] = text
+                changed = True
+        if changed:
+            self.app.snapshot_state()
+            self.app.mark_dirty()
 
 # Plugins tab
 def _name_of_plugin(entry) -> str:
@@ -7634,6 +9026,13 @@ class PluginsTab(QWidget):
         self.state_store = PluginStateStore()
         self.cbs = {}  # name -> QCheckBox
         self._entries = {}  # name -> full_entry (str or [name, opts])
+        # Names removed from the table since the last Save. The store is only
+        # rewritten by collect(), so Undo/Reload still restore these entries.
+        self._removed = set()
+        self._visible_cbs = {}  # name -> checkbox for rows currently in the table
+        # name -> bool, the user's in-session choice. Repopulating the table
+        # (e.g. clearing a filter) must not lose an unsaved toggle.
+        self._checked = {}
 
         layout = QVBoxLayout(self)
 
@@ -7703,11 +9102,24 @@ class PluginsTab(QWidget):
         if self.app.cfg:
             disabled_entries = self.state_store.get_entries(self.app.cfg.path)
             for name, entry in sorted(disabled_entries.items()):
-                if name not in seen_names:
+                if name not in seen_names and name not in self._removed:
                     seen_names.add(name)
                     entries.append(entry)
 
         return entries
+
+    def _active_names(self) -> set:
+        """Names currently present in the config's plugin[] list."""
+        return {_name_of_plugin(e) for e in self._get_raw_plugins()} - {""}
+
+    def _disabled_names(self) -> set:
+        """Remembered-disabled names that are not enabled in the config.
+
+        A plugin listed in `plugin[]` wins over any store entry (which may come
+        from a stale legacy file), so migrating old state can never silently
+        re-disable a plugin the user has since re-enabled."""
+        disabled = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+        return set(disabled) - self._active_names() - self._removed
 
     def _filter_plugins(self, text: str):
         """Filter plugins by search text matching name or options."""
@@ -7717,7 +9129,7 @@ class PluginsTab(QWidget):
 
         text = text.lower()
         all_entries = self._display_entries()
-        disabled_names = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+        disabled_names = self._disabled_names()
 
         filtered = []
         for e in all_entries:
@@ -7732,33 +9144,36 @@ class PluginsTab(QWidget):
     def _update_table(self):
         """Update table with full current entries list."""
         all_entries = self._display_entries()
-        disabled_names = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+        disabled_names = self._disabled_names()
         pairs = [(e, _name_of_plugin(e) not in disabled_names) for e in all_entries]
         self._populate_table(pairs)
 
     def _populate_table(self, pairs: List[Tuple[Any, bool]]):
-        """Populate table widget rows."""
+        """Populate table widget rows. `_entries` keeps every known plugin, so a
+        filtered-out row is still collected on Save."""
         self.table.blockSignals(True)
         self.table.setRowCount(len(pairs))
-        self.cbs = {}
-        self._entries = {}
+        new_cbs = {}
 
         for row, (entry, enabled) in enumerate(pairs):
             name = _name_of_plugin(entry)
             opts = _opts_of_plugin(entry)
             self._entries[name] = entry
+            enabled = self._checked.get(name, enabled)
 
             # Col 0: Enabled checkbox
             cb = QCheckBox()
             cb.setChecked(enabled)
-            cb.stateChanged.connect(self.app.mark_dirty)
+            cb.stateChanged.connect(
+                lambda _state, n=name, box=cb: self._checked.__setitem__(n, box.isChecked()))
+            self._checked.setdefault(name, enabled)
             cell = QWidget()
             cell_layout = QHBoxLayout(cell)
             cell_layout.setContentsMargins(0, 0, 0, 0)
             cell_layout.setAlignment(Qt.AlignCenter)
             cell_layout.addWidget(cb)
             self.table.setCellWidget(row, 0, cell)
-            self.cbs[name] = cb
+            new_cbs[name] = cb
 
             # Col 1: Plugin name
             name_item = QTableWidgetItem(name)
@@ -7775,18 +9190,28 @@ class PluginsTab(QWidget):
             cfg_btn.clicked.connect(lambda _, n=name: self._configure_plugin(n))
             self.table.setCellWidget(row, 3, cfg_btn)
 
+        # Only the visible rows get fresh checkboxes; hidden rows keep the
+        # checkbox object (and its checked state) from before the filter.
+        merged = {n: cb for n, cb in self.cbs.items() if n not in new_cbs}
+        merged.update(new_cbs)
+        self.cbs = merged
+        self._visible_cbs = new_cbs
+
+
         self.table.blockSignals(False)
         self._update_status()
 
     def _update_status(self):
         total = self.table.rowCount()
-        en = sum(1 for cb in self.cbs.values() if cb.isChecked())
+        en = sum(1 for cb in self._visible_cbs.values() if cb.isChecked())
         self.status_label.setText(
             f"{total} plugins ({en} enabled). Disabled plugins are remembered in cache with options intact."
         )
 
     def refresh(self):
-        """Refresh table with current data."""
+        """Refresh table with current data. Staged removals are dropped, so
+        Undo/Reload brings a removed plugin back from the state store."""
+        self._removed.clear()
         self._update_table()
 
     def _on_double_click(self, row: int, col: int):
@@ -7854,6 +9279,7 @@ class PluginsTab(QWidget):
         cell_layout.addWidget(cb)
         self.table.setCellWidget(row, 0, cell)
         self.cbs[name] = cb
+        self._visible_cbs[name] = cb
 
         self.table.setItem(row, 1, QTableWidgetItem(name))
         opts_item = QTableWidgetItem(_format_opts_summary(opts))
@@ -7909,6 +9335,7 @@ class PluginsTab(QWidget):
                 cell_layout.addWidget(cb)
                 self.table.setCellWidget(row, 0, cell)
                 self.cbs[name] = cb
+                self._visible_cbs[name] = cb
 
                 self.table.setItem(row, 1, QTableWidgetItem(name))
                 opts_item = QTableWidgetItem(_format_opts_summary(opts))
@@ -7952,10 +9379,11 @@ class PluginsTab(QWidget):
             QMessageBox.warning(self, "Export Error", str(e))
 
     def _set_all_enabled(self, enabled: bool):
-        """Enable/disable all plugins."""
+        """Enable/disable all plugins, including any hidden by a filter."""
         self.app.snapshot_state()
-        for cb in self.cbs.values():
+        for name, cb in self.cbs.items():
             cb.setChecked(enabled)
+            self._checked[name] = enabled
         self.app.mark_dirty()
         self._update_status()
 
@@ -7983,8 +9411,9 @@ class PluginsTab(QWidget):
                 self.table.removeRow(row)
             self.cbs.pop(name, None)
             self._entries.pop(name, None)
-            if self.app.cfg:
-                self.state_store.remove_entry(self.app.cfg.path, name)
+            self._visible_cbs.pop(name, None)
+            self._checked.pop(name, None)
+            self._removed.add(name)
 
         self.app.mark_dirty()
         self._update_status()
@@ -7998,13 +9427,20 @@ class PluginsTab(QWidget):
         return -1
 
     def collect(self, data: dict):
-        """Collect data from UI into config dict, preserving options tuples."""
+        """Collect data from UI into config dict, preserving options tuples.
+
+        The table only ever holds the rows a search filter left visible, so the
+        state comes from `_entries` / `_checked` (all known plugins), never from
+        the visible `cbs`.
+        """
+        disabled_names = self._disabled_names()
         active = []
         disabled_dict = {}
 
-        for name, cb in self.cbs.items():
-            entry = self._entries.get(name, name)
-            if cb.isChecked():
+        for name, entry in self._entries.items():
+            if name in self._removed:
+                continue
+            if self._checked.get(name, True) and name not in disabled_names:
                 active.append(entry)
             else:
                 disabled_dict[name] = entry
@@ -8012,11 +9448,16 @@ class PluginsTab(QWidget):
         data["plugin"] = active
         if self.app.cfg:
             self.state_store.set_disabled(self.app.cfg.path, disabled_dict)
+        self._removed.clear()
 
 
 # Permissions tab
 class PermissionTab(QWidget):
     """Enhanced permission tab with search"""
+
+    # Categories the schema restricts to a bare action string
+    # (PermissionActionConfig) — a path/level map is invalid for these.
+    ACTION_ONLY = ("todowrite", "question", "webfetch", "websearch", "doom_loop")
 
     def __init__(self, app):
         super().__init__()
@@ -8047,6 +9488,18 @@ class PermissionTab(QWidget):
         button_layout.addWidget(remove_btn)
         layout.addLayout(button_layout)
 
+    def _perm(self):
+        """Raw `permission` value, or {} when there is no config."""
+        return self.app.cfg.data.get("permission") if self.app.cfg else None
+
+    def _rules(self, perm):
+        """`permission` as a dict of categories; {} for the string form.
+
+        The schema allows a bare action string ("allow"/"ask"/"deny") as the
+        whole permission block, which has no .items().
+        """
+        return perm if isinstance(perm, dict) else {}
+
     def _filter_permissions(self, text: str):
         """Filter permissions by search text"""
         if not text:
@@ -8054,11 +9507,20 @@ class PermissionTab(QWidget):
             return
 
         text = text.lower()
-        perm = self.app.cfg.data.get("permission", {}) if self.app.cfg else {}
+        raw = self._perm()
+        if isinstance(raw, str):
+            # whole-block action string: a single implicit row
+            self._update_tree({"": raw} if text in raw.lower() else {})
+            return
+
+        perm = self._rules(raw)
         filtered = {}
 
         for category, rules in perm.items():
             if not isinstance(rules, dict):
+                # action-only category, e.g. {"edit": "ask"}
+                if text in category.lower() or text in str(rules).lower():
+                    filtered[category] = rules
                 continue
 
             matching_rules = {
@@ -8074,23 +9536,35 @@ class PermissionTab(QWidget):
     def _update_tree(self, permissions: Optional[dict] = None):
         """Update tree with permissions"""
         if permissions is None:
-            permissions = self.app.cfg.data.get("permission", {}) if self.app.cfg else {}
+            raw = self._perm()
+            # the whole block may be a single action string
+            permissions = {"": raw} if isinstance(raw, str) else self._rules(raw)
 
         self.tree.clear()
 
         for category, rules in permissions.items():
-            if not isinstance(rules, dict):
+            if category == "" and isinstance(rules, str):
+                # the whole block is a single action string
+                root = QTreeWidgetItem(self.tree)
+                root.setText(0, "permission")
+                root.setText(2, rules)
+                root.setData(0, Qt.UserRole, "block")
                 continue
 
             category_item = QTreeWidgetItem(self.tree)
             category_item.setText(0, category)
-            category_item.setFlags(category_item.flags() | Qt.ItemIsEditable)
+            category_item.setData(0, Qt.UserRole, "cat")
+
+            if not isinstance(rules, dict):
+                # action-only category: no path level
+                category_item.setText(2, str(rules))
+                continue
 
             for path, level in rules.items():
                 rule_item = QTreeWidgetItem(category_item)
                 rule_item.setText(1, path)
                 rule_item.setText(2, str(level))
-                rule_item.setFlags(rule_item.flags() | Qt.ItemIsEditable)
+                rule_item.setData(0, Qt.UserRole, "rule")
 
         self.tree.expandAll()
 
@@ -8100,45 +9574,74 @@ class PermissionTab(QWidget):
 
     def _add_rule(self):
         """Add new permission rule"""
+        raw = self._perm()
+        if raw is not None and not isinstance(raw, dict):
+            QMessageBox.information(
+                self, "Add Permission Rule",
+                'This config sets "permission" to a single action string.\n'
+                "Turn it into an object in the Raw JSON tab before adding rules.",
+            )
+            return
         self.app.snapshot_state()
         category, ok = QInputDialog.getText(
             self, "Add Permission Rule", "Category:",
-            QLineEdit.Normal, "filesystem"
+            QLineEdit.Normal, "read"
         )
         if not ok or not category.strip():
             return
+        category = category.strip()
 
-        path, ok = QInputDialog.getText(
-            self, "Add Permission Rule", "Path:",
-            QLineEdit.Normal, "/tmp/*"
-        )
-        if not ok or not path.strip():
-            return
+        action_only = category in self.ACTION_ONLY
+        path = ""
+        if not action_only:
+            path, ok = QInputDialog.getText(
+                self, "Add Permission Rule", "Path:",
+                QLineEdit.Normal, "*"
+            )
+            if not ok or not path.strip():
+                return
+            path = path.strip()
 
         level, ok = QInputDialog.getItem(
             self, "Add Permission Rule", "Level:",
-            ["read", "write", "execute", "none"], 0, False
+            ["ask", "allow", "deny"], 0, False
         )
         if not ok:
             return
 
         perm = self.app.cfg.data.setdefault("permission", {})
-        if category not in perm:
-            perm[category] = {}
-
-        perm[category][path] = level
+        if not isinstance(perm, dict):
+            return
+        if action_only:
+            perm[category] = level
+        else:
+            # A category may already hold a bare action string ({"bash":"ask"});
+            # keep it as the catch-all "*" rule instead of discarding it.
+            old = perm.get(category)
+            if isinstance(old, str):
+                perm[category] = {"*": old}
+            elif isinstance(old, dict):
+                perm[category] = old
+            else:
+                perm[category] = {}
+            perm[category][path] = level
         self.app.mark_dirty()
         self.refresh()
 
     def _remove_selected(self):
         """Remove selected permission rules"""
+        raw = self._perm()
+        if isinstance(raw, str):
+            QMessageBox.information(
+                self, "Remove", "Nothing to remove: permission is a single action string.")
+            return
+        perm = self._rules(raw)
         self.app.snapshot_state()
         selected = self.tree.selectedItems()
         if not selected:
             QMessageBox.information(self, "Remove", "Please select rules to remove")
             return
 
-        perm = self.app.cfg.data.get("permission", {})
         removed = 0
 
         for item in selected:
@@ -8146,13 +9649,13 @@ class PermissionTab(QWidget):
                 # Category
                 category = item.text(0)
                 if category in perm:
-                    removed += len(perm[category])
+                    removed += max(1, len(perm[category]) if isinstance(perm[category], dict) else 1)
                     perm.pop(category)
             else:
                 # Rule
                 category = item.parent().text(0)
                 path = item.text(1)
-                if category in perm and path in perm[category]:
+                if isinstance(perm.get(category), dict) and path in perm[category]:
                     removed += 1
                     perm[category].pop(path)
                     if not perm[category]:
@@ -8166,16 +9669,16 @@ class PermissionTab(QWidget):
         """Collect data from UI"""
         # Permissions are edited directly in the config
         pass
-
 # Runtime tab and its small editor widgets
 class StringListEdit(QWidget):
     """Editable list of strings backed by a nested key path in the config."""
 
-    def __init__(self, app, data_path, placeholder="item"):
+    def __init__(self, app, data_path, placeholder="item", on_change=None):
         super().__init__()
         self.app = app
         self.data_path = data_path  # e.g. ["disabled_providers"]
         self.placeholder = placeholder
+        self.on_change = on_change
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -8225,18 +9728,23 @@ class StringListEdit(QWidget):
         else:
             node.pop(last, None)
 
+    def _changed(self):
+        if self.on_change is not None:
+            self.on_change()
+        self.app.mark_dirty()
+
     def _add(self):
         text, ok = QInputDialog.getText(self, "Add", f"New {self.placeholder}:")
         if ok and text.strip():
             self.list.addItem(text.strip())
-            self.app.mark_dirty()
+            self._changed()
 
     def _remove(self):
         rows = sorted({self.list.row(it) for it in self.list.selectedItems()}, reverse=True)
         for r in rows:
             self.list.takeItem(r)
         if rows:
-            self.app.mark_dirty()
+            self._changed()
 
 
 class BoolObjectCombo(QWidget):
@@ -8289,10 +9797,11 @@ class BoolObjectCombo(QWidget):
 class BoolMapEditor(QWidget):
     """Editable map<string,bool> backed by a nested key path (e.g. tools)."""
 
-    def __init__(self, app, data_path):
+    def __init__(self, app, data_path, on_change=None):
         super().__init__()
         self.app = app
         self.data_path = data_path
+        self.on_change = on_change
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.table = QTableWidget(0, 2)
@@ -8354,7 +9863,9 @@ class BoolMapEditor(QWidget):
         else:
             node.pop(last, None)
 
-    def _changed(self):
+    def _changed(self, *_):
+        if self.on_change is not None:
+            self.on_change()
         self.app.mark_dirty()
 
     def _add(self):
@@ -8366,14 +9877,14 @@ class BoolMapEditor(QWidget):
             cb = QCheckBox()
             cb.setChecked(True)
             self.table.setCellWidget(r, 1, cb)
-            self.app.mark_dirty()
+            self._changed()
 
     def _remove(self):
         rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
         for r in rows:
             self.table.removeRow(r)
         if rows:
-            self.app.mark_dirty()
+            self._changed()
 
 
 class RuntimeTab(BaseTab):
@@ -8404,7 +9915,7 @@ class RuntimeTab(BaseTab):
         self.server_mdns_domain = MaskedLineEdit("", field_name="mdnsDomain", placeholder="opencode.local")
         self.server_mdns_domain.edit.editingFinished.connect(self._t("server"))
         sform.addRow("mDNS Domain", self.server_mdns_domain)
-        self.server_cors = StringListEdit(app, ["cors"], "origin")
+        self.server_cors = self._list(["server", "cors"], "origin", "server")
         sform.addRow("CORS origins", self.server_cors)
         lay.addWidget(server_box)
 
@@ -8417,15 +9928,15 @@ class RuntimeTab(BaseTab):
         self.comp_prune = QCheckBox("Prune old tool outputs")
         self.comp_prune.stateChanged.connect(self._t("compaction"))
         sform.addRow("Compaction prune", self.comp_prune)
-        self.comp_reserved = self._spin(0)
+        self.comp_reserved = self._spin(-1, "compaction")
         sform.addRow("Compaction reserved", self.comp_reserved)
-        self.comp_tail = self._spin(0)
+        self.comp_tail = self._spin(-1, "compaction")
         sform.addRow("Compaction tail turns", self.comp_tail)
-        self.comp_preserve = self._spin(0)
+        self.comp_preserve = self._spin(-1, "compaction")
         sform.addRow("Preserve recent tokens", self.comp_preserve)
-        self.tool_lines = self._spin(0)
+        self.tool_lines = self._spin(0, "tool_output")
         sform.addRow("Tool output max lines", self.tool_lines)
-        self.tool_bytes = self._spin(0)
+        self.tool_bytes = self._spin(0, "tool_output")
         sform.addRow("Tool output max bytes", self.tool_bytes)
         lay.addWidget(session_box)
 
@@ -8435,11 +9946,11 @@ class RuntimeTab(BaseTab):
         self.att_resize = QCheckBox("Auto-resize oversized images")
         self.att_resize.stateChanged.connect(self._t("attachment"))
         aform.addRow("Auto resize", self.att_resize)
-        self.att_w = self._spin(0)
+        self.att_w = self._spin(0, "attachment")
         aform.addRow("Max width", self.att_w)
-        self.att_h = self._spin(0)
+        self.att_h = self._spin(0, "attachment")
         aform.addRow("Max height", self.att_h)
-        self.att_bytes = self._spin(0)
+        self.att_bytes = self._spin(0, "attachment")
         aform.addRow("Max base64 bytes", self.att_bytes)
         lay.addWidget(att_box)
 
@@ -8452,15 +9963,15 @@ class RuntimeTab(BaseTab):
         self.lsp = BoolObjectCombo(app, "lsp")
         self.lsp.combo.currentIndexChanged.connect(self._t("lsp"))
         aform.addRow("LSP", self.lsp)
-        self.watcher_ignore = StringListEdit(app, ["watcher", "ignore"], "glob")
+        self.watcher_ignore = self._list(["watcher", "ignore"], "glob", "watcher")
         aform.addRow("Watcher ignore", self.watcher_ignore)
-        self.instructions = StringListEdit(app, ["instructions"], "path/glob")
+        self.instructions = self._list(["instructions"], "path/glob", "instructions")
         aform.addRow("Instructions", self.instructions)
-        self.skills_paths = StringListEdit(app, ["skills", "paths"], "path")
+        self.skills_paths = self._list(["skills", "paths"], "path", "skills")
         aform.addRow("Skill paths", self.skills_paths)
-        self.skills_urls = StringListEdit(app, ["skills", "urls"], "url")
+        self.skills_urls = self._list(["skills", "urls"], "url", "skills")
         aform.addRow("Skill URLs", self.skills_urls)
-        self.tools = BoolMapEditor(app, ["tools"])
+        self.tools = BoolMapEditor(self.app, ["tools"], on_change=self._t("tools"))
         aform.addRow("Tools", self.tools)
         lay.addWidget(adv_box)
 
@@ -8479,21 +9990,40 @@ class RuntimeTab(BaseTab):
         self.exp_loop = QCheckBox("Continue loop on deny")
         self.exp_loop.stateChanged.connect(self._t("experimental"))
         eform.addRow("Continue loop on deny", self.exp_loop)
-        self.exp_mcp_timeout = self._spin(0)
+        self.exp_mcp_timeout = self._spin(0, "experimental")
         eform.addRow("MCP timeout (ms)", self.exp_mcp_timeout)
-        self.exp_primary_tools = StringListEdit(app, ["experimental", "primary_tools"], "tool")
+        self.exp_primary_tools = self._list(
+            ["experimental", "primary_tools"], "tool", "experimental")
         eform.addRow("Primary-only tools", self.exp_primary_tools)
         eform.addRow("Policies", self._build_policies_table())
         lay.addWidget(exp_box)
         lay.addStretch(1)
 
     # --- helpers ---
-    def _spin(self, lo=0):
+    def _spin(self, lo=0, group="server"):
         s = QSpinBox()
         s.setRange(lo, 2**31 - 1)
         s.setSpecialValueText("(unset)")
-        s.valueChanged.connect(lambda *_: self.app.mark_dirty())
+        s.valueChanged.connect(self._t(group))
         return s
+
+    def _list(self, path, placeholder, group):
+        return StringListEdit(self.app, path, placeholder, on_change=self._t(group))
+
+    @staticmethod
+    def _opt_int(spin):
+        """Value of a '(unset)' spinbox: None at the sentinel, else the number.
+
+        Keeps a schema-valid 0 distinct from "not set" (OC-17).
+        """
+        return None if spin.value() <= spin.minimum() else spin.value()
+
+    def _set_opt_spin(self, spin, val):
+        """Populate a '-1 == (unset)' spinbox, keeping a real 0 visible."""
+        spin.blockSignals(True)
+        ok = isinstance(val, int) and not isinstance(val, bool) and val >= 0
+        spin.setValue(val if ok else -1)
+        spin.blockSignals(False)
 
     def _build_policies_table(self):
         w = QWidget()
@@ -8545,9 +10075,9 @@ class RuntimeTab(BaseTab):
         comp = data.get("compaction") if isinstance(data.get("compaction"), dict) else {}
         self._set_checked(self.comp_auto, comp.get("auto", True))
         self._set_checked(self.comp_prune, comp.get("prune", False))
-        self._set_spin(self.comp_reserved, comp.get("reserved"))
-        self._set_spin(self.comp_tail, comp.get("tail_turns"))
-        self._set_spin(self.comp_preserve, comp.get("preserve_recent_tokens"))
+        self._set_opt_spin(self.comp_reserved, comp.get("reserved"))
+        self._set_opt_spin(self.comp_tail, comp.get("tail_turns"))
+        self._set_opt_spin(self.comp_preserve, comp.get("preserve_recent_tokens"))
 
         toolo = data.get("tool_output") if isinstance(data.get("tool_output"), dict) else {}
         self._set_spin(self.tool_lines, toolo.get("max_lines"))
@@ -8597,7 +10127,8 @@ class RuntimeTab(BaseTab):
             self._put(srv, "hostname", self.server_host.value(), "")
             self._put(srv, "mdns", self.server_mdns.isChecked(), None)
             self._put(srv, "mdnsDomain", self.server_mdns_domain.value(), "")
-            self.server_cors.collect(srv)
+            # collect from the root: data_path is absolute (["server","cors"])
+            self.server_cors.collect(data)
             if not srv:
                 data.pop("server", None)
 
@@ -8605,9 +10136,9 @@ class RuntimeTab(BaseTab):
             comp = data.setdefault("compaction", {})
             self._put(comp, "auto", self.comp_auto.isChecked(), True)
             self._put(comp, "prune", self.comp_prune.isChecked(), False)
-            self._put(comp, "reserved", self.comp_reserved.value() or None, None)
-            self._put(comp, "tail_turns", self.comp_tail.value() or None, None)
-            self._put(comp, "preserve_recent_tokens", self.comp_preserve.value() or None, None)
+            self._put(comp, "reserved", self._opt_int(self.comp_reserved), None)
+            self._put(comp, "tail_turns", self._opt_int(self.comp_tail), None)
+            self._put(comp, "preserve_recent_tokens", self._opt_int(self.comp_preserve), None)
             if not comp:
                 data.pop("compaction", None)
 
@@ -8634,12 +10165,20 @@ class RuntimeTab(BaseTab):
         if "lsp" in self._touched:
             self.lsp.collect(data)
 
-        if "watcher" in self._touched or "instructions" in self._touched \
-                or "skills" in self._touched or "tools" in self._touched:
-            self.watcher_ignore.collect(data.setdefault("watcher", {}))
+        if "watcher" in self._touched:
+            self.watcher_ignore.collect(data)
+            # only prune wrappers this branch just created: an untouched
+            # {"watcher": {}} must round-trip unchanged.
+            if isinstance(data.get("watcher"), dict) and not data["watcher"]:
+                data.pop("watcher")
+        if "instructions" in self._touched:
             self.instructions.collect(data)
-            self.skills_paths.collect(data.setdefault("skills", {}))
-            self.skills_urls.collect(data.setdefault("skills", {}))
+        if "skills" in self._touched:
+            self.skills_paths.collect(data)
+            self.skills_urls.collect(data)
+            if isinstance(data.get("skills"), dict) and not data["skills"]:
+                data.pop("skills")
+        if "tools" in self._touched:
             self.tools.collect(data)
 
         if "experimental" in self._touched:
@@ -8649,14 +10188,24 @@ class RuntimeTab(BaseTab):
             self._put(exp, "openTelemetry", self.exp_otel.isChecked(), False)
             self._put(exp, "continue_loop_on_deny", self.exp_loop.isChecked(), False)
             self._put(exp, "mcp_timeout", self.exp_mcp_timeout.value() or None, None)
-            self.exp_primary_tools.collect(exp)
+            self.exp_primary_tools.collect(data)
             pols = []
             for r in range(self.policies.rowCount()):
                 eff = self.policies.item(r, 0).text() if self.policies.item(r, 0) else ""
                 act = self.policies.item(r, 1).text() if self.policies.item(r, 1) else ""
                 res = self.policies.item(r, 2).text() if self.policies.item(r, 2) else ""
-                if act and res:
-                    pols.append({"effect": eff, "action": act, "resource": res})
+                if not (eff and act and res):
+                    continue
+                if eff not in ("allow", "deny") or act != "provider.use":
+                    # Policy requires a valid effect/action; an incomplete row
+                    # would make opencode refuse the whole config.
+                    QMessageBox.warning(
+                        self, "Policies",
+                        f"Skipped row {r + 1}: effect must be allow/deny and "
+                        "action must be provider.use.",
+                    )
+                    continue
+                pols.append({"effect": eff, "action": act, "resource": res})
             self._put(exp, "policies", pols, [])
             if not exp:
                 data.pop("experimental", None)
@@ -8699,10 +10248,15 @@ class AgentEditDialog(QDialog):
             self.top_p.setValue(cfg["top_p"])
         form.addRow("Top P", self.top_p)
         self.steps = QSpinBox()
-        self.steps.setRange(-1, 10**6)
+        # -1 == '(inherit)': the schema requires steps > 0, so a dialog that
+        # was never touched must omit the key rather than write steps: 0.
+        self.steps.setRange(0, 10**6)
         self.steps.setSpecialValueText("(inherit)")
-        if isinstance(cfg.get("steps"), int):
-            self.steps.setValue(cfg["steps"])
+        seed_steps = cfg.get("steps", cfg.get("maxSteps"))
+        self.steps.setValue(int(seed_steps) if isinstance(seed_steps, int)
+                            and not isinstance(seed_steps, bool) and seed_steps > 0 else 0)
+        self._steps_set = isinstance(seed_steps, int) and not isinstance(seed_steps, bool) \
+            and seed_steps > 0
         form.addRow("Steps", self.steps)
         self.hidden = QCheckBox("Hidden from @ menu")
         self.hidden.setChecked(bool(cfg.get("hidden", False)))
@@ -8711,12 +10265,21 @@ class AgentEditDialog(QDialog):
         self.disable.setChecked(bool(cfg.get("disable", False)))
         form.addRow("Disable", self.disable)
         self.color_edit = QLineEdit(cfg.get("color", "") or "")
+        self.color_edit.setPlaceholderText("#FF5733 or primary")
         form.addRow("Color", self.color_edit)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(self.accept)
+        bb.accepted.connect(self._try_accept)
         bb.rejected.connect(self.reject)
         form.addRow(bb)
+
+    def _try_accept(self):
+        """Refuse to close on an invalid color so the input is not lost."""
+        err = self.color_error()
+        if err:
+            QMessageBox.warning(self, "Agent", err)
+            return
+        self.accept()
 
     def _double(self, sentinel):
         d = QDoubleSpinBox()
@@ -8741,9 +10304,22 @@ class AgentEditDialog(QDialog):
             out["temperature"] = self.temp.value()
         if self.top_p.value() != -1000:
             out["top_p"] = self.top_p.value()
-        if self.steps.value() != -1:
-            out["steps"] = self.steps.value()
+        # 0 means "inherit": emit None so an existing steps value is removed.
+        # The schema (exclusiveMinimum: 0) rejects steps: 0.
+        out["steps"] = self.steps.value() or None
         return out
+
+    def color_error(self) -> str:
+        """Return an error message for an invalid color, or "" when valid."""
+        v = self.color_edit.text().strip()
+        if not v:
+            return ""
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+            return ""
+        if v in ("primary", "secondary", "accent", "success", "warning", "error", "info"):
+            return ""
+        return ("Color must be a hex code like #FF5733, or one of: primary, "
+                "secondary, accent, success, warning, error, info")
 
 
 class AgentsTab(QWidget):
@@ -8817,14 +10393,26 @@ class AgentsTab(QWidget):
 
     def _add(self):
         dlg = AgentEditDialog(self)
-        if dlg.exec() and dlg.values()["name"]:
-            v = dlg.values()
-            name = v.pop("name")
-            self.app.snapshot_state()
-            agents = self.app.cfg.data.setdefault("agent", {})
-            agents[name] = {k: val for k, val in v.items() if val not in (None, "")}
-            self.app.mark_dirty()
-            self.refresh()
+        if not dlg.exec():
+            return
+        err = dlg.color_error()
+        if err:
+            QMessageBox.warning(self, "Agent", err)
+            return
+        v = dlg.values()
+        name = v.pop("name")
+        if not name:
+            return
+        if name in self._agents():
+            QMessageBox.information(
+                self, "Agent", f"An agent named '{name}' already exists.\n"
+                "Use Edit to change it.")
+            return
+        self.app.snapshot_state()
+        agents = self.app.cfg.data.setdefault("agent", {})
+        agents[name] = {k: val for k, val in v.items() if val not in (None, "")}
+        self.app.mark_dirty()
+        self.refresh()
 
     def _edit(self, name=None):
         if name is None:
@@ -8833,22 +10421,31 @@ class AgentsTab(QWidget):
                 return
         cfg = dict(self._agents().get(name, {}))
         dlg = AgentEditDialog(self, name=name, cfg=cfg)
-        if dlg.exec():
-            v = dlg.values()
-            newname = v.pop("name") or name
-            self.app.snapshot_state()
-            agents = self.app.cfg.data.setdefault("agent", {})
-            merged = dict(cfg)  # preserve unknown keys (permission, options, tools, ...)
-            for k, val in v.items():
-                if val in (None, ""):
-                    merged.pop(k, None)
-                else:
-                    merged[k] = val
-            if newname != name:
-                agents.pop(name, None)
-            agents[newname] = merged
-            self.app.mark_dirty()
-            self.refresh()
+        if not dlg.exec():
+            return
+        err = dlg.color_error()
+        if err:
+            QMessageBox.warning(self, "Agent", err)
+            return
+        v = dlg.values()
+        newname = v.pop("name") or name
+        if newname != name and newname in self._agents():
+            QMessageBox.information(
+                self, "Agent", f"An agent named '{newname}' already exists.")
+            return
+        self.app.snapshot_state()
+        agents = self.app.cfg.data.setdefault("agent", {})
+        merged = dict(cfg)  # preserve unknown keys (permission, options, tools, ...)
+        for k, val in v.items():
+            if val in (None, ""):
+                merged.pop(k, None)
+            else:
+                merged[k] = val
+        if newname != name:
+            agents.pop(name, None)
+        agents[newname] = merged
+        self.app.mark_dirty()
+        self.refresh()
 
     def _remove(self, name=None):
         if name is None:
@@ -8928,8 +10525,8 @@ class CommandsTab(QWidget):
             top.addWidget(b)
         lay.addLayout(top)
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Name", "Description", "Agent", "Model"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Name", "Description", "Agent", "Model", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         lay.addWidget(self.table)
@@ -8981,14 +10578,22 @@ class CommandsTab(QWidget):
 
     def _add(self):
         dlg = CommandEditDialog(self)
-        if dlg.exec() and dlg.values()["name"] and dlg.values()["template"]:
-            v = dlg.values()
-            name = v.pop("name")
-            self.app.snapshot_state()
-            commands = self.app.cfg.data.setdefault("command", {})
-            commands[name] = {k: val for k, val in v.items() if val not in (None, "")}
-            self.app.mark_dirty()
-            self.refresh()
+        if not dlg.exec():
+            return
+        v = dlg.values()
+        name = v.pop("name")
+        if not name or not v.get("template"):
+            return
+        if name in self._commands():
+            QMessageBox.information(
+                self, "Command", f"A command named '{name}' already exists.\n"
+                "Use Edit to change it.")
+            return
+        self.app.snapshot_state()
+        commands = self.app.cfg.data.setdefault("command", {})
+        commands[name] = {k: val for k, val in v.items() if val not in (None, "")}
+        self.app.mark_dirty()
+        self.refresh()
 
     def _edit(self, name=None):
         if name is None:
@@ -8997,17 +10602,24 @@ class CommandsTab(QWidget):
                 return
         cfg = dict(self._commands().get(name, {}))
         dlg = CommandEditDialog(self, name=name, cfg=cfg)
-        if dlg.exec() and dlg.values()["template"]:
-            v = dlg.values()
-            newname = v.pop("name") or name
-            self.app.snapshot_state()
-            commands = self.app.cfg.data.setdefault("command", {})
-            merged = {k: val for k, val in v.items() if val not in (None, "")}
-            if newname != name:
-                commands.pop(name, None)
-            commands[newname] = merged
-            self.app.mark_dirty()
-            self.refresh()
+        if not dlg.exec():
+            return
+        v = dlg.values()
+        if not v.get("template"):
+            return
+        newname = v.pop("name") or name
+        if newname != name and newname in self._commands():
+            QMessageBox.information(
+                self, "Command", f"A command named '{newname}' already exists.")
+            return
+        self.app.snapshot_state()
+        commands = self.app.cfg.data.setdefault("command", {})
+        merged = {k: val for k, val in v.items() if val not in (None, "")}
+        if newname != name:
+            commands.pop(name, None)
+        commands[newname] = merged
+        self.app.mark_dirty()
+        self.refresh()
 
     def _remove(self, name=None):
         if name is None:
@@ -9107,25 +10719,42 @@ class TuiPluginEditor(QWidget):
         return name in self._active_names()
 
     def _migrate_file_flag(self):
+        """Move disabled plugins that exist in the `plugin` list into the editor
+        cache, and keep every other `plugin_enabled` entry in the file.
+
+        `plugin_enabled` is schema-valid for names the editor has no `plugin`
+        entry for (built-in TUI plugins) and for `true` values, so those must
+        survive untouched (OC-09).
+        """
         data = self._data
         path = self._cfg_path()
         if path is None or not isinstance(data.get("plugin_enabled"), dict):
             return
         flagged = {n for n, v in data["plugin_enabled"].items() if v is False}
         plugin = data.get("plugin", [])
+        migrated = set()
         if flagged:
             kept = []
             for entry in plugin:
                 name = self._name_of(entry)
                 if name in flagged:
                     self.state_store.set_entry(path, name, entry)
+                    migrated.add(name)
                 else:
                     kept.append(entry)
             if kept:
                 data["plugin"] = kept
             else:
                 data.pop("plugin", None)
-        data.pop("plugin_enabled", None)
+        # Everything the editor does not own stays in the file: `true` entries,
+        # and `false` entries for names absent from the `plugin` list (built-in
+        # TUI plugins the editor cannot re-enable from here).
+        residual = {k: v for k, v in data["plugin_enabled"].items()
+                    if not (v is False and k in migrated)}
+        if residual:
+            data["plugin_enabled"] = residual
+        else:
+            data.pop("plugin_enabled", None)
 
     def _display_entries(self):
         path = self._cfg_path()
@@ -9280,7 +10909,9 @@ class TuiPluginEditor(QWidget):
         self.refresh()
 
     def collect(self, data):
-        data.pop("plugin_enabled", None)
+        """Leave `plugin_enabled` alone: entries the editor does not own are
+        preserved verbatim (migrated ones were already dropped on refresh)."""
+        pass
 
 
 class TuiTab(BaseTab):
@@ -9360,11 +10991,21 @@ class TuiTab(BaseTab):
         self.prompt_h.valueChanged.connect(self._t("prompt"))
         form.addRow("Prompt max height", self.prompt_h)
 
+        # max_width is `int > 0 | "auto"`; 0 stays "(unset)" and a checkbox
+        # selects the literal "auto" value (OC-15).
+        pw_row = QWidget()
+        pw_lay = QHBoxLayout(pw_row)
+        pw_lay.setContentsMargins(0, 0, 0, 0)
         self.prompt_w = QSpinBox()
         self.prompt_w.setRange(0, 10**6)
-        self.prompt_w.setSpecialValueText("(auto)")
+        self.prompt_w.setSpecialValueText("(unset)")
         self.prompt_w.valueChanged.connect(self._t("prompt"))
-        form.addRow("Prompt max width", self.prompt_w)
+        pw_lay.addWidget(self.prompt_w)
+        self.prompt_w_auto = QCheckBox("auto")
+        self.prompt_w_auto.toggled.connect(self._t("prompt"))
+        pw_lay.addWidget(self.prompt_w_auto)
+        self.prompt_w_auto.toggled.connect(self.prompt_w.setDisabled)
+        form.addRow("Prompt max width", pw_row)
 
         self.plugins = TuiPluginEditor(app)
         form.addRow("Plugins", self.plugins)
@@ -9399,7 +11040,13 @@ class TuiTab(BaseTab):
         self._set_double(self.att_volume, att.get("volume", 0.4))
         prompt = data.get("prompt") if isinstance(data.get("prompt"), dict) else {}
         self._set_spin(self.prompt_h, prompt.get("max_height"))
-        self._set_spin(self.prompt_w, prompt.get("max_width"))
+        pw = prompt.get("max_width")
+        is_auto = pw == "auto"
+        self.prompt_w_auto.blockSignals(True)
+        self.prompt_w_auto.setChecked(is_auto)
+        self.prompt_w_auto.blockSignals(False)
+        self.prompt_w.setDisabled(is_auto)
+        self._set_spin(self.prompt_w, None if is_auto else pw)
         self.plugins.refresh()
 
     def collect(self, data):
@@ -9437,7 +11084,10 @@ class TuiTab(BaseTab):
         if "prompt" in self._touched:
             prompt = data.setdefault("prompt", {})
             self._put(prompt, "max_height", self.prompt_h.value() or None, None)
-            self._put(prompt, "max_width", self.prompt_w.value() or None, None)
+            if self.prompt_w_auto.isChecked():
+                prompt["max_width"] = "auto"
+            else:
+                self._put(prompt, "max_width", self.prompt_w.value() or None, None)
             if not prompt:
                 data.pop("prompt", None)
         self.plugins.collect(data)
@@ -9459,9 +11109,10 @@ class GeneralTab(QWidget):
         self.schema_edit.edit.editingFinished.connect(self.app.mark_dirty)
         layout.addRow("$schema", self.schema_edit)
 
-        # Autoupdate: true | false | "notify"
+        # Autoupdate: absent | false | true | "notify"
         self.autoupdate_combo = QComboBox()
-        for label, val in [("Off (false)", False), ("On (true)", True), ("Notify (\"notify\")", "notify")]:
+        for label, val in [("(default)", "__absent__"), ("Off (false)", False),
+                           ("On (true)", True), ('Notify ("notify")', "notify")]:
             self.autoupdate_combo.addItem(label, val)
         self.autoupdate_combo.currentIndexChanged.connect(self.app.mark_dirty)
         layout.addRow("Autoupdate", self.autoupdate_combo)
@@ -9481,9 +11132,9 @@ class GeneralTab(QWidget):
         self.default_agent_edit.edit.editingFinished.connect(self.app.mark_dirty)
         layout.addRow("Default Agent", self.default_agent_edit)
 
-        # Subagent depth
+        # Subagent depth: -1 is '(default)'; 0 is a distinct, schema-valid value
         self.subagent_depth = QSpinBox()
-        self.subagent_depth.setRange(0, 100)
+        self.subagent_depth.setRange(-1, 100)
         self.subagent_depth.setSpecialValueText("(default)")
         self.subagent_depth.valueChanged.connect(self._depth_changed)
         layout.addRow("Subagent Depth", self.subagent_depth)
@@ -9509,7 +11160,8 @@ class GeneralTab(QWidget):
 
         # Share
         self.share_combo = QComboBox()
-        for label, val in [("(default)", ""), ("true", "true"), ("false", "false")]:
+        for label, val in [("(default)", ""), ("manual", "manual"),
+                           ("auto", "auto"), ("disabled", "disabled")]:
             self.share_combo.addItem(label, val)
         self.share_combo.currentIndexChanged.connect(self.app.mark_dirty)
         layout.addRow("Share", self.share_combo)
@@ -9551,7 +11203,14 @@ class GeneralTab(QWidget):
         data = self.app.cfg.data if self.app.cfg else {}
         self.schema_edit.set_value(data.get("$schema", ""))
         au = data.get("autoupdate")
-        idx = 0 if au is False or au is None else (1 if au is True else 2)
+        if au is False:
+            idx = 1
+        elif au is True:
+            idx = 2
+        elif au == "notify":
+            idx = 3
+        else:
+            idx = 0
         self.autoupdate_combo.blockSignals(True)
         self.autoupdate_combo.setCurrentIndex(idx)
         self.autoupdate_combo.blockSignals(False)
@@ -9560,7 +11219,10 @@ class GeneralTab(QWidget):
         self.default_agent_edit.set_value(data.get("default_agent", ""))
         self._depth_touched = False
         self.subagent_depth.blockSignals(True)
-        self.subagent_depth.setValue(int(data["subagent_depth"]) if isinstance(data.get("subagent_depth"), int) else 0)
+        depth = data.get("subagent_depth")
+        self.subagent_depth.setValue(
+            int(depth) if isinstance(depth, int) and not isinstance(depth, bool)
+            and depth >= 0 else -1)
         self.subagent_depth.blockSignals(False)
         self.username_edit.set_value(data.get("username", ""))
         self.shell_edit.set_value(data.get("shell", ""))
@@ -9570,13 +11232,14 @@ class GeneralTab(QWidget):
         self.loglevel_combo.setCurrentIndex(ll_idx if ll_idx >= 0 else 0)
         self.loglevel_combo.blockSignals(False)
         sh = data.get("share")
-        sh_idx = self.share_combo.findData("true" if sh is True else ("false" if sh is False else ""))
+        sh_idx = self.share_combo.findData(sh if isinstance(sh, str) else "")
         self.share_combo.blockSignals(True)
         self.share_combo.setCurrentIndex(sh_idx if sh_idx >= 0 else 0)
         self.share_combo.blockSignals(False)
         self._snapshot_touched = False
         self.snapshot_check.blockSignals(True)
-        self.snapshot_check.setChecked(bool(data.get("snapshot", False)))
+        # snapshot defaults to true, so an absent key must show as enabled
+        self.snapshot_check.setChecked(data.get("snapshot") is not False)
         self.snapshot_check.blockSignals(False)
         self.disabled_providers.refresh()
         self.enabled_providers.refresh()
@@ -9587,7 +11250,7 @@ class GeneralTab(QWidget):
             data["$schema"] = self.schema_edit.value()
 
         au = self.autoupdate_combo.currentData()
-        if au is False:
+        if au == "__absent__":
             data.pop("autoupdate", None)
         else:
             data["autoupdate"] = au
@@ -9606,7 +11269,11 @@ class GeneralTab(QWidget):
                 data.pop(key, None)
 
         if self._depth_touched:
-            data["subagent_depth"] = self.subagent_depth.value()
+            # -1 is '(default)'; 0 is a real, schema-valid depth
+            if self.subagent_depth.value() >= 0:
+                data["subagent_depth"] = self.subagent_depth.value()
+            else:
+                data.pop("subagent_depth", None)
 
         ll = self.loglevel_combo.currentData()
         if ll:
@@ -9615,18 +11282,14 @@ class GeneralTab(QWidget):
             data.pop("logLevel", None)
 
         sh = self.share_combo.currentData()
-        if sh == "true":
-            data["share"] = True
-        elif sh == "false":
-            data["share"] = False
+        if sh:
+            data["share"] = sh
         else:
             data.pop("share", None)
 
         if self._snapshot_touched:
-            if self.snapshot_check.isChecked():
-                data["snapshot"] = True
-            else:
-                data.pop("snapshot", None)
+            # snapshot defaults to true, so "off" must be written as false.
+            data["snapshot"] = self.snapshot_check.isChecked()
 
         self.disabled_providers.collect(data)
         self.enabled_providers.collect(data)
@@ -9687,7 +11350,36 @@ class RawJsonTab(QWidget):
     def _modified(self, val):
         self.__modified = val
 
+    def _commit_pending(self):
+        """Parse the editor text into the config it belongs to before switching
+        away, so a raw edit is not silently thrown away (OC-16)."""
+        if not self._modified:
+            return True
+        kind = self.app._raw_kind
+        text = self.editor.toPlainText()
+        if not text.strip():
+            return True
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(
+                self, "Raw JSON", f"Invalid JSON, keeping the previous values:\n\n{e}")
+            return False
+        cfg = self.app.cfg_tui if kind == "tui" else self.app.cfg_oc
+        if cfg is None or not isinstance(parsed, dict):
+            return True
+        cfg.data.clear()
+        cfg.data.update(parsed)
+        return True
+
     def _switch_file(self):
+        prev = self.app._raw_kind
+        if prev != self.file_combo.currentData() and not self._commit_pending():
+            # the text belongs to the previous file: put the combo back
+            self.file_combo.blockSignals(True)
+            self.file_combo.setCurrentIndex(max(0, self.file_combo.findData(prev)))
+            self.file_combo.blockSignals(False)
+            return
         self.app._raw_kind = self.file_combo.currentData()
         self.refresh()
 
@@ -9939,6 +11631,19 @@ OPENCLAUDE_MCP_TYPES = ("stdio", "http", "sse")
 #     drop-ins (sorted), and managed-mcp.json holds policy MCP servers.
 #   - projects[] key = normalize(cwd) with backslashes replaced by "/".
 
+def _needs_jsonc(raw: str) -> bool:
+    """True when `raw` only parses as JSONC (comments, BOM or trailing commas),
+    i.e. saving it back as plain json.dumps would drop something."""
+    if not raw:
+        return False
+    if raw.lstrip(" \t\r\n").startswith("\ufeff"):
+        return True
+    try:
+        json.loads(raw)
+        return False
+    except (ValueError, TypeError):
+        return True
+
 def default_managed_dir() -> Path:
     if sys.platform == "darwin":
         return Path("/Library/Application Support/ClaudeCode")
@@ -9981,11 +11686,17 @@ class LayeredConfigFile:
         # path-str -> error message for files that exist but are unparsable;
         # guards the form-save path against clobbering them with empty dicts.
         self.parse_errors = {}
+        # path-str -> True for files that needed loads_jsonc (comments/BOM);
+        # the form-save path asks before rewriting them without comments.
+        self.jsonc_files = set()
 
     def _read(self, path) -> dict:
         try:
             if Path(path).exists():
-                data = loads_jsonc(Path(path).read_text(encoding="utf-8"))
+                raw = Path(path).read_text(encoding="utf-8")
+                if _needs_jsonc(raw):
+                    self.jsonc_files.add(str(path))
+                data = loads_jsonc(raw)
                 return data if isinstance(data, dict) else {}
         except OSError as e:
             self.parse_errors[str(path)] = str(e)
@@ -9995,6 +11706,7 @@ class LayeredConfigFile:
 
     def load(self) -> bool:
         self.parse_errors = {}
+        self.jsonc_files = set()
         for name, path in self.layer_files.items():
             self.layers[name] = self._read(path)
         self.global_data = self._read(self.global_file)
@@ -10045,7 +11757,28 @@ class LayeredConfigFile:
 
     def save_global(self, data: dict) -> Tuple[bool, str]:
         """Atomically write the global ~/.openclaude.json (providers/routing/mcp)."""
-        return self._atomic_write(self.global_file, data, on_ok=lambda: setattr(self, "global_data", data))
+        ok, msg = self._atomic_write(self.global_file, data, on_ok=lambda: setattr(self, "global_data", data))
+        if ok:
+            self._prune_provider_trash(data)
+        return ok, msg
+
+    def _prune_provider_trash(self, data: dict):
+        """Drop trash entries for profiles present in the just-saved global file
+        (keys: profile id, or "agentModels:<name>" for legacy rows). Best-effort:
+        never changes the save result."""
+        present = set()
+        profiles = data.get("providerProfiles")
+        if isinstance(profiles, list):
+            present.update(str(p["id"]) for p in profiles if isinstance(p, dict) and p.get("id"))
+        legacy = data.get("agentModels")
+        if isinstance(legacy, dict):
+            present.update(f"agentModels:{k}" for k in legacy)
+        if not present:
+            return
+        try:
+            ProviderTrashStore().prune(self.global_file, present)
+        except Exception:
+            pass
 
     def save_project_mcp(self, data: dict) -> Tuple[bool, str]:
         """Atomically write the project-scope .mcp.json."""
@@ -10058,6 +11791,7 @@ class LayeredConfigFile:
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
             self.parse_errors.pop(str(path), None)
+            self.jsonc_files.discard(str(path))
             if on_ok:
                 on_ok()
             return True, f"Saved to {path}"
@@ -10464,8 +12198,16 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         self._had_active = False    # global file already had activeProviderProfileId
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel("Providers — providerProfiles in ~/.openclaude.json "
-                                "(apiKey is masked; other fields like id/authScheme are preserved):"))
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(QLabel("Providers — providerProfiles in ~/.openclaude.json "
+                                    "(apiKey is masked; other fields like id/authScheme are preserved):"))
+        top_layout.addStretch()
+        self.show_trash_chk = QCheckBox("Show deleted")
+        self.show_trash_chk.setToolTip(f"Removed providers are kept in {PROVIDER_TRASH_FILE}")
+        self.show_trash_chk.toggled.connect(lambda _: self._reload_trash_rows())
+        top_layout.addWidget(self.show_trash_chk)
+        layout.addLayout(top_layout)
+
         self.models_table = QTableWidget(0, len(self.COLS))
         self.models_table.setHorizontalHeaderLabels(self.COLS)
         self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -10475,8 +12217,16 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         add_m.clicked.connect(lambda: self._add_model_row())
         del_m = QPushButton("Remove selected")
         del_m.clicked.connect(self._remove_model_row)
+        self.restore_btn = QPushButton("Restore selected")
+        self.restore_btn.clicked.connect(self._restore_trash_rows)
+        self.purge_btn = QPushButton("Delete permanently")
+        self.purge_btn.clicked.connect(self._purge_trash_rows)
+        for btn in (self.restore_btn, self.purge_btn):
+            btn.setEnabled(False)    # act on deleted rows; enabled with "Show deleted"
         mbtn.addWidget(add_m)
         mbtn.addWidget(del_m)
+        mbtn.addWidget(self.restore_btn)
+        mbtn.addWidget(self.purge_btn)
         mbtn.addStretch()
         layout.addLayout(mbtn)
 
@@ -10522,9 +12272,22 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         self._mark_edited()
 
     # --- provider rows (providerProfiles) ---
+    # Deleted (trash) rows are display-only and sit below the live rows; their
+    # name item carries the trash key under this role.
+    TRASH_ROLE = Qt.UserRole + 1
+
+    def _flag_of(self, r):
+        """Trash key of a display-only deleted row, else None (live row)."""
+        item = self.models_table.item(r, 0)
+        return item.data(self.TRASH_ROLE) if item else None
+
+    def _first_trash_row(self):
+        n = self.models_table.rowCount()
+        return next((r for r in range(n) if self._flag_of(r)), n)
+
     def _add_model_row(self, profile=None):
         profile = profile if isinstance(profile, dict) else {}
-        r = self.models_table.rowCount()
+        r = self._first_trash_row()          # live rows stay above deleted ones
         self.models_table.insertRow(r)
         name_item = QTableWidgetItem(str(profile.get("name", "")))
         # Preserve the original profile dict (id, authHeader, authScheme, ...).
@@ -10538,9 +12301,185 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         self.models_table.setCellWidget(r, 4, masked)
         self._edited()
 
+    @staticmethod
+    def _legacy_row(key, spec):
+        """Row shape (_add_model_row input) for a legacy agentModels entry."""
+        spec = spec if isinstance(spec, dict) else {}
+        row = dict(spec)   # keep any extra legacy keys
+        row.update({"name": key, "provider": spec.get("provider", ""),
+                    "baseUrl": spec.get("base_url", ""), "model": spec.get("model", ""),
+                    "apiKey": spec.get("api_key", ""), "_legacy_agentModels": True})
+        return row
+
+    def _row_entry(self, r):
+        """(kind, name, value) for live row r, exactly as collect() writes it:
+        ("legacy", name, agentModels spec) or ("profile", name, profile dict).
+        None for a row without a name (collect skips those)."""
+        name_item = self.models_table.item(r, 0)
+        name = name_item.text().strip() if name_item else ""
+        if not name:
+            return None
+        orig = self.preserved(name_item)
+        provider = self._cell(r, 1)
+        base_url = self._cell(r, 2)
+        model = self._cell(r, 3)
+        widget = self.models_table.cellWidget(r, 4)
+        api_key = widget.value().strip() if widget else ""
+
+        if orig.pop("_legacy_agentModels", False):
+            spec = dict(orig)  # preserve extra legacy keys
+            for mirror in ("name", "provider", "baseUrl", "model", "apiKey"):
+                spec.pop(mirror, None)   # UI mirrors, not schema keys
+            self._set_or_pop(spec, "base_url", base_url)
+            self._set_or_pop(spec, "model", model)
+            self._set_or_pop(spec, "api_key", api_key)
+            return "legacy", name, spec
+
+        prof = dict(orig)
+        prof["name"] = name
+        if not prof.get("id"):
+            prof["id"] = f"provider_{os.urandom(6).hex()}"
+        self._set_or_pop(prof, "provider", provider)
+        self._set_or_pop(prof, "baseUrl", base_url)
+        self._set_or_pop(prof, "model", model)
+        self._set_or_pop(prof, "apiKey", api_key)
+        return "profile", name, prof
+
+    def _trash_entry(self, r):
+        """(trash_key, entry) for live row r; the entry is _add_model_row input."""
+        got = self._row_entry(r)
+        if got is None:
+            return None
+        kind, name, value = got
+        if kind == "legacy":
+            return f"agentModels:{name}", self._legacy_row(name, value)
+        return str(value["id"]), value
+
+    def _live_keys(self):
+        keys = set()
+        for r in range(self.models_table.rowCount()):
+            item = self.models_table.item(r, 0)
+            if item is None or self._flag_of(r):
+                continue
+            orig = self.preserved(item)
+            if orig.get("_legacy_agentModels"):
+                keys.add(f"agentModels:{item.text().strip()}")
+            elif orig.get("id"):
+                keys.add(str(orig["id"]))
+        return keys
+
+    def _trashed(self):
+        """Trash entries of the global file whose key is not a live row."""
+        layered = self._layered()
+        if layered is None:
+            return {}
+        live = self._live_keys()
+        return {k: v for k, v in ProviderTrashStore().entries(layered.global_file).items()
+                if k not in live}
+
+    def _append_trash_row(self, key, entry):
+        entry = entry if isinstance(entry, dict) else {}
+        r = self.models_table.rowCount()
+        self.models_table.insertRow(r)
+        for c, fld in enumerate(("name", "provider", "baseUrl", "model")):
+            item = QTableWidgetItem(str(entry.get(fld, "")))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            font = item.font()
+            font.setItalic(True)
+            item.setFont(font)
+            item.setForeground(Qt.gray)
+            self.models_table.setItem(r, c, item)
+        self.models_table.item(r, 0).setData(self.TRASH_ROLE, key)
+        masked = MaskedLineEdit(str(entry.get("apiKey", "")), field_name="apiKey")
+        masked.setEnabled(False)
+        self.models_table.setCellWidget(r, 4, masked)
+
+    def _reload_trash_rows(self):
+        """Sync the display-only deleted rows with the trash file. Live rows (and
+        their unsaved edits) are untouched and the tab is never marked dirty."""
+        show = self.show_trash_chk.isChecked()
+        for btn in (self.restore_btn, self.purge_btn):
+            btn.setEnabled(show)
+        prev = self.models_table.blockSignals(True)
+        try:
+            for r in reversed(range(self.models_table.rowCount())):
+                if self._flag_of(r):
+                    self.models_table.removeRow(r)
+            if show:
+                for key, entry in sorted(self._trashed().items()):
+                    self._append_trash_row(key, entry)
+        finally:
+            self.models_table.blockSignals(prev)
+
+    def _selected_rows(self):
+        rows = {i.row() for i in self.models_table.selectedItems()}
+        if not rows and self.models_table.currentRow() >= 0:
+            rows = {self.models_table.currentRow()}
+        return sorted(rows, reverse=True)
+
     def _remove_model_row(self):
-        if self.remove_current(self.models_table):
+        """Soft delete: move each selected provider (current, edited values) into
+        the trash file, then drop its row. It leaves the global file on Save."""
+        layered = self._layered()
+        rows = [r for r in self._selected_rows() if not self._flag_of(r)]
+        if layered is None or not rows:
+            return
+        store = ProviderTrashStore()
+        removed = False
+        for r in rows:    # descending, so earlier indices stay valid
+            got = self._trash_entry(r)
+            if got is not None:
+                try:
+                    store.put(layered.global_file, *got)
+                except (OSError, TypeError, ValueError) as e:
+                    QMessageBox.critical(self, "Remove provider",
+                                         f"Could not save the provider to the trash file; "
+                                         f"it was not removed:\n{e}")
+                    break
+            self.models_table.removeRow(r)
+            removed = True
+        if removed:
             self._edited()
+            self._reload_trash_rows()
+
+    def _selected_trash_keys(self):
+        return [k for k in (self._flag_of(r) for r in self._selected_rows()) if k]
+
+    def _restore_trash_rows(self):
+        """Turn selected deleted rows back into live rows. The trash entry stays
+        until a successful save prunes it, so restore-then-discard loses nothing."""
+        layered = self._layered()
+        keys = self._selected_trash_keys()
+        if layered is None or not keys:
+            return
+        trashed = self._trashed()       # excludes keys that are live again
+        for key in keys:
+            if key in trashed:
+                self._add_model_row(trashed[key])     # marks the tab edited
+        skipped = sum(key not in trashed for key in keys)
+        self._reload_trash_rows()
+        if skipped:
+            QMessageBox.warning(self, "Restore provider",
+                                f"{skipped} selected provider(s) not restored: already "
+                                "present, or no longer in the trash file.")
+
+    def _purge_trash_rows(self):
+        """Permanently drop selected deleted rows from the trash file."""
+        layered = self._layered()
+        keys = self._selected_trash_keys()
+        if layered is None or not keys:
+            return
+        if not _confirm(self, "Delete permanently",
+                        f"Permanently delete {len(keys)} provider(s) from the trash?\n\n"
+                        "This cannot be undone."):
+            return
+        store = ProviderTrashStore()
+        try:
+            for key in keys:
+                store.discard(layered.global_file, key)
+        except OSError as e:
+            QMessageBox.critical(self, "Delete permanently", str(e))
+        self._reload_trash_rows()
 
     # --- agentRouting rows ---
     def _add_route_row(self, agent="", key=""):
@@ -10576,12 +12515,7 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
             agent_models = data.get("agentModels") if isinstance(data.get("agentModels"), dict) else {}
             self._had_agent_models = "agentModels" in data
             for key, spec in agent_models.items():
-                spec = spec if isinstance(spec, dict) else {}
-                row = dict(spec)   # keep any extra legacy keys
-                row.update({"name": key, "provider": spec.get("provider", ""),
-                            "baseUrl": spec.get("base_url", ""), "model": spec.get("model", ""),
-                            "apiKey": spec.get("api_key", ""), "_legacy_agentModels": True})
-                self._add_model_row(row)
+                self._add_model_row(self._legacy_row(key, spec))
 
             chain = data.get("providerFallbackChain")
             self._set_text(self.fallback_edit,
@@ -10606,6 +12540,7 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
             routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
             for agent, key in routing.items():
                 self._add_route_row(str(agent), str(key))
+            self._reload_trash_rows()
         finally:
             self._loading = False
             self._dirty = False
@@ -10616,40 +12551,20 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         seen_names = set()
         dupes = set()
         for r in range(self.models_table.rowCount()):
-            name_item = self.models_table.item(r, 0)
-            name = name_item.text().strip() if name_item else ""
+            if self._flag_of(r):
+                continue             # deleted rows are display-only
+            name = self._cell(r, 0)
             if not name:
                 continue
             if name in seen_names:
                 dupes.add(name)      # reported below; first row wins
                 continue
             seen_names.add(name)
-            orig = self.preserved(name_item) if name_item else {}
-            provider = self._cell(r, 1)
-            base_url = self._cell(r, 2)
-            model = self._cell(r, 3)
-            widget = self.models_table.cellWidget(r, 4)
-            api_key = widget.value().strip() if widget else ""
-
-            if orig.pop("_legacy_agentModels", False):
-                spec = dict(orig)  # preserve extra legacy keys
-                for mirror in ("name", "provider", "baseUrl", "model", "apiKey"):
-                    spec.pop(mirror, None)   # UI mirrors, not schema keys
-                self._set_or_pop(spec, "base_url", base_url)
-                self._set_or_pop(spec, "model", model)
-                self._set_or_pop(spec, "api_key", api_key)
-                legacy_models[name] = spec
-                continue
-
-            prof = dict(orig)
-            prof["name"] = name
-            if not prof.get("id"):
-                prof["id"] = f"provider_{os.urandom(6).hex()}"
-            self._set_or_pop(prof, "provider", provider)
-            self._set_or_pop(prof, "baseUrl", base_url)
-            self._set_or_pop(prof, "model", model)
-            self._set_or_pop(prof, "apiKey", api_key)
-            profiles.append(prof)
+            kind, _, value = self._row_entry(r)
+            if kind == "legacy":
+                legacy_models[name] = value
+            else:
+                profiles.append(value)
 
         # Only write providerProfiles when the file already had it or we have rows,
         # so an untouched global file isn't polluted with an empty list.
@@ -10660,8 +12575,8 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
 
         known_ids = {p.get("id") for p in profiles if isinstance(p, dict)}
         active = self.active_combo.currentData() or ""
-        if active and known_ids and active not in known_ids:
-            active = ""                     # profile was deleted; don't dangle
+        if active and active not in known_ids:
+            active = ""                     # profile was removed; don't dangle
         if "activeProviderProfileId" in data or active:
             self._put(data, "activeProviderProfileId", active, "")
 
@@ -10705,6 +12620,9 @@ class OpenclaudeMcpTab(OpenclaudeTab):
 
     SCOPES = OPENCLAUDE_MCP_SCOPES          # from constants (single source)
     SOURCE_TYPES = ("github", "git", "url", "file", "directory", "npm")
+    # Transports addressed by a URL rather than a command: openclaude's
+    # McpServerConfigSchema requires `url` for both of these.
+    URL_TYPES = ("http", "sse")
 
     def __init__(self, app):
         super().__init__(app)
@@ -10762,8 +12680,21 @@ class OpenclaudeMcpTab(OpenclaudeTab):
         name_item = QTableWidgetItem(name)
         self.preserve(name_item, server)
         self.mcp_table.setItem(r, 0, name_item)
+        # Transport as a combo over the supported types so a typo like "SSE"
+        # or "htp" cannot produce an entry no schema member accepts. An
+        # unknown stored type is added to the list rather than dropped.
         typ = str(server.get("type") or ("http" if server.get("url") else "stdio"))
-        self.mcp_table.setItem(r, 1, QTableWidgetItem(typ))
+        choices = list(OPENCLAUDE_MCP_TYPES)
+        if typ and typ not in choices:
+            choices.append(typ)
+        combo = QComboBox()
+        combo.addItem("", "")
+        for t in choices:
+            combo.addItem(t, t)
+        idx = combo.findData(typ)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.currentIndexChanged.connect(self._edited)
+        self.mcp_table.setCellWidget(r, 1, combo)
         target = server.get("command") if isinstance(server.get("command"), str) else \
             "" if not server.get("url") else str(server.get("url"))
         self.mcp_table.setItem(r, 2, QTableWidgetItem(str(target or "")))
@@ -10799,9 +12730,24 @@ class OpenclaudeMcpTab(OpenclaudeTab):
             cfg = dlg.result_server_config
             if not key or not cfg:
                 return
+            # Appending a row under an existing name would silently replace
+            # that server on save (env/args/headers and all), so ask first
+            # — same as the opencode MCP tab.
+            if key in self._collect_scope_table() and not _confirm(
+                self, "Overwrite Server",
+                f"Server '{key}' already exists. Overwrite?"
+            ):
+                return
             self._add_row(key, cfg)
             self._dirty_scopes.add(self._shown_scope)
             self._mark_edited()
+
+    def _transport(self, r):
+        """The transport of row `r` (combo cell, '' when unset)."""
+        w = self.mcp_table.cellWidget(r, 1)
+        if w is not None:
+            return w.currentData() or ""
+        return self._cell(r, 1)
 
     def _cell(self, r, c):
         return self.cell_text(self.mcp_table, r, c)
@@ -10847,7 +12793,7 @@ class OpenclaudeMcpTab(OpenclaudeTab):
             if not name:
                 continue
             srv = dict(self.preserved(nitem))
-            typ = self._cell(r, 1)
+            typ = self._transport(r)
             target = self._cell(r, 2)
             args_text = self._cell(r, 3)
             env_w = self.mcp_table.cellWidget(r, 4)
@@ -10858,7 +12804,7 @@ class OpenclaudeMcpTab(OpenclaudeTab):
                 srv["type"] = typ
             else:
                 srv.pop("type", None)
-            if typ == "http":
+            if typ in self.URL_TYPES:
                 srv["url"] = target
                 srv.pop("command", None)
             elif target:
@@ -11835,6 +13781,27 @@ def _confirm_unsaved(win, action="switch layer"):
     return "discard"
 
 
+def _confirm_strip_comments(win, path):
+    """Ask before rewriting a comments-carrying settings file without them.
+
+    Returns True to proceed with the save. Module-level so tests can
+    monkeypatch it (offscreen runs never exec dialogs).
+    """
+    if not HAS_QT:
+        return False
+    box = QMessageBox(win)
+    box.setWindowTitle("Comments will be removed")
+    box.setText(
+        f"{path} contains JSON comments.\n"
+        "Saving from the form rewrites it as plain JSON and every comment is lost."
+    )
+    save_btn = box.addButton("Save anyway", QMessageBox.AcceptRole)
+    cancel_btn = box.addButton(QMessageBox.Cancel)
+    box.setDefaultButton(cancel_btn)
+    box.exec()
+    return box.clickedButton() is save_btn
+
+
 def _layer_change_guarded(tab, combo):
     """Shared layer-combo handler: prompts before discarding unsaved edits."""
     win = tab.app
@@ -11898,6 +13865,15 @@ def _openclaude_save(win):
         win.status_bar.showMessage(
             "Save blocked: settings file has invalid JSON — fix it in the Raw tab")
         return
+
+    # save_layer rewrites the file with json.dumps, dropping every comment a
+    # JSONC settings file carried. Ask before destroying them.
+    layer_path = layered.layer_files[layer]
+    if str(layer_path) in getattr(layered, "jsonc_files", set()):
+        if not _confirm_strip_comments(win, layer_path):
+            win.status_bar.showMessage(
+                f"Save cancelled: comments kept in {layer_path}")
+            return
 
     base = dict(layered.layer(layer))
     win._agent_settings_tab.collect(base)
@@ -12335,6 +14311,52 @@ class MainWindow(QMainWindow):
             self.tabs.addTab(tab, title)
 
         self.setCentralWidget(self.tabs)
+        self._prev_tab = self.tabs.currentWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _sync_raw_into_config(self) -> bool:
+        """Apply valid Raw JSON text to the config it belongs to.
+
+        Without this the Raw editor and the form tabs disagree: whichever was
+        edited last was silently discarded at save time (OC-08).
+        """
+        if not self.tab_raw._modified:
+            return True
+        cfg = self.cfg_tui if self._raw_kind == "tui" else self.cfg_oc
+        if cfg is None:
+            return True
+        try:
+            parsed = json.loads(self.tab_raw.editor.toPlainText())
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        cfg.data.clear()
+        cfg.data.update(parsed)
+        self.tab_raw._modified = False
+        return True
+
+    def _on_tab_changed(self, _index):
+        """Keep the Raw editor and the form tabs consistent on every switch."""
+        prev, cur = self._prev_tab, self.tabs.currentWidget()
+        self._prev_tab = cur
+        if prev is None or cur is None or prev is cur:
+            return
+        if not hasattr(self, "tab_raw") or self.tab_raw is None:
+            return
+        oc_tabs = list(getattr(self, "_oc_tabs", []))
+        if prev is self.tab_raw and self._raw_kind == "opencode":
+            # Leaving Raw: its text becomes the base, and the form tabs must
+            # not keep the values they were showing before the raw edit.
+            if self._sync_raw_into_config() and self.cfg_oc:
+                for tab in oc_tabs:
+                    tab.refresh()
+        elif (prev in oc_tabs and self._raw_kind == "opencode"
+              and not self.tab_raw._modified):
+            # Leaving a form tab: let the Raw editor show what was just edited
+            # here, so a later raw edit is based on it rather than on a stale
+            # document.
+            self.tab_raw.refresh()
 
     def _build_status_bar(self):
         """Build status bar"""
@@ -12541,17 +14563,10 @@ class MainWindow(QMainWindow):
         return "opencode"
 
     def _collect_oc(self) -> dict:
-        if self.tab_raw._modified and self._raw_kind == "opencode":
-            try:
-                base = json.loads(self.tab_raw.editor.toPlainText())
-                if isinstance(base, dict):
-                    data = base
-                else:
-                    data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
-            except json.JSONDecodeError:
-                data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
-        else:
-            data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
+        # A raw edit is folded into cfg.data first, then the form tabs collect
+        # on top of it. Neither side overwrites the other (OC-08).
+        self._sync_raw_into_config()
+        data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
         for tab in self._oc_tabs:
             try:
                 tab.collect(data)
@@ -12560,17 +14575,8 @@ class MainWindow(QMainWindow):
         return data
 
     def _collect_tui(self) -> dict:
-        if self.tab_raw._modified and self._raw_kind == "tui":
-            try:
-                base = json.loads(self.tab_raw.editor.toPlainText())
-                if isinstance(base, dict):
-                    data = base
-                else:
-                    data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
-            except json.JSONDecodeError:
-                data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
-        else:
-            data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
+        self._sync_raw_into_config()
+        data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
         self.tab_tui.collect(data)
         return data
 
@@ -12869,7 +14875,10 @@ class MainWindow(QMainWindow):
 
     def _manage_custom_catalog(self):
         """Open the Custom Models & Matching Rules manager dialog."""
-        self._ensure_catalog()
+        # Only load a catalog when none is loaded: _ensure_catalog() would
+        # otherwise throw away the catalog the user just loaded (CAT-06).
+        if not self.model_catalog.loaded() and not self._ensure_catalog():
+            return
         dlg = CustomCatalogManagerDialog(self, self.model_catalog)
         dlg.exec()
         self._update_catalog_status()
@@ -12966,30 +14975,28 @@ class MainWindow(QMainWindow):
         providers = {}
         if hasattr(self, "cfg") and self.cfg and isinstance(self.cfg.data, dict):
             providers = section(self.cfg.data, "provider")
-        dlg = ProviderHealthCheckDialog(self, providers=providers)
+        # Project-scoped {file:...} API keys resolve against the config's dir.
+        cfg_path = str(self.cfg_oc.path) if self.cfg_oc else ""
+        dlg = ProviderHealthCheckDialog(self, providers=providers, config_path=cfg_path)
         dlg.exec()
 
     def _show_mcp_hub(self):
-        """Show MCP Server Hub & Templates dialog"""
-        mode = "openclaude" if getattr(self, "adapter_name", "") == "openclaude" else "opencode"
-        dlg = MCPTemplateHubDialog(self, target_mode=mode)
-        if dlg.exec() == QDialog.Accepted:
-            key = dlg.result_server_key
-            cfg = dlg.result_server_config
-            if not key or not cfg:
-                return
-            if mode == "opencode" and hasattr(self, "cfg") and self.cfg:
-                mcp = self.cfg.data.setdefault("mcp", {})
-                mcp[key] = cfg
-                self.mark_dirty()
-                if hasattr(self, "tab_mcp"):
-                    self.tab_mcp.refresh()
-                QMessageBox.information(self, "Installed", f"MCP server '{key}' installed into OpenCode config.")
-            elif mode == "openclaude" and hasattr(self, "tab_openclaude_mcp"):
-                self.tab_openclaude_mcp._add_row(key, cfg)
-                self.tab_openclaude_mcp._dirty_scopes.add(self.tab_openclaude_mcp._shown_scope)
-                self.tab_openclaude_mcp._mark_edited()
-                QMessageBox.information(self, "Installed", f"MCP server '{key}' installed into OpenClaude config.")
+        """Show MCP Server Hub & Templates dialog.
+
+        The install itself is delegated to the active adapter's MCP tab, which
+        prompts before overwriting an existing server and snapshots the undo
+        stack (audit F3/F4).
+        """
+        if getattr(self, "tab_mcp", None) is not None:
+            self.tab_mcp._open_mcp_hub()
+            return
+        mcp_tab = getattr(self, "_agent_mcp_tab", None)
+        if mcp_tab is not None:
+            mcp_tab._open_mcp_hub()
+            return
+        QMessageBox.information(
+            self, "MCP Server Hub",
+            "The active adapter does not provide an MCP Servers tab.")
 
     def _show_config_converter(self):
         """Show Universal Config Converter & Importer/Exporter dialog"""

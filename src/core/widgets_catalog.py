@@ -485,6 +485,23 @@ class MatchFormatPreviewDialog(QDialog):
                 out.append(self.entries[row])
         return out
 
+# Default base URL per fetch adapter. Gemini's API lives under /v1beta.
+_FETCH_BASE_URL_DEFAULTS = {
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "models_dev": "https://models.dev/api.json",
+    "generic": "",
+}
+
+
+_APIKEY_PLACEHOLDER_RE = re.compile(r"\{(?:env|file):[^{}]*\}")
+
+
+def _has_placeholder(value: str) -> bool:
+    """True if `value` uses opencode's {env:VAR} / {file:path} references."""
+    return isinstance(value, str) and bool(_APIKEY_PLACEHOLDER_RE.search(value))
+
 class _ModelFetchWorker(QThread):
     """Runs fetch_provider_models off the UI thread."""
     finished_ok = Signal(dict)
@@ -502,11 +519,37 @@ class _ModelFetchWorker(QThread):
             self.failed.emit(str(e))
 
 
+class _CatalogSyncWorker(QThread):
+    """Runs ModelCatalog.fetch_online off the UI thread.
+
+    Downloading, JSONC-stripping and re-parsing a multi-megabyte catalog all
+    take long enough to freeze the window, so the download never runs on the
+    GUI thread. Reuse this worker from anywhere else that updates the catalog.
+    """
+    finished_ok = Signal(str, int)   # message, model count
+    failed = Signal(str)             # error message
+
+    def __init__(self, catalog, url=None):
+        super().__init__()
+        self.catalog = catalog
+        self.url = url
+
+    def run(self):
+        try:
+            ok, msg, count = self.catalog.fetch_online(self.url)
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        if ok:
+            self.finished_ok.emit(msg, count)
+        else:
+            self.failed.emit(msg)
+
+
 class FetchProviderModelsDialog(QDialog):
     """Fetch a provider's model list from its API and preview the results."""
-
     def __init__(self, parent, provider_key: str = "new-provider", catalog=None,
-                 providers=None):
+                 providers=None, lock_key: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Fetch Provider Models from API")
         self.resize(720, 560)
@@ -514,6 +557,10 @@ class FetchProviderModelsDialog(QDialog):
         self.provider_key = provider_key
         self.providers = providers  # full provider map, for existing-status display
         self._worker = None
+        self._lock_key = lock_key
+        self._fetched_signature = None  # (url, api key, adapter) the table matches
+        self._auto_base_url = ""   # last base URL we auto-filled from a default
+        self._closed = False
 
         # Silently load the bundled catalog so the Reference combo can be filled.
         self.catalog = catalog
@@ -523,6 +570,10 @@ class FetchProviderModelsDialog(QDialog):
 
         form = QFormLayout()
         self.key_edit = QLineEdit(provider_key)
+        # The fetch is always for this provider; letting the key be edited only
+        # mislabels the Status column, since the result is applied to
+        # provider_key regardless (F11).
+        self.key_edit.setReadOnly(lock_key)
         self.key_edit.textChanged.connect(self._apply_status)
         form.addRow("Provider key:", self.key_edit)
 
@@ -545,13 +596,22 @@ class FetchProviderModelsDialog(QDialog):
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://api.openai.com/v1")
+        self.url_edit.textChanged.connect(self._invalidate_fetch)
         form.addRow("Base URL:", self.url_edit)
 
         self.apikey_edit = QLineEdit()
         self.apikey_edit.setEchoMode(QLineEdit.Password)
         self.apikey_edit.setPlaceholderText("(sent as a header to fetch the model list)")
+        self.apikey_edit.textChanged.connect(self._invalidate_fetch)
+        self.apikey_edit.setReadOnly(lock_key)
+        if lock_key:
+            self.apikey_edit.setToolTip(
+                "This provider already has an API key configured; it is reused as-is.")
         form.addRow("API key:", self.apikey_edit)
 
+        # Saving a reference like "{env:OPENAI_API_KEY}" would freeze the
+        # variable name into the config; the checkbox default is set in
+        # _prefill_from_provider once the stored key is known.
         self.save_apikey_check = QCheckBox("Save API key to config (options.apiKey)")
         self.save_apikey_check.setChecked(True)
         self.save_apikey_check.setToolTip(
@@ -621,10 +681,53 @@ class FetchProviderModelsDialog(QDialog):
 
         self._on_format_change()
         self._prefill_from_provider()
+        # Re-apply the adapter-dependent state now that the stored URL/key are
+        # in place (a locked key needs a non-empty value to stay usable).
+        self._on_format_change()
+
+    # Providers whose npm package determines the API shape even before the
+    # stored options are read: guessing the format first stops an Anthropic
+    # key from being sent to an OpenAI endpoint.
+    _NPM_ADAPTER = {
+        "@ai-sdk/anthropic": "anthropic",
+        "@ai-sdk/google": "gemini",
+        "@ai-sdk/openai": "openai",
+    }
+    _PROVIDER_ID_ADAPTER = {
+        "anthropic": "anthropic",
+        "google": "gemini",
+        "gemini": "gemini",
+        "openai": "openai",
+        "google-generative-ai": "gemini",
+    }
+
+    def _infer_adapter_from_provider(self) -> str:
+        """Best-guess API format from the provider's npm package or id."""
+        if not isinstance(self.providers, dict):
+            return ""
+        prov = self.providers.get(self.provider_key)
+        if not isinstance(prov, dict):
+            return ""
+        npm = prov.get("npm")
+        if isinstance(npm, str) and npm in self._NPM_ADAPTER:
+            return self._NPM_ADAPTER[npm]
+        pid = str(self.provider_key or "").lower()
+        return self._PROVIDER_ID_ADAPTER.get(pid, "")
+
+    def _select_adapter(self, adapter: str):
+        idx = self.format_combo.findData(adapter)
+        if idx >= 0:
+            self.format_combo.setCurrentIndex(idx)
 
     def _prefill_from_provider(self):
         """Pre-fill URL/key from the target provider's saved options, so
         re-fetching an existing provider starts from its real endpoint."""
+        # Infer the format before reading the stored options: prefilling first
+        # would send an Anthropic key to the default OpenAI URL.
+        inferred = self._infer_adapter_from_provider()
+        if inferred:
+            self._select_adapter(inferred)
+
         if not isinstance(self.providers, dict):
             return
         prov = self.providers.get(self.provider_key)
@@ -635,7 +738,10 @@ class FetchProviderModelsDialog(QDialog):
             self.url_edit.setText(str(opts["baseURL"]))
         key = opts.get("apiKey")
         if isinstance(key, str) and key:
+            # Keep "{env:…}"/"{file:…}" verbatim so Save writes it back
+            # unchanged; it is only resolved when building the request.
             self.apikey_edit.setText(key)
+            self.save_apikey_check.setChecked(not _has_placeholder(key))
 
     def _current_adapter(self) -> str:
         return self.format_combo.currentData()
@@ -649,23 +755,52 @@ class FetchProviderModelsDialog(QDialog):
     def _on_format_change(self):
         adapter = self._current_adapter()
         self.generic_box.setVisible(adapter == "generic")
-        # Sensible default base URLs per adapter.
-        defaults = {
-            "openai": "https://api.openai.com/v1",
-            "anthropic": "https://api.anthropic.com",
-            "gemini": "https://generativelanguage.googleapis.com",
-            "models_dev": "https://models.dev/api.json",
-            "generic": "",
-        }
-        if not self.url_edit.text().strip() or self.url_edit.text() in defaults.values():
-            self.url_edit.setText(defaults.get(adapter, ""))
-        self.apikey_edit.setEnabled(adapter != "models_dev")
+        # Replace the URL only while it is still the default we last applied, so
+        # switching format never clobbers a URL the user typed.
+        if not self.url_edit.text().strip() or self.url_edit.text() == self._auto_base_url:
+            self.url_edit.setText(_FETCH_BASE_URL_DEFAULTS.get(adapter, ""))
+        self._auto_base_url = self.url_edit.text()
+        # A locked key stays usable (it is the provider's existing key); only
+        # *editing* it is blocked.
+        self.apikey_edit.setEnabled(
+            adapter != "models_dev" and (not self._lock_key or bool(self.apikey_edit.text())))
+        self._invalidate_fetch()
+
+    def _request_signature(self):
+        """What the current table contents were fetched with."""
+        return (self.url_edit.text().strip(),
+                self.apikey_edit.text(),
+                self._current_adapter())
+
+    def _invalidate_fetch(self, *_):
+        """Changing the endpoint, key or format makes the table stale."""
+        if self._fetched_signature is None:
+            return
+        if self._request_signature() == self._fetched_signature:
+            return
+        self._fetched_signature = None
+        self.fetched_models = {}
+        self.table.setRowCount(0)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+        self.status_label.setText("Settings changed — fetch again")
+
+    def api_base_url(self) -> str:
+        """The URL to store as the fetched provider's ``options.baseURL``.
+
+        API-style formats keep their base URL, normalised with the version
+        segment the AI SDK expects; list/catalog formats (models.dev, generic
+        JSON) store nothing. The policy lives in api_base_url_for.
+        """
+        return api_base_url_for(self._current_adapter(),
+                                self.url_edit.text().strip())
 
     def _build_spec(self) -> ProviderFetchSpec:
         return ProviderFetchSpec(
             base_url=self.url_edit.text().strip(),
             adapter=self._current_adapter(),
-            api_key=self.apikey_edit.text(),
+            # Only the outgoing request resolves {env:}/{file:} references;
+            # the field itself keeps the reference text for Save.
+            api_key=resolve_config_placeholders(self.apikey_edit.text()),
             items_path=self.items_path_edit.text().strip(),
             id_field=self.id_field_edit.text().strip(),
             name_field=self.name_field_edit.text().strip(),
@@ -684,16 +819,27 @@ class FetchProviderModelsDialog(QDialog):
         self._worker.start()
 
     def _on_fetched(self, models: dict):
+        # The dialog may have been closed (or the settings changed) while the
+        # request was in flight; that result is no longer wanted.
+        if self._closed:
+            return
         self.fetched_models = models
+        self._fetched_signature = self._request_signature()
         self.fetch_btn.setEnabled(True)
         self.status_label.setText(f"Fetched {len(models)} models")
         self._populate(models)
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(models))
 
     def _on_failed(self, msg: str):
+        if self._closed:
+            return
         self.fetch_btn.setEnabled(True)
         self.status_label.setText("Fetch failed")
         QMessageBox.warning(self, "Fetch Error", msg)
+
+    def closeEvent(self, event):
+        self._closed = True
+        super().closeEvent(event)
 
     def _populate(self, models: dict):
         self.table.setRowCount(len(models))
@@ -1032,7 +1178,6 @@ class ModelCatalogDialog(QDialog):
                                                             "model_id": f.model_id}
                                for f in rows], f, indent=2, ensure_ascii=False)
             else:
-                import csv
                 with open(path, "w", encoding="utf-8", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow(["provider", "model_id", "name", "context",
@@ -1204,8 +1349,11 @@ class EditCustomModelDialog(QDialog):
         self.result_model_id = ""
         self.result_provider = ""
         self.result_spec = {}
+        # Fields the dialog does not expose (cost, aliases, extra modalities,
+        # ...) are carried over untouched when the spec is rebuilt.
+        self._original_spec = dict(spec or {})
 
-        spec = spec or {}
+        spec = dict(self._original_spec)
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
@@ -1234,14 +1382,14 @@ class EditCustomModelDialog(QDialog):
         self.ctx_spin = QSpinBox()
         self.ctx_spin.setRange(0, 10000000)
         self.ctx_spin.setSingleStep(4000)
-        self.ctx_spin.setValue(int(limit.get("context", 128000)))
+        self.ctx_spin.setValue(int(limit["context"]) if isinstance(limit.get("context"), (int, float)) else 128000)
         form.addRow("Context Window (tokens):", self.ctx_spin)
 
         # Output limit
         self.out_spin = QSpinBox()
         self.out_spin.setRange(0, 1000000)
         self.out_spin.setSingleStep(1000)
-        self.out_spin.setValue(int(limit.get("output", 8192)))
+        self.out_spin.setValue(int(limit["output"]) if isinstance(limit.get("output"), (int, float)) else 8192)
         form.addRow("Max Output Tokens:", self.out_spin)
 
         # Features
@@ -1255,6 +1403,13 @@ class EditCustomModelDialog(QDialog):
         self.tools_cb.setChecked(bool(spec.get("tool_call", True)))
         self.temp_cb = QCheckBox("Temperature Control")
         self.temp_cb.setChecked(bool(spec.get("temperature", True)))
+        # Flags absent from the stored spec are only written when the user
+        # actually toggles them, so an unedited OK never invents them.
+        self._initial_feature_state = {
+            key: box.isChecked()
+            for key, box in (("attachment", self.att_cb), ("reasoning", self.reas_cb),
+                             ("tool_call", self.tools_cb), ("temperature", self.temp_cb))
+        }
 
         feat_layout.addWidget(self.att_cb, 0, 0)
         feat_layout.addWidget(self.reas_cb, 0, 1)
@@ -1303,32 +1458,44 @@ class EditCustomModelDialog(QDialog):
         name = self.name_edit.text().strip() or humanize_model_id(mid)
         prov = self.prov_edit.text().strip() or "custom"
 
-        in_mods = ["text"]
+        # Start from the stored spec so fields this dialog does not show
+        # (cost, aliases, extra modalities, ...) survive an unedited OK.
+        spec = dict(self._original_spec)
+
+        limit = dict(spec["limit"]) if isinstance(spec.get("limit"), dict) else {}
+        limit["context"] = self.ctx_spin.value()
+        limit["output"] = self.out_spin.value()
+        spec["limit"] = limit
+
+        spec["name"] = name
+        spec["provider"] = prov
+
+        # Booleans: keep stored flags as they are, and only introduce a flag
+        # the user actually toggled (never flip "absent" into "true").
+        for key, box in (("attachment", self.att_cb),
+                         ("reasoning", self.reas_cb),
+                         ("tool_call", self.tools_cb),
+                         ("temperature", self.temp_cb)):
+            if key in spec:
+                spec[key] = box.isChecked()
+            elif box.isChecked() != self._initial_feature_state[key]:
+                spec[key] = box.isChecked()
+
+        mods = dict(spec["modalities"]) if isinstance(spec.get("modalities"), dict) else {}
+        known_in = {"text", "image", "audio"}
+        known_out = {"text", "image"}
+        in_mods = [m for m in mods.get("input", []) if m not in known_in]
+        out_mods = [m for m in mods.get("output", []) if m not in known_out]
+        in_mods.insert(0, "text")
         if self.mod_in_image.isChecked():
-            in_mods.append("image")
-        if self.mod_in_audio.isChecked():
+            in_mods.insert(1, "image")
+        if self.mod_in_audio.isChecked() and "audio" not in in_mods:
             in_mods.append("audio")
-
-        out_mods = ["text"]
-        if self.mod_out_image.isChecked():
+        out_mods.insert(0, "text")
+        if self.mod_out_image.isChecked() and "image" not in out_mods:
             out_mods.append("image")
-
-        spec = {
-            "name": name,
-            "provider": prov,
-            "limit": {
-                "context": self.ctx_spin.value(),
-                "output": self.out_spin.value(),
-            },
-            "attachment": self.att_cb.isChecked(),
-            "reasoning": self.reas_cb.isChecked(),
-            "tool_call": self.tools_cb.isChecked(),
-            "temperature": self.temp_cb.isChecked(),
-            "modalities": {
-                "input": in_mods,
-                "output": out_mods,
-            }
-        }
+        if "modalities" in spec:
+            spec["modalities"] = {"input": in_mods, "output": out_mods}
 
         self.result_model_id = mid
         self.result_provider = prov
@@ -1408,7 +1575,7 @@ class CustomCatalogManagerDialog(QDialog):
         self.resize(900, 600)
         self.catalog = catalog
         self.settings = SettingsManager()
-
+        self._sync_worker = None
         layout = QVBoxLayout(self)
 
         self.tabs = QTabWidget()
@@ -1473,13 +1640,24 @@ class CustomCatalogManagerDialog(QDialog):
 
         self._refresh_custom_models_table()
 
+    def _read_custom_models(self, warn: bool = False) -> dict:
+        """Read the custom-model file; an unparseable file yields an empty map
+        plus a warning instead of raising through the dialog's UI paths."""
+        try:
+            return self.catalog.get_all_custom_models()
+        except ValueError as e:
+            if warn:
+                QMessageBox.warning(self, "Custom Models File Error", str(e))
+            return {}
+
     def _refresh_custom_models_table(self):
-        models = self.catalog.get_all_custom_models()
+        models = self._read_custom_models(warn=True)
         self._populate_custom_models_table(models)
 
     def _populate_custom_models_table(self, models: dict):
         self.custom_table.setRowCount(len(models))
         for row, (mid, spec) in enumerate(sorted(models.items())):
+            spec = spec if isinstance(spec, dict) else {}
             self.custom_table.setItem(row, 0, QTableWidgetItem(mid))
             self.custom_table.setItem(row, 1, QTableWidgetItem(spec.get("name") or humanize_model_id(mid)))
             self.custom_table.setItem(row, 2, QTableWidgetItem(spec.get("provider", "custom")))
@@ -1499,7 +1677,7 @@ class CustomCatalogManagerDialog(QDialog):
             self.custom_table.setItem(row, 5, QTableWidgetItem(", ".join(feats) if feats else "—"))
 
     def _filter_custom_models(self, text: str):
-        all_models = self.catalog.get_all_custom_models()
+        all_models = self._read_custom_models()
         if not text:
             self._populate_custom_models_table(all_models)
             return
@@ -1526,7 +1704,7 @@ class CustomCatalogManagerDialog(QDialog):
         if not mid_item:
             return
         mid = mid_item.text()
-        all_models = self.catalog.get_all_custom_models()
+        all_models = self._read_custom_models()
         spec = all_models.get(mid, {})
         dlg = EditCustomModelDialog(self, mid, spec, spec.get("provider", "custom"))
         if dlg.exec() == QDialog.Accepted and dlg.result_model_id:
@@ -1554,21 +1732,44 @@ class CustomCatalogManagerDialog(QDialog):
         )
         if dlg.exec() == QDialog.Accepted and dlg.result_data:
             data = dlg.result_data
-            if isinstance(data, dict):
+            if not isinstance(data, dict):
+                QMessageBox.warning(self, "Import Error",
+                                    "Custom models JSON must be an object.")
+                return
+            # Reject anything that is not `{model_id: {spec}}` before writing:
+            # a stray "$schema" string would be saved and then break the loader.
+            invalid = [k for k, v in data.items() if not isinstance(v, dict)]
+            if invalid:
+                QMessageBox.warning(
+                    self, "Import Error",
+                    "These entries are not model objects and were not imported: "
+                    + ", ".join(sorted(map(str, invalid))[:10]),
+                )
+                return
+            if not data:
+                QMessageBox.warning(self, "Import Error", "No custom models found.")
+                return
+            try:
                 current = self.catalog.get_all_custom_models()
-                current.update(data)
-                try:
-                    CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    CUSTOM_MODELS_FILE.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-                    self.catalog._load_custom_models()
-                    self._refresh_custom_models_table()
-                    self._refresh_status()
-                    QMessageBox.information(self, "Import", f"Imported {len(data)} custom model(s).")
-                except Exception as e:
-                    QMessageBox.warning(self, "Import Error", str(e))
+            except ValueError as e:
+                QMessageBox.warning(self, "Import Error", str(e))
+                return
+            current.update(data)
+            try:
+                CUSTOM_MODELS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(
+                    CUSTOM_MODELS_FILE,
+                    json.dumps(current, indent=2, ensure_ascii=False),
+                )
+                self.catalog._reload_after_custom_change()
+                self._refresh_custom_models_table()
+                self._refresh_status()
+                QMessageBox.information(self, "Import", f"Imported {len(data)} custom model(s).")
+            except Exception as e:
+                QMessageBox.warning(self, "Import Error", str(e))
 
     def _export_custom_models(self):
-        models = self.catalog.get_all_custom_models()
+        models = self._read_custom_models()
         if not models:
             QMessageBox.information(self, "Export", "No custom models to export.")
             return
@@ -1716,35 +1917,47 @@ class CustomCatalogManagerDialog(QDialog):
     def _update_sync_info(self):
         src = self.catalog.source or "None"
         cnt = len(self.catalog.flat)
-        custom_cnt = len(self.catalog.get_all_custom_models())
+        try:
+            custom_cnt = len(self.catalog.get_all_custom_models())
+        except ValueError:
+            custom_cnt = -1
         rules_cnt = len(self.catalog.get_all_pattern_rules())
         last = self.catalog.last_updated or "Never"
+        custom_label = "unreadable — fix or delete custom_models.json" if custom_cnt < 0 \
+            else f"{custom_cnt:,}"
         self.sync_info.setText(
             f"<b>Active Catalog Source:</b> {src}<br>"
             f"<b>Total Catalog Models:</b> {cnt:,}<br>"
-            f"<b>User Custom Models:</b> {custom_cnt:,}<br>"
+            f"<b>User Custom Models:</b> {custom_label}<br>"
             f"<b>Active Pattern Rules:</b> {rules_cnt:,}<br>"
             f"<b>Last Loaded / Updated:</b> {last}"
         )
 
     def _sync_online(self):
+        """Start the online catalog update on a worker thread."""
         url = self.url_edit.text().strip()
         self.settings.set_catalog_url(url)
         self.sync_btn.setEnabled(False)
         self.sync_btn.setText("Updating...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ok, msg, count = self.catalog.fetch_online(url)
-            if ok:
-                QMessageBox.information(self, "Catalog Update", msg)
-                self._update_sync_info()
-                self._refresh_status()
-            else:
-                QMessageBox.warning(self, "Catalog Update Error", msg)
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.sync_btn.setEnabled(True)
-            self.sync_btn.setText("🔄 Update Catalog Online Now")
+        self._sync_worker = _CatalogSyncWorker(self.catalog, url)
+        self._sync_worker.finished_ok.connect(self._on_sync_ok)
+        self._sync_worker.failed.connect(self._on_sync_failed)
+        self._sync_worker.start()
+
+    def _on_sync_ok(self, msg: str, count: int):
+        QApplication.restoreOverrideCursor()
+        self.sync_btn.setEnabled(True)
+        self.sync_btn.setText("🔄 Update Catalog Online Now")
+        QMessageBox.information(self, "Catalog Update", msg)
+        self._update_sync_info()
+        self._refresh_status()
+
+    def _on_sync_failed(self, msg: str):
+        QApplication.restoreOverrideCursor()
+        self.sync_btn.setEnabled(True)
+        self.sync_btn.setText("🔄 Update Catalog Online Now")
+        QMessageBox.warning(self, "Catalog Update Error", msg)
 
     def _load_local_catalog(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1762,7 +1975,10 @@ class CustomCatalogManagerDialog(QDialog):
 
     def _refresh_status(self):
         cnt = len(self.catalog.flat)
-        custom_cnt = len(self.catalog.get_all_custom_models())
+        try:
+            custom_cnt = len(self.catalog.get_all_custom_models())
+        except ValueError:
+            custom_cnt = "error"
         rules_cnt = len(self.catalog.get_all_pattern_rules())
         self.status_lbl.setText(
             f"Catalog: {cnt:,} models | Custom: {custom_cnt} | Pattern Rules: {rules_cnt}"

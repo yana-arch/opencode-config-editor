@@ -33,10 +33,15 @@ class AgentEditDialog(QDialog):
             self.top_p.setValue(cfg["top_p"])
         form.addRow("Top P", self.top_p)
         self.steps = QSpinBox()
-        self.steps.setRange(-1, 10**6)
+        # -1 == '(inherit)': the schema requires steps > 0, so a dialog that
+        # was never touched must omit the key rather than write steps: 0.
+        self.steps.setRange(0, 10**6)
         self.steps.setSpecialValueText("(inherit)")
-        if isinstance(cfg.get("steps"), int):
-            self.steps.setValue(cfg["steps"])
+        seed_steps = cfg.get("steps", cfg.get("maxSteps"))
+        self.steps.setValue(int(seed_steps) if isinstance(seed_steps, int)
+                            and not isinstance(seed_steps, bool) and seed_steps > 0 else 0)
+        self._steps_set = isinstance(seed_steps, int) and not isinstance(seed_steps, bool) \
+            and seed_steps > 0
         form.addRow("Steps", self.steps)
         self.hidden = QCheckBox("Hidden from @ menu")
         self.hidden.setChecked(bool(cfg.get("hidden", False)))
@@ -45,12 +50,21 @@ class AgentEditDialog(QDialog):
         self.disable.setChecked(bool(cfg.get("disable", False)))
         form.addRow("Disable", self.disable)
         self.color_edit = QLineEdit(cfg.get("color", "") or "")
+        self.color_edit.setPlaceholderText("#FF5733 or primary")
         form.addRow("Color", self.color_edit)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(self.accept)
+        bb.accepted.connect(self._try_accept)
         bb.rejected.connect(self.reject)
         form.addRow(bb)
+
+    def _try_accept(self):
+        """Refuse to close on an invalid color so the input is not lost."""
+        err = self.color_error()
+        if err:
+            QMessageBox.warning(self, "Agent", err)
+            return
+        self.accept()
 
     def _double(self, sentinel):
         d = QDoubleSpinBox()
@@ -75,9 +89,22 @@ class AgentEditDialog(QDialog):
             out["temperature"] = self.temp.value()
         if self.top_p.value() != -1000:
             out["top_p"] = self.top_p.value()
-        if self.steps.value() != -1:
-            out["steps"] = self.steps.value()
+        # 0 means "inherit": emit None so an existing steps value is removed.
+        # The schema (exclusiveMinimum: 0) rejects steps: 0.
+        out["steps"] = self.steps.value() or None
         return out
+
+    def color_error(self) -> str:
+        """Return an error message for an invalid color, or "" when valid."""
+        v = self.color_edit.text().strip()
+        if not v:
+            return ""
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", v):
+            return ""
+        if v in ("primary", "secondary", "accent", "success", "warning", "error", "info"):
+            return ""
+        return ("Color must be a hex code like #FF5733, or one of: primary, "
+                "secondary, accent, success, warning, error, info")
 
 
 class AgentsTab(QWidget):
@@ -151,14 +178,26 @@ class AgentsTab(QWidget):
 
     def _add(self):
         dlg = AgentEditDialog(self)
-        if dlg.exec() and dlg.values()["name"]:
-            v = dlg.values()
-            name = v.pop("name")
-            self.app.snapshot_state()
-            agents = self.app.cfg.data.setdefault("agent", {})
-            agents[name] = {k: val for k, val in v.items() if val not in (None, "")}
-            self.app.mark_dirty()
-            self.refresh()
+        if not dlg.exec():
+            return
+        err = dlg.color_error()
+        if err:
+            QMessageBox.warning(self, "Agent", err)
+            return
+        v = dlg.values()
+        name = v.pop("name")
+        if not name:
+            return
+        if name in self._agents():
+            QMessageBox.information(
+                self, "Agent", f"An agent named '{name}' already exists.\n"
+                "Use Edit to change it.")
+            return
+        self.app.snapshot_state()
+        agents = self.app.cfg.data.setdefault("agent", {})
+        agents[name] = {k: val for k, val in v.items() if val not in (None, "")}
+        self.app.mark_dirty()
+        self.refresh()
 
     def _edit(self, name=None):
         if name is None:
@@ -167,22 +206,31 @@ class AgentsTab(QWidget):
                 return
         cfg = dict(self._agents().get(name, {}))
         dlg = AgentEditDialog(self, name=name, cfg=cfg)
-        if dlg.exec():
-            v = dlg.values()
-            newname = v.pop("name") or name
-            self.app.snapshot_state()
-            agents = self.app.cfg.data.setdefault("agent", {})
-            merged = dict(cfg)  # preserve unknown keys (permission, options, tools, ...)
-            for k, val in v.items():
-                if val in (None, ""):
-                    merged.pop(k, None)
-                else:
-                    merged[k] = val
-            if newname != name:
-                agents.pop(name, None)
-            agents[newname] = merged
-            self.app.mark_dirty()
-            self.refresh()
+        if not dlg.exec():
+            return
+        err = dlg.color_error()
+        if err:
+            QMessageBox.warning(self, "Agent", err)
+            return
+        v = dlg.values()
+        newname = v.pop("name") or name
+        if newname != name and newname in self._agents():
+            QMessageBox.information(
+                self, "Agent", f"An agent named '{newname}' already exists.")
+            return
+        self.app.snapshot_state()
+        agents = self.app.cfg.data.setdefault("agent", {})
+        merged = dict(cfg)  # preserve unknown keys (permission, options, tools, ...)
+        for k, val in v.items():
+            if val in (None, ""):
+                merged.pop(k, None)
+            else:
+                merged[k] = val
+        if newname != name:
+            agents.pop(name, None)
+        agents[newname] = merged
+        self.app.mark_dirty()
+        self.refresh()
 
     def _remove(self, name=None):
         if name is None:

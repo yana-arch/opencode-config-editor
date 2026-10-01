@@ -2,11 +2,12 @@
 class StringListEdit(QWidget):
     """Editable list of strings backed by a nested key path in the config."""
 
-    def __init__(self, app, data_path, placeholder="item"):
+    def __init__(self, app, data_path, placeholder="item", on_change=None):
         super().__init__()
         self.app = app
         self.data_path = data_path  # e.g. ["disabled_providers"]
         self.placeholder = placeholder
+        self.on_change = on_change
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -56,18 +57,23 @@ class StringListEdit(QWidget):
         else:
             node.pop(last, None)
 
+    def _changed(self):
+        if self.on_change is not None:
+            self.on_change()
+        self.app.mark_dirty()
+
     def _add(self):
         text, ok = QInputDialog.getText(self, "Add", f"New {self.placeholder}:")
         if ok and text.strip():
             self.list.addItem(text.strip())
-            self.app.mark_dirty()
+            self._changed()
 
     def _remove(self):
         rows = sorted({self.list.row(it) for it in self.list.selectedItems()}, reverse=True)
         for r in rows:
             self.list.takeItem(r)
         if rows:
-            self.app.mark_dirty()
+            self._changed()
 
 
 class BoolObjectCombo(QWidget):
@@ -120,10 +126,11 @@ class BoolObjectCombo(QWidget):
 class BoolMapEditor(QWidget):
     """Editable map<string,bool> backed by a nested key path (e.g. tools)."""
 
-    def __init__(self, app, data_path):
+    def __init__(self, app, data_path, on_change=None):
         super().__init__()
         self.app = app
         self.data_path = data_path
+        self.on_change = on_change
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.table = QTableWidget(0, 2)
@@ -185,7 +192,9 @@ class BoolMapEditor(QWidget):
         else:
             node.pop(last, None)
 
-    def _changed(self):
+    def _changed(self, *_):
+        if self.on_change is not None:
+            self.on_change()
         self.app.mark_dirty()
 
     def _add(self):
@@ -197,14 +206,14 @@ class BoolMapEditor(QWidget):
             cb = QCheckBox()
             cb.setChecked(True)
             self.table.setCellWidget(r, 1, cb)
-            self.app.mark_dirty()
+            self._changed()
 
     def _remove(self):
         rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
         for r in rows:
             self.table.removeRow(r)
         if rows:
-            self.app.mark_dirty()
+            self._changed()
 
 
 class RuntimeTab(BaseTab):
@@ -235,7 +244,7 @@ class RuntimeTab(BaseTab):
         self.server_mdns_domain = MaskedLineEdit("", field_name="mdnsDomain", placeholder="opencode.local")
         self.server_mdns_domain.edit.editingFinished.connect(self._t("server"))
         sform.addRow("mDNS Domain", self.server_mdns_domain)
-        self.server_cors = StringListEdit(app, ["cors"], "origin")
+        self.server_cors = self._list(["server", "cors"], "origin", "server")
         sform.addRow("CORS origins", self.server_cors)
         lay.addWidget(server_box)
 
@@ -248,15 +257,15 @@ class RuntimeTab(BaseTab):
         self.comp_prune = QCheckBox("Prune old tool outputs")
         self.comp_prune.stateChanged.connect(self._t("compaction"))
         sform.addRow("Compaction prune", self.comp_prune)
-        self.comp_reserved = self._spin(0)
+        self.comp_reserved = self._spin(-1, "compaction")
         sform.addRow("Compaction reserved", self.comp_reserved)
-        self.comp_tail = self._spin(0)
+        self.comp_tail = self._spin(-1, "compaction")
         sform.addRow("Compaction tail turns", self.comp_tail)
-        self.comp_preserve = self._spin(0)
+        self.comp_preserve = self._spin(-1, "compaction")
         sform.addRow("Preserve recent tokens", self.comp_preserve)
-        self.tool_lines = self._spin(0)
+        self.tool_lines = self._spin(0, "tool_output")
         sform.addRow("Tool output max lines", self.tool_lines)
-        self.tool_bytes = self._spin(0)
+        self.tool_bytes = self._spin(0, "tool_output")
         sform.addRow("Tool output max bytes", self.tool_bytes)
         lay.addWidget(session_box)
 
@@ -266,11 +275,11 @@ class RuntimeTab(BaseTab):
         self.att_resize = QCheckBox("Auto-resize oversized images")
         self.att_resize.stateChanged.connect(self._t("attachment"))
         aform.addRow("Auto resize", self.att_resize)
-        self.att_w = self._spin(0)
+        self.att_w = self._spin(0, "attachment")
         aform.addRow("Max width", self.att_w)
-        self.att_h = self._spin(0)
+        self.att_h = self._spin(0, "attachment")
         aform.addRow("Max height", self.att_h)
-        self.att_bytes = self._spin(0)
+        self.att_bytes = self._spin(0, "attachment")
         aform.addRow("Max base64 bytes", self.att_bytes)
         lay.addWidget(att_box)
 
@@ -283,15 +292,15 @@ class RuntimeTab(BaseTab):
         self.lsp = BoolObjectCombo(app, "lsp")
         self.lsp.combo.currentIndexChanged.connect(self._t("lsp"))
         aform.addRow("LSP", self.lsp)
-        self.watcher_ignore = StringListEdit(app, ["watcher", "ignore"], "glob")
+        self.watcher_ignore = self._list(["watcher", "ignore"], "glob", "watcher")
         aform.addRow("Watcher ignore", self.watcher_ignore)
-        self.instructions = StringListEdit(app, ["instructions"], "path/glob")
+        self.instructions = self._list(["instructions"], "path/glob", "instructions")
         aform.addRow("Instructions", self.instructions)
-        self.skills_paths = StringListEdit(app, ["skills", "paths"], "path")
+        self.skills_paths = self._list(["skills", "paths"], "path", "skills")
         aform.addRow("Skill paths", self.skills_paths)
-        self.skills_urls = StringListEdit(app, ["skills", "urls"], "url")
+        self.skills_urls = self._list(["skills", "urls"], "url", "skills")
         aform.addRow("Skill URLs", self.skills_urls)
-        self.tools = BoolMapEditor(app, ["tools"])
+        self.tools = BoolMapEditor(self.app, ["tools"], on_change=self._t("tools"))
         aform.addRow("Tools", self.tools)
         lay.addWidget(adv_box)
 
@@ -310,21 +319,40 @@ class RuntimeTab(BaseTab):
         self.exp_loop = QCheckBox("Continue loop on deny")
         self.exp_loop.stateChanged.connect(self._t("experimental"))
         eform.addRow("Continue loop on deny", self.exp_loop)
-        self.exp_mcp_timeout = self._spin(0)
+        self.exp_mcp_timeout = self._spin(0, "experimental")
         eform.addRow("MCP timeout (ms)", self.exp_mcp_timeout)
-        self.exp_primary_tools = StringListEdit(app, ["experimental", "primary_tools"], "tool")
+        self.exp_primary_tools = self._list(
+            ["experimental", "primary_tools"], "tool", "experimental")
         eform.addRow("Primary-only tools", self.exp_primary_tools)
         eform.addRow("Policies", self._build_policies_table())
         lay.addWidget(exp_box)
         lay.addStretch(1)
 
     # --- helpers ---
-    def _spin(self, lo=0):
+    def _spin(self, lo=0, group="server"):
         s = QSpinBox()
         s.setRange(lo, 2**31 - 1)
         s.setSpecialValueText("(unset)")
-        s.valueChanged.connect(lambda *_: self.app.mark_dirty())
+        s.valueChanged.connect(self._t(group))
         return s
+
+    def _list(self, path, placeholder, group):
+        return StringListEdit(self.app, path, placeholder, on_change=self._t(group))
+
+    @staticmethod
+    def _opt_int(spin):
+        """Value of a '(unset)' spinbox: None at the sentinel, else the number.
+
+        Keeps a schema-valid 0 distinct from "not set" (OC-17).
+        """
+        return None if spin.value() <= spin.minimum() else spin.value()
+
+    def _set_opt_spin(self, spin, val):
+        """Populate a '-1 == (unset)' spinbox, keeping a real 0 visible."""
+        spin.blockSignals(True)
+        ok = isinstance(val, int) and not isinstance(val, bool) and val >= 0
+        spin.setValue(val if ok else -1)
+        spin.blockSignals(False)
 
     def _build_policies_table(self):
         w = QWidget()
@@ -376,9 +404,9 @@ class RuntimeTab(BaseTab):
         comp = data.get("compaction") if isinstance(data.get("compaction"), dict) else {}
         self._set_checked(self.comp_auto, comp.get("auto", True))
         self._set_checked(self.comp_prune, comp.get("prune", False))
-        self._set_spin(self.comp_reserved, comp.get("reserved"))
-        self._set_spin(self.comp_tail, comp.get("tail_turns"))
-        self._set_spin(self.comp_preserve, comp.get("preserve_recent_tokens"))
+        self._set_opt_spin(self.comp_reserved, comp.get("reserved"))
+        self._set_opt_spin(self.comp_tail, comp.get("tail_turns"))
+        self._set_opt_spin(self.comp_preserve, comp.get("preserve_recent_tokens"))
 
         toolo = data.get("tool_output") if isinstance(data.get("tool_output"), dict) else {}
         self._set_spin(self.tool_lines, toolo.get("max_lines"))
@@ -428,7 +456,8 @@ class RuntimeTab(BaseTab):
             self._put(srv, "hostname", self.server_host.value(), "")
             self._put(srv, "mdns", self.server_mdns.isChecked(), None)
             self._put(srv, "mdnsDomain", self.server_mdns_domain.value(), "")
-            self.server_cors.collect(srv)
+            # collect from the root: data_path is absolute (["server","cors"])
+            self.server_cors.collect(data)
             if not srv:
                 data.pop("server", None)
 
@@ -436,9 +465,9 @@ class RuntimeTab(BaseTab):
             comp = data.setdefault("compaction", {})
             self._put(comp, "auto", self.comp_auto.isChecked(), True)
             self._put(comp, "prune", self.comp_prune.isChecked(), False)
-            self._put(comp, "reserved", self.comp_reserved.value() or None, None)
-            self._put(comp, "tail_turns", self.comp_tail.value() or None, None)
-            self._put(comp, "preserve_recent_tokens", self.comp_preserve.value() or None, None)
+            self._put(comp, "reserved", self._opt_int(self.comp_reserved), None)
+            self._put(comp, "tail_turns", self._opt_int(self.comp_tail), None)
+            self._put(comp, "preserve_recent_tokens", self._opt_int(self.comp_preserve), None)
             if not comp:
                 data.pop("compaction", None)
 
@@ -465,12 +494,20 @@ class RuntimeTab(BaseTab):
         if "lsp" in self._touched:
             self.lsp.collect(data)
 
-        if "watcher" in self._touched or "instructions" in self._touched \
-                or "skills" in self._touched or "tools" in self._touched:
-            self.watcher_ignore.collect(data.setdefault("watcher", {}))
+        if "watcher" in self._touched:
+            self.watcher_ignore.collect(data)
+            # only prune wrappers this branch just created: an untouched
+            # {"watcher": {}} must round-trip unchanged.
+            if isinstance(data.get("watcher"), dict) and not data["watcher"]:
+                data.pop("watcher")
+        if "instructions" in self._touched:
             self.instructions.collect(data)
-            self.skills_paths.collect(data.setdefault("skills", {}))
-            self.skills_urls.collect(data.setdefault("skills", {}))
+        if "skills" in self._touched:
+            self.skills_paths.collect(data)
+            self.skills_urls.collect(data)
+            if isinstance(data.get("skills"), dict) and not data["skills"]:
+                data.pop("skills")
+        if "tools" in self._touched:
             self.tools.collect(data)
 
         if "experimental" in self._touched:
@@ -480,14 +517,24 @@ class RuntimeTab(BaseTab):
             self._put(exp, "openTelemetry", self.exp_otel.isChecked(), False)
             self._put(exp, "continue_loop_on_deny", self.exp_loop.isChecked(), False)
             self._put(exp, "mcp_timeout", self.exp_mcp_timeout.value() or None, None)
-            self.exp_primary_tools.collect(exp)
+            self.exp_primary_tools.collect(data)
             pols = []
             for r in range(self.policies.rowCount()):
                 eff = self.policies.item(r, 0).text() if self.policies.item(r, 0) else ""
                 act = self.policies.item(r, 1).text() if self.policies.item(r, 1) else ""
                 res = self.policies.item(r, 2).text() if self.policies.item(r, 2) else ""
-                if act and res:
-                    pols.append({"effect": eff, "action": act, "resource": res})
+                if not (eff and act and res):
+                    continue
+                if eff not in ("allow", "deny") or act != "provider.use":
+                    # Policy requires a valid effect/action; an incomplete row
+                    # would make opencode refuse the whole config.
+                    QMessageBox.warning(
+                        self, "Policies",
+                        f"Skipped row {r + 1}: effect must be allow/deny and "
+                        "action must be provider.use.",
+                    )
+                    continue
+                pols.append({"effect": eff, "action": act, "resource": res})
             self._put(exp, "policies", pols, [])
             if not exp:
                 data.pop("experimental", None)

@@ -4,6 +4,7 @@ No real network calls are made — fetch_provider_models accepts an injected
 `opener` callable that returns canned bytes.
 """
 import json
+import socket
 
 import pytest
 
@@ -103,6 +104,251 @@ def test_build_url_gemini_appends_query_key():
     assert "/v1beta/models" in url
     assert "key=SECRET" in url
 
+
+def test_build_url_anthropic_base_with_v1_is_not_doubled():
+    # The SDK-documented base already carries the version segment (F3).
+    url = app._build_fetch_url(
+        _spec(base_url="https://api.anthropic.com/v1", adapter="anthropic"))
+    assert url == "https://api.anthropic.com/v1/models"
+
+
+def test_build_url_anthropic_bare_host_gets_v1():
+    url = app._build_fetch_url(
+        _spec(base_url="https://api.anthropic.com", adapter="anthropic"))
+    assert url == "https://api.anthropic.com/v1/models"
+
+
+def test_build_url_gemini_v1beta_base_is_not_doubled():
+    url = app._build_fetch_url(
+        _spec(base_url="https://generativelanguage.googleapis.com/v1beta",
+              adapter="gemini"))
+    assert url == "https://generativelanguage.googleapis.com/v1beta/models"
+
+
+def test_build_url_gemini_bare_host_gets_v1beta():
+    url = app._build_fetch_url(
+        _spec(base_url="https://generativelanguage.googleapis.com", adapter="gemini"))
+    assert url == "https://generativelanguage.googleapis.com/v1beta/models"
+
+
+def test_build_url_openai_base_with_v1_is_unchanged():
+    url = app._build_fetch_url(
+        _spec(base_url="https://api.openai.com/v1", adapter="openai"))
+    assert url == "https://api.openai.com/v1/models"
+
+
+# ---------------------------------------------------------------------------
+# api_base_url_for: which URL may be persisted as options.baseURL (F2)
+# ---------------------------------------------------------------------------
+
+def test_api_base_url_for_list_formats_is_empty():
+    # models.dev / generic fetched a listing URL, not an API base (F2).
+    assert app.api_base_url_for("models_dev", "https://models.dev/api.json") == ""
+    assert app.api_base_url_for("generic", "http://localhost:11434/api/tags") == ""
+    assert app.api_base_url_for("generic", "") == ""
+
+
+def test_api_base_url_for_openai_keeps_its_base():
+    # openai is an API format (not a listing format), so it does persist.
+    assert app.api_base_url_for(
+        "openai", "https://api.example.com/v1") == "https://api.example.com/v1"
+    assert app.api_base_url_for(
+        "openai", "https://openrouter.ai/api/v1/") == "https://openrouter.ai/api/v1"
+
+
+def test_api_base_url_for_sdk_formats_carries_the_version():
+    assert app.api_base_url_for(
+        "anthropic", "https://api.anthropic.com") == "https://api.anthropic.com/v1"
+    assert app.api_base_url_for(
+        "anthropic", "https://api.anthropic.com/v1") == "https://api.anthropic.com/v1"
+    assert app.api_base_url_for(
+        "gemini", "https://generativelanguage.googleapis.com"
+    ) == "https://generativelanguage.googleapis.com/v1beta"
+    assert app.api_base_url_for(
+        "gemini", "https://generativelanguage.googleapis.com/v1beta"
+    ) == "https://generativelanguage.googleapis.com/v1beta"
+
+
+def test_api_base_url_for_empty_url_is_empty():
+    assert app.api_base_url_for("anthropic", "") == ""
+
+
+def test_apply_fetched_provider_empty_base_url_never_writes_or_clears():
+    providers = {"p": {"models": {}, "options": {"baseURL": "https://keep/v1"}}}
+    prov, _ = app.apply_fetched_provider(providers, "p", {"m": {}}, base_url="")
+    assert prov["options"] == {"baseURL": "https://keep/v1"}
+
+
+def test_apply_fetched_provider_empty_base_url_adds_no_options():
+    providers = {}
+    prov, _ = app.apply_fetched_provider(
+        providers, "p", {"m": {}}, base_url="", api_key="", save_api_key=False)
+    assert "options" not in prov
+
+
+# ---------------------------------------------------------------------------
+# Pagination (F8)
+# ---------------------------------------------------------------------------
+
+def test_fetch_follows_anthropic_has_more_pages():
+    seen = []
+
+    def fake_opener(url, headers, timeout):
+        seen.append(url)
+        if "after_id=" not in url:
+            body = {"data": [{"id": f"m{i}"} for i in range(20)],
+                    "has_more": True, "last_id": "m19"}
+        else:
+            body = {"data": [{"id": "m20"}, {"id": "m21"}], "has_more": False}
+        return json.dumps(body).encode("utf-8")
+
+    out = app.fetch_provider_models(
+        _spec(base_url="https://api.anthropic.com/v1", adapter="anthropic"),
+        opener=fake_opener)
+    assert len(out) == 22
+    assert len(seen) == 2
+    assert "after_id=m19" in seen[1]
+
+
+def test_fetch_stops_after_anthropic_last_page():
+    seen = []
+
+    def fake_opener(url, headers, timeout):
+        seen.append(url)
+        return json.dumps({"data": [{"id": "only"}],
+                           "has_more": False}).encode("utf-8")
+
+    out = app.fetch_provider_models(
+        _spec(base_url="https://api.anthropic.com/v1", adapter="anthropic"),
+        opener=fake_opener)
+    assert set(out) == {"only"}
+    assert len(seen) == 1
+
+
+def test_fetch_follows_gemini_next_page_token():
+    seen = []
+
+    def fake_opener(url, headers, timeout):
+        seen.append(url)
+        if "pageToken=" not in url:
+            body = {"models": [{"name": f"models/g{i}"} for i in range(50)],
+                    "nextPageToken": "TOK"}
+        else:
+            body = {"models": [{"name": "models/g50"}]}
+        return json.dumps(body).encode("utf-8")
+
+    out = app.fetch_provider_models(
+        _spec(base_url="https://generativelanguage.googleapis.com/v1beta",
+              adapter="gemini"),
+        opener=fake_opener)
+    assert len(out) == 51
+    assert "pageToken=TOK" in seen[1]
+
+
+def test_fetch_pagination_stops_at_page_cap():
+    calls = {"n": 0}
+
+    def always_more(url, headers, timeout):
+        calls["n"] += 1
+        return json.dumps({"data": [{"id": f"m{calls['n']}"}],
+                           "has_more": True, "last_id": "x"}).encode("utf-8")
+
+    out = app.fetch_provider_models(
+        _spec(base_url="https://api.anthropic.com/v1", adapter="anthropic"),
+        opener=always_more)
+    assert calls["n"] == app.MAX_FETCH_PAGES
+    assert len(out) == app.MAX_FETCH_PAGES
+
+
+def test_fetch_openai_does_not_paginate():
+    calls = {"n": 0}
+
+    def fake_opener(url, headers, timeout):
+        calls["n"] += 1
+        return json.dumps({"data": [{"id": "a"}], "has_more": True,
+                           "last_id": "a",
+                           "nextPageToken": "T"}).encode("utf-8")
+
+    out = app.fetch_provider_models(_spec(adapter="openai"), opener=fake_opener)
+    assert set(out) == {"a"}
+    assert calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Redirects: the guard re-runs, credentials do not cross origins (F9)
+# ---------------------------------------------------------------------------
+
+def test_redirect_to_private_host_is_refused(monkeypatch):
+    """A public URL that 302s to a loopback backend must not be followed."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    backend = {}
+
+    class Back(BaseHTTPRequestHandler):
+        def do_GET(self):
+            backend["authorization"] = self.headers.get("Authorization")
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    back = HTTPServer(("127.0.0.1", 0), Back)
+    threading.Thread(target=back.serve_forever, daemon=True).start()
+
+    class Front(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header(
+                "Location", f"http://127.0.0.1:{back.server_port}/models")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    front = HTTPServer(("127.0.0.1", 0), Front)
+    threading.Thread(target=front.serve_forever, daemon=True).start()
+
+    # 'front.test' is public as far as the guard is concerned; the redirect
+    # target is loopback, so the same guard must refuse the hop.
+    real_is_local = app._is_local_host
+    monkeypatch.setattr(
+        app, "_is_local_host",
+        lambda h: False if h == "front.test" else real_is_local(h))
+    real_gai = socket.getaddrinfo
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, *a, **k: (real_gai("127.0.0.1", *a, **k)
+                                if host == "front.test"
+                                else real_gai(host, *a, **k)))
+
+    import urllib.request
+    opener = urllib.request.build_opener(
+        app._GuardedRedirectHandler(allow_local=False))
+    req = urllib.request.Request(
+        f"http://front.test:{front.server_port}/models",
+        headers={"Authorization": "Bearer sk-SECRET"})
+    with pytest.raises(app.FetchError):
+        opener.open(req, timeout=5)
+    assert backend.get("authorization") is None
+
+    front.shutdown()
+    back.shutdown()
+
+
+def test_cross_origin_redirect_strips_all_credentials_case_insensitively(monkeypatch):
+    monkeypatch.setattr(app, "_validate_fetch_url", lambda *a, **k: None)
+    req = app.urllib.request.Request(
+        "https://one.example/models",
+        headers={"Authorization": "Bearer token", "x-api-key": "secret",
+                 "Proxy-Authorization": "proxy", "Cookie": "session=secret"})
+    redirected = app._GuardedRedirectHandler(False).redirect_request(
+        req, None, 302, "Found", {}, "https://two.example/models")
+    headers = {key.lower(): value for key, value in redirected.header_items()}
+    assert not ({"authorization", "x-api-key", "proxy-authorization", "cookie"} & set(headers))
 
 def test_headers_bearer():
     h = app._build_fetch_headers(_spec(adapter="openai", api_key="abc"))

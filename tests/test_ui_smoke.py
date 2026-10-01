@@ -144,6 +144,10 @@ def test_providers_tab_add_from_api_creates_new_provider(qapp, catalog, monkeypa
             self.reference_provider = None
         def _current_adapter(self):
             return "openai"
+        def api_base_url(self):
+            # The real dialog returns '' for list/catalog formats; "openai"
+            # is API-style, so the URL is the baseURL that gets persisted.
+            return self.url_edit.text().strip()
         def exec(self):
             return app.QDialog.Accepted
 

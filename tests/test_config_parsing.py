@@ -1,5 +1,6 @@
 """Tests for config access helpers, parsing utilities and Validator."""
 import pytest
+import json
 
 from tests.conftest import app
 
@@ -68,6 +69,63 @@ def test_parse_mcp_import():
 def test_parse_mcp_import_raw():
     out = app.parse_mcp_import({"srv": {"type": "remote", "url": "https://x"}})
     assert "srv" in out
+
+
+def test_parse_mcp_import_converts_claude_desktop_entries():
+    """Claude/Cursor entries must land in opencode's own shape (F6)."""
+    out = app.parse_mcp_import({
+        "filesystem": {"command": "npx", "args": ["-y", "pkg"],
+                       "env": {"TOKEN": "T"}},
+        "remote-docs": {"url": "https://docs.example/mcp"},
+    })
+    assert out["filesystem"] == {
+        "type": "local",
+        "command": ["npx", "-y", "pkg"],
+        "enabled": True,
+        "environment": {"TOKEN": "T"},
+    }
+    assert out["remote-docs"] == {
+        "type": "remote",
+        "url": "https://docs.example/mcp",
+        "enabled": True,
+    }
+
+
+def test_parse_mcp_import_accepts_mcp_servers_wrapper():
+    out = app.parse_mcp_import({"mcpServers": {
+        "gh": {"command": "docker", "args": ["run", "img"]},
+    }})
+    assert out["gh"]["type"] == "local"
+    assert out["gh"]["command"] == ["docker", "run", "img"]
+
+
+def test_parse_mcp_import_converts_single_claude_server():
+    out = app.parse_mcp_import({"command": "npx", "args": ["pkg"]})
+    entry = next(iter(out.values()))
+    assert entry["type"] == "local"
+    assert entry["command"] == ["npx", "pkg"]
+
+
+def test_parse_mcp_import_passes_opencode_entries_through():
+    cfg = {"srv": {"type": "remote", "url": "https://x", "enabled": True,
+                   "oauth": {"a": 1}, "headers": {"H": "v"}}}
+    assert app.parse_mcp_import(dict(cfg)) == cfg
+
+
+def test_parse_mcp_import_passes_toggle_entry_through():
+    cfg = {"t": {"enabled": False}}
+    assert app.parse_mcp_import(dict(cfg)) == cfg
+
+
+def test_parse_mcp_import_converts_mixed_map_per_entry():
+    opencode = {"type": "local", "command": ["npx", "-y", "pkg"],
+                "environment": {"K": "V"}}
+    out = app.parse_mcp_import({
+        "native": opencode,
+        "claude": {"command": "uvx", "args": ["srv"]},
+    })
+    assert out["native"] == opencode
+    assert out["claude"]["command"] == ["uvx", "srv"]
 
 
 def test_merge_dict_replaces_plain_keys():
@@ -176,6 +234,37 @@ def test_config_file_rejects_invalid_json(tmp_path):
     assert cf.error
 
 
+def test_config_file_loads_utf8_bom(tmp_path):
+    p = tmp_path / "opencode.json"
+    p.write_bytes(b'\xef\xbb\xbf{"theme": "x"}')
+    cf = app.ConfigFile(p, "opencode")
+    assert cf.load() is True, cf.error
+    assert cf.data == {"theme": "x"}
+
+
+def test_config_file_binary_reports_error_instead_of_raising(tmp_path):
+    p = tmp_path / "opencode.json"
+    p.write_bytes(b"\xff\xfe\x00\x81binary")
+    cf = app.ConfigFile(p, "opencode")
+    assert cf.load() is False
+    assert cf.error
+
+
+def test_config_file_export_failure_leaves_existing_file_intact(tmp_path, monkeypatch):
+    target = tmp_path / "export.json"
+    target.write_text("OLD", encoding="utf-8")
+    cf = app.ConfigFile(tmp_path / "opencode.json", "opencode")
+    cf.data = {"theme": "new"}
+
+    def fail(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(app.os, "replace", fail)
+    ok, msg = cf.export(target)
+    assert not ok and "disk full" in msg
+    assert target.read_text(encoding="utf-8") == "OLD"
+    assert [f.name for f in tmp_path.iterdir() if f.name.startswith("export.json.")] == []
+
+
 # --- layered config helpers (for multi-layer adapters like openclaude) -----
 
 def test_deep_merge_later_wins_and_recurses():
@@ -233,7 +322,7 @@ def test_strip_jsonc_line_comments():
         "key": "value", // inline comment
         "url": "http://example.com/api" // url with slashes
     }"""
-    clean = app.strip_jsonc(raw)
+    assert json.loads(app.strip_jsonc(raw)) == {"key": "value", "url": "http://example.com/api"}
     parsed = app.loads_jsonc(raw)
     assert parsed == {"key": "value", "url": "http://example.com/api"}
 
@@ -287,3 +376,40 @@ def test_plugin_state_store_preserves_options(tmp_path):
     disabled_names = store.get_disabled(cfg_file)
     assert disabled_names == {"plain-plugin", "custom-plugin"}
 
+
+
+def test_strip_jsonc_never_rewrites_string_literals():
+    """F1: a comma + optional whitespace before } / ] inside a string is data."""
+    raw = '{"a": "x,y }", "b": "} ", "c": "p, q]", "d": "e,]"}'
+    assert app.loads_jsonc(raw) == json.loads(raw)
+    assert app.strip_jsonc(raw) == raw
+
+
+def test_strip_jsonc_keeps_commas_inside_escaped_strings():
+    raw = '{"a": "quote\\" then,]"}'
+    assert app.loads_jsonc(raw) == {"a": 'quote" then,]'}
+
+
+def test_strip_jsonc_still_drops_real_trailing_commas():
+    raw = '{"a": [1, 2, ], "b": {"c": 1,},}'
+    assert app.loads_jsonc(raw) == {"a": [1, 2], "b": {"c": 1}}
+
+
+def test_strip_jsonc_keeps_interior_commas_before_non_brackets():
+    # `,` followed by a value is not a trailing comma and must survive.
+    assert app.loads_jsonc('{"a": 1, "b": 2}') == {"a": 1, "b": 2}
+    assert app.loads_jsonc('{"a": [1, 2],}') == {"a": [1, 2]}
+    # A string after the comma (IntegrationFix repro) must not let a later `}` eat it.
+    raw = '{"mcpServers": {"keep": {"args": ["--flag", "a,b"]}}}'
+    assert app.loads_jsonc(raw) == app.json.loads(raw)
+
+
+def test_loads_jsonc_accepts_utf8_bom(tmp_path):
+    """(a) A BOM-prefixed opencode.json must load, not be overwritten blind."""
+    path = tmp_path / "opencode.json"
+    path.write_bytes('﻿{"theme": "opencode"}'.encode("utf-8"))
+
+    cfg = app.ConfigFile(path, "opencode")
+    assert cfg.load() is True
+    assert cfg.error is None
+    assert cfg.data == {"theme": "opencode"}

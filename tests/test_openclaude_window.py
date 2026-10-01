@@ -924,3 +924,34 @@ def test_masked_env_cell_edit_marks_scope_dirty(oc_win, tmp_path):
     saved = json.loads(gpath.read_text())
     assert saved["mcpServers"]["srv"]["env"] == {"TOKEN": "new"}
 
+
+
+def test_form_save_asks_before_stripping_comments(oc_win, tmp_path, monkeypatch):
+    """F4: saving a settings layer that had comments must confirm first."""
+    settings = tmp_path / "cfghome" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    original = '{\n  // my note\n  "model": "opus"\n}\n'
+    settings.write_text(original, encoding="utf-8")
+
+    oc_win.oc_layer = "user"
+    oc_win.oc_layered.load()
+    oc_win.refresh_tabs()
+
+    asked = []
+
+    def _decline(win, path):
+        asked.append(str(path))
+        return False
+
+    monkeypatch.setattr(app, "_confirm_strip_comments", _decline)
+    oc_win._save()
+
+    assert asked == [str(settings)]
+    # Declined -> the commented file is untouched.
+    assert settings.read_text(encoding="utf-8") == original
+
+    # Accepting does save (and does strip, as the dialog warned).
+    monkeypatch.setattr(app, "_confirm_strip_comments", lambda w, p: True)
+    oc_win._save()
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+    assert "//" not in settings.read_text(encoding="utf-8")

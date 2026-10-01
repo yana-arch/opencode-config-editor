@@ -61,7 +61,8 @@ tự động phủ mọi adapter đã đăng ký.
    docstring ngắn gọn).
 4. Build và kiểm tra:
    ```bash
-   python3 build.py
+   python3 build.py              # build + chạy test
+   ruff check                    # lint (CI chạy y hệt)
    python3 opencode-config-editor.py
    ```
 5. Cập nhật [CHANGELOG.md](CHANGELOG.md) nếu thay đổi đáng chú ý.
@@ -72,7 +73,7 @@ tự động phủ mọi adapter đã đăng ký.
 - Python 3.8+, tuân thủ [PEP 8](https://peps.python.org/pep-0008/).
 - Docstring tiếng Anh (khớp với code hiện tại), ngắn gọn.
 - Không thêm comment thừa; đặt tên hàm/biến rõ nghĩa.
-- Khi thêm tính năng UI, cập nhật danh sách tab/key trong `00_header.py` nếu cần.
+- Mọi `import` đặt trong `src/core/header.py`. Các file khác trong `src/` không import ở cấp module: `build.py` ghép tất cả thành một module, nên import lặp sẽ gây lỗi F811 ở bước `ruff check` của CI. Khi thêm tính năng UI, cập nhật danh sách tab/key trong `header.py` nếu cần.
 
 ## Các bước thông thường khi thêm tab mới
 

@@ -13,10 +13,10 @@ set -euo pipefail
 #   # Local: cài từ file python đã có sẵn trong thư mục
 #   sudo bash install.sh --local opencode-config-editor.py
 #
-# Tuỳ biến:
-#   REPO=<owner/repo>  bash install.sh    # đổi nguồn tải remote (mặc định yana-arch/opencode-config-editor)
-#   VERSION=<x.y.z>    bash install.sh    # cài phiên bản cụ thể thay vì mới nhất
-#   NO_DEPS=1          bash install.sh    # bỏ qua cài python3/pyside6
+# Tuỳ chọn (truyền dạng cờ để hoạt động qua sudo — sudo không giữ biến môi trường):
+#   sudo bash install.sh --remote --repo <owner/repo>   # đổi nguồn tải (mặc định yana-arch/opencode-config-editor)
+#   sudo bash install.sh --remote --version <x.y.z>      # cài phiên bản cụ thể thay vì mới nhất
+#   sudo bash install.sh --remote --no-deps              # bỏ qua cài python3/pyside6
 # ============================================================
 
 APP_NAME="opencode-editor"
@@ -34,16 +34,17 @@ LOCAL_FILE=""
 # ---------- Parser tham số ----------
 usage() {
     cat <<EOF
-Cách dùng: bash install.sh [--remote | --local <file>]
+Cách dùng: bash install.sh [--remote | --local <file>] [tuỳ chọn]
 
   --remote               Tải release từ GitHub (mặc định)
   --local <file>         Cài từ file python có sẵn trong thư mục
+  --repo <owner/repo>    Đổi nguồn tải remote (mặc định: yana-arch/opencode-config-editor)
+  --version <x.y.z>      Cài phiên bản cụ thể (mặc định: latest)
+  --no-deps              Bỏ qua cài đặt phụ thuộc (python3, pyside6)
   -h, --help             Hiển thị trợ giúp này
 
-Biến môi trường:
-  REPO=<owner/repo>      Đổi nguồn tải remote (mặc định: yana-arch/opencode-config-editor)
-  VERSION=<x.y.z>        Cài phiên bản cụ thể (mặc định: latest)
-  NO_DEPS=1              Bỏ qua cài đặt phụ thuộc (python3, pyside6)
+Các cờ trên hoạt động cả khi chạy qua sudo. Biến môi trường REPO/VERSION/NO_DEPS
+vẫn được hỗ trợ khi KHÔNG dùng sudo.
 EOF
     exit "${1:-0}"
 }
@@ -62,6 +63,22 @@ parse_args() {
                     die "Cần chỉ định file khi dùng --local (ví dụ: --local opencode-config-editor.py)."
                 fi
                 LOCAL_FILE="$1"
+                shift
+                ;;
+            --no-deps)
+                NO_DEPS="1"
+                shift
+                ;;
+            --repo)
+                shift
+                [[ $# -gt 0 && "$1" != --* ]] || die "--repo cần giá trị <owner/repo>."
+                REPO="$1"
+                shift
+                ;;
+            --version)
+                shift
+                [[ $# -gt 0 && "$1" != --* ]] || die "--version cần giá trị <x.y.z>."
+                VERSION="$1"
                 shift
                 ;;
             -h|--help)
@@ -117,17 +134,31 @@ install_deps() {
         echo "(bỏ qua cài phụ thuộc theo NO_DEPS=1)"
         return
     fi
-    echo "Đang cài phụ thuộc: python3, python3-pyside6..."
+    echo "Đang cài phụ thuộc: python3, PySide6..."
+    # Install per-package with --needed so a single wrong name or an
+    # already-present package can't abort the whole script (set -e).
+    local failed=""
     if have pacman; then
-        pacman -Sy --noconfirm python python-pyside6
+        pacman -S --needed --noconfirm python || failed+=" python"
+        pacman -S --needed --noconfirm pyside6 || failed+=" pyside6"
     elif have apt; then
-        apt update && apt install -y python3 python3-pyside6
+        apt update || true
+        apt install -y python3 || failed+=" python3"
+        apt install -y python3-pyside6 || failed+=" python3-pyside6"
     elif have dnf; then
-        dnf install -y python3 python3-pyside6
+        dnf install -y python3 || failed+=" python3"
+        dnf install -y python3-pyside6 || failed+=" python3-pyside6"
     elif have zypper; then
-        zypper --non-interactive install python3 python3-PySide6
+        zypper --non-interactive install python3 || failed+=" python3"
+        zypper --non-interactive install python3-PySide6 || failed+=" python3-PySide6"
     else
-        echo "Cảnh báo: Không tìm thấy trình quản lý gói. Hãy tự cài python3 và PySide6."
+        echo "Cảnh báo: Không tìm thấy trình quản lý gói. Hãy tự cài python3 và PySide6" \
+             "(pip install --user PySide6), rồi chạy lại với --no-deps."
+        return
+    fi
+    if [[ -n "$failed" ]]; then
+        echo "Cảnh báo: không cài được:$failed. Hãy tự cài (ví dụ Arch: 'pacman -S python pyside6';" \
+             "hoặc 'pip install --user PySide6'), rồi chạy lại với --no-deps nếu cần."
     fi
 }
 
@@ -163,14 +194,18 @@ install_files() {
 
     echo "Đang khởi tạo thư mục cấu hình tại $config_dir ..."
     mkdir -p "$config_dir"
-    chown -R "$target_user:$target_user" "$config_dir" 2>/dev/null || true
+    # Chown the directory itself even when no group is named after the user:
+    # "user:user" fails with 'invalid group' on such systems and the old
+    # `|| true` swallowed it, leaving a root-owned dir that crashes startup.
+    chown -R "$target_user" "$config_dir" 2>/dev/null \
+        || die "Không thể đặt quyền sở hữu cho $config_dir. Hãy chạy: sudo chown -R $target_user \"$config_dir\""
 
     # Copy catalog nếu có sẵn trong repo
     local cat_src="models/models.dev.catalog.json"
     if [[ -f "$cat_src" ]]; then
         echo "Đang cài đặt model catalog..."
         cp "$cat_src" "$config_dir/catalog.json"
-        chown "$target_user:$target_user" "$config_dir/catalog.json" 2>/dev/null || true
+        chown "$target_user" "$config_dir/catalog.json" 2>/dev/null || true
     fi
 
     # Wrapper

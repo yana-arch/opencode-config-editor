@@ -16,6 +16,9 @@ class MaskedLineEdit(QWidget):
         # (e.g. env/headers cells whose VALUES may carry API keys).
         self.is_secret = bool(self.SECRET_HINT.search(field_name)) if secret is None else bool(secret)
         self._real_value = str(value) if value is not None else ""
+        # What we last pushed into the line edit; lets _user_modified() tell an
+        # untouched secret apart from a user edit without re-deriving the mask.
+        self._rendered = ""
         self.toggle_btn = None
 
         layout = QHBoxLayout(self)
@@ -23,7 +26,8 @@ class MaskedLineEdit(QWidget):
 
         self.edit = QLineEdit()
         self.edit.setPlaceholderText(placeholder)
-        self.edit.setText(self._display_value())
+        self._rendered = self._display_value()
+        self.edit.setText(self._rendered)
         # QLineEdit.textChanged carries a str, but our own textChanged is
         # declared arg-less, so it must NOT be used as the slot directly:
         # PySide6 raises "textChanged() only accepts 0 argument(s), 1 given!"
@@ -47,9 +51,14 @@ class MaskedLineEdit(QWidget):
         return self.toggle_btn is not None and self.toggle_btn.isChecked()
 
     def _user_modified(self) -> bool:
-        """True when the edit text differs from the masked rendering of the
-        stored value (i.e. the user typed something)."""
-        return self.edit.text() != _mask(self._real_value)
+        """True when the visible text differs from the last value rendering.
+
+        Tracking the rendering explicitly (rather than recomputing it) is what
+        makes toggling reliable: the eye state has already flipped by the time
+        _toggle_visibility runs, so a recomputed display would compare the text
+        against the wrong side of the toggle.
+        """
+        return self.edit.text() != self._rendered
 
     def _display_value(self) -> str:
         """Get display value (masked if secret)"""
@@ -58,21 +67,29 @@ class MaskedLineEdit(QWidget):
         return _mask(self._real_value)
 
     def _toggle_visibility(self, checked: bool):
-        """Toggle visibility without clobbering anything the user typed."""
-        modified = self._user_modified()
-        if checked and not modified and self.edit.text() != self._real_value:
-            self.edit.setText(self._real_value)
-        elif not checked and not modified:
-            self.edit.setText(_mask(self._real_value))
+        """Show/hide the secret without losing a typed edit in either direction.
+
+        The eye state has already flipped when this runs, so _user_modified()
+        compares against the *previous* rendering, and the text the user typed
+        (masked or not) becomes the new value to protect.
+        """
+        if self._user_modified():
+            self._real_value = self.edit.text()
+        self._render()
+
+    def _render(self):
+        """Push the current value into the line edit for the current eye state."""
+        self._rendered = self._display_value()
+        self.edit.setText(self._rendered)
 
     def set_value(self, value):
         """Set value"""
         self._real_value = str(value) if value is not None else ""
-        self.edit.setText(self._display_value())
+        self._render()
 
     def value(self) -> str:
-        """Get current value: what the user typed, or the stored secret while
-        the (untouched) display is still masked."""
+        """Get current value: the stored secret while the (untouched) display is
+        still masked, otherwise what the user typed - masked edits included."""
         if self.is_secret and not self._revealed() and not self._user_modified():
             return self._real_value
         return self.edit.text()

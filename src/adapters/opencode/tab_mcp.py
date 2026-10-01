@@ -1,4 +1,17 @@
 # MCP servers tab
+
+def _mcp_matches(cfg, text: str) -> bool:
+    """Search-text match over a server entry; non-dict entries never match."""
+    if not isinstance(cfg, dict):
+        return False
+    if text in str(cfg.get("type", "")).lower():
+        return True
+    if text in str(cfg.get("url", "")).lower():
+        return True
+    if isinstance(cfg.get("command"), list):
+        return any(text in str(c).lower() for c in cfg["command"])
+    return False
+
 class MCPHeadersDialog(QDialog):
     """Edit the `headers` map (name -> value) of a remote MCP server.
 
@@ -41,7 +54,10 @@ class MCPHeadersDialog(QDialog):
         r = self.table.rowCount()
         self.table.insertRow(r)
         self.table.setItem(r, 0, QTableWidgetItem(name))
-        self.table.setItem(r, 1, QTableWidgetItem(value))
+        item = QTableWidgetItem(_mask(str(value)) if value else "")
+        # The real value lives in UserRole so it can round-trip unedited.
+        item.setData(Qt.UserRole, str(value))
+        self.table.setItem(r, 1, item)
 
     def _add(self):
         name, ok = QInputDialog.getText(self, "Header", "Header name:")
@@ -60,9 +76,16 @@ class MCPHeadersDialog(QDialog):
             name = self.table.item(r, 0)
             value = self.table.item(r, 1)
             n = name.text().strip() if name else ""
-            v = value.text() if value else ""
-            if n:
-                out[n] = v
+            if not n:
+                continue
+            if value is None:
+                out[n] = ""
+                continue
+            # An untouched cell still shows the mask; take the stored secret.
+            # Once the user types (or clears), the text is what they meant.
+            shown = value.text()
+            real = str(value.data(Qt.UserRole) or "")
+            out[n] = real if shown == _mask(real) else shown
         return out
 
 
@@ -116,17 +139,14 @@ class McpTab(QWidget):
     def _filter_servers(self, text: str):
         """Filter servers by search text"""
         if not text:
-            self.refresh()
+            self._update_table()
             return
 
         text = text.lower()
         mcp = self.app.cfg.data.get("mcp", {}) if self.app.cfg else {}
         filtered = {
             name: cfg for name, cfg in mcp.items()
-            if text in name.lower() or
-               (isinstance(cfg.get("type"), str) and text in cfg["type"].lower()) or
-               (isinstance(cfg.get("url"), str) and text in cfg["url"].lower()) or
-               (isinstance(cfg.get("command"), list) and any(text in str(c).lower() for c in cfg["command"]))
+            if text in name.lower() or _mcp_matches(cfg, text)
         }
 
         self._update_table(filtered)
@@ -150,18 +170,23 @@ class McpTab(QWidget):
             self.table.setCellWidget(row, 0, enabled_check)
             self.cbs[name] = enabled_check
 
-            # Name
-            self.table.setItem(row, 1, QTableWidgetItem(name))
+            # Name / Type are not round-trippable from the table (the key is
+            # the map key, and type decides the entry's shape), so read-only.
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 1, name_item)
 
-            # Type
-            self.table.setItem(row, 2, QTableWidgetItem(str(cfg.get("type", ""))))
+            type_item = QTableWidgetItem(str(cfg.get("type", "")))
+            type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 2, type_item)
 
-            # Command/URL
+            # Command/URL. Local commands are argv lists, and shlex.split
+            # round-trips exactly what the join displayed.
             if cfg.get("type") == "local":
                 cmd = " ".join(cfg.get("command", []))
             else:
                 cmd = cfg.get("url", "")
-            self.table.setItem(row, 3, QTableWidgetItem(cmd))
+            self.table.setItem(row, 3, QTableWidgetItem(str(cmd or "")))
 
             # Actions
             actions_widget = QWidget()
@@ -188,8 +213,17 @@ class McpTab(QWidget):
         self.status_label.setText(f"{len(servers)} servers")
 
     def refresh(self):
-        """Refresh table with current data"""
-        self._update_table()
+        """Refresh the table, keeping the active search filter applied."""
+        self._filter_servers(self.search_edit.text())
+
+    def _visible_names(self) -> dict:
+        """{name: cfg} for the rows currently shown in the table."""
+        mcp = (self.app.cfg.data.get("mcp", {}) if self.app.cfg else {})
+        return {
+            name: mcp[name] for name in
+            (self.table.item(r, 1).text() for r in range(self.table.rowCount()))
+            if name in mcp
+        }
 
     def _add_server(self):
         """Add new MCP server"""
@@ -268,7 +302,9 @@ class McpTab(QWidget):
             QMessageBox.warning(self, "Error", f"Server '{name}' not found")
             return
 
-        if cfg.get("type") == "local":
+        # Headers only exist on type=remote entries; a type-less toggle entry
+        # ({enabled: false}) matches no schema branch once headers are added.
+        if cfg.get("type") != "remote":
             QMessageBox.information(
                 self, "Headers", "Headers apply to remote MCP servers only."
             )
@@ -377,21 +413,27 @@ class McpTab(QWidget):
             QMessageBox.warning(self, "Export Error", str(e))
 
     def _set_all_enabled(self, enabled: bool):
-        """Enable/disable all servers"""
+        """Enable/disable every dict entry (non-dict entries are left alone)"""
         self.app.snapshot_state()
         mcp = self.app.cfg.data.get("mcp", {})
+        changed = False
         for name in mcp:
-            mcp[name]["enabled"] = enabled
-        self.app.mark_dirty()
+            if isinstance(mcp[name], dict):
+                mcp[name]["enabled"] = enabled
+                changed = True
+        if changed:
+            self.app.mark_dirty()
         self.refresh()
 
     def _toggle_enabled(self, name: str):
         """Toggle enabled state for server"""
-        self.app.snapshot_state()
         mcp = self.app.cfg.data.get("mcp", {})
-        if name in mcp:
-            mcp[name]["enabled"] = self.cbs[name].isChecked()
+        cfg = mcp.get(name)
+        if isinstance(cfg, dict) and name in self.cbs:
+            self.app.snapshot_state()
+            cfg["enabled"] = self.cbs[name].isChecked()
             self.app.mark_dirty()
+
 
     def _open_mcp_hub(self):
         """Open MCP Template Hub to install curated MCP servers"""
@@ -412,7 +454,33 @@ class McpTab(QWidget):
             QMessageBox.information(self, "Installed", f"MCP server '{key}' installed successfully.")
 
     def collect(self, data: dict):
-        """Collect data from UI"""
-        # Enabled states are already applied live
-        pass
+        """Write the Command/URL column back into cfg.data['mcp'].
+
+        Name and Type are read-only in the table, so only column 3 can carry
+        an edit. Remote entries take the cell text as their url; local entries
+        are re-split with shlex so what was displayed round-trips.
+        """
+        mcp = self.app.cfg.data.get("mcp", {})
+        changed = False
+        for r in range(self.table.rowCount()):
+            name_item = self.table.item(r, 1)
+            cell = self.table.item(r, 3)
+            if name_item is None or cell is None:
+                continue
+            name = name_item.text()
+            cfg = mcp.get(name)
+            if not isinstance(cfg, dict):
+                continue
+            text = cell.text().strip()
+            if cfg.get("type") == "local":
+                new = shlex.split(text) if text else []
+                if cfg.get("command") != new:
+                    cfg["command"] = new
+                    changed = True
+            elif cfg.get("url", "") != text:
+                cfg["url"] = text
+                changed = True
+        if changed:
+            self.app.snapshot_state()
+            self.app.mark_dirty()
 

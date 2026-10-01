@@ -60,7 +60,8 @@ No changes to `core/` are required. The parametrized contract test in
 3. Edit the code in `src/`. Please maintain the existing style (Python, 4-space indent, concise docstrings).
 4. Build and test your changes:
    ```bash
-   python3 build.py
+   python3 build.py              # build + run the tests
+   ruff check                    # lint (same as CI)
    python3 opencode-config-editor.py
    ```
 5. Update [CHANGELOG_EN.md](CHANGELOG_EN.md) (and [CHANGELOG.md](CHANGELOG.md) if possible) for significant changes.
@@ -71,7 +72,7 @@ No changes to `core/` are required. The parametrized contract test in
 - Python 3.8+ following [PEP 8](https://peps.python.org/pep-0008/).
 - Concise docstrings in English (matching existing code).
 - Keep comments to a minimum; prefer self-documenting code.
-- When adding UI features, update key lists in `00_header.py` if necessary.
+- All imports live in `src/core/header.py`. Other `src/` files must not import at module level: `build.py` concatenates everything into one module, so a duplicate import fails CI's `ruff check` with F811. When adding UI features, update the key lists in `header.py` if necessary.
 
 ## How to Add a New Tab
 

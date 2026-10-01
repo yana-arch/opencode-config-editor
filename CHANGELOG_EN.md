@@ -11,6 +11,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/en/2.0.0/).
 
 
+## [Unreleased]
+
+### Added
+- **Soft-delete providers (opencode + openclaude)**: *Remove* moves a provider into the
+  editor's own `~/.config/opencode-config-editor/deleted-providers.json` (mode 0600, it holds
+  API keys) instead of flagging it inside the agent config (opencode silently ignores unknown
+  keys, so a "deleted" provider stayed active). It leaves the config file on the next Save.
+  Tick **Show deleted** to *Restore* it (the trash copy is pruned only after a successful save)
+  or *Delete permanently* (cannot be undone).
+
+### Fixed
+- opencode: editing a key in the *Provider* cell now renames in place instead of duplicating
+  the provider; empty or duplicate keys (including providers hidden by the search box) are
+  refused.
+- opencode: inline `npm`/*Name* edits are no longer lost when the table rebuilds (search,
+  *Models...*, *Options...*, *Add*, *Import*, *Show deleted*).
+- opencode: saving no longer writes `"npm": ""` into providers that had no `npm`.
+- opencode: provider search no longer crashes on non-object entries (e.g. `null`).
+- opencode: saving after Raw JSON edits no longer re-creates a provider deleted in Raw.
+- openclaude: removing every provider no longer leaves `activeProviderProfileId` pointing at
+  a missing profile.
+- **Stability & CI**: all imports live in `src/core/header.py` (CI `ruff check` is green); *Add Custom Model* opens again (missing `QGridLayout`); the app imports without PySide6; tests no longer write into the real `~/.config` or pop dialogs onto the screen.
+- **JSONC**: trailing-comma removal no longer rewrites string content (`[^,]` → `[^]`); BOM files load; plugin state left in `~/.cache` is migrated; plugin Remove takes effect only on Save; openclaude asks before a Save strips comments.
+- **MCP Hub**: opencode entries use `environment`, not `env`; Fetch/Context7 templates install real packages; Install is blocked while args/URL are blank; tokens are masked in the preview; overwriting an existing server asks first (Tools menu and openclaude tab); `sse` servers keep their `url`.
+- **MCP tab / Fetch from API**: Command/URL cell edits are saved; catalog URLs are no longer stored as `baseURL`; `/v1` and `/v1beta` are joined correctly; Cancel in the Models dialog really cancels; Claude/Cursor `mcpServers` imports are converted.
+- **Universal Config Converter**: Apply deep-merges (no lost `apiKey`/`models`), an MCP-only import no longer wipes `plugin`, unsaved edits prompt first, the OpenClaude source/target work, Save to File merges and writes atomically, MCP and permission mappings are correct.
+- **Health Check**: no hang/crash on close or a second run; `{env:}`/`{file:}` are resolved; built-in providers work without `npm`; openai-compatible keys are never sent to api.openai.com; keys never appear in error text.
+- **Model Catalog**: exact ids win and results are deterministic; `:free`/`:0`/`:thinking` tags no longer merge unrelated families; a bad download can't overwrite the cache; custom models no longer hide the catalog; self-referencing pattern rules no longer recurse forever.
+- **opencode tabs**: no `steps: 0`, permission rules use `ask/allow/deny`, string-form `permission` works, `share`/`autoupdate: false`/`server.cors`/`plugin_enabled` survive saves, Runtime spinbox edits are saved, Raw JSON edits are not overwritten by form tabs.
+- **Main window**: secret fields re-mask correctly and never save `*`; the Validator no longer crashes on a non-object `mcp`; the schema cache expires after 24h.
+
+### Removed
+- opencode: the placeholder *Enable All* / *Disable All* buttons on the Providers tab. They did
+  nothing and wrongly claimed providers have no enabled state (that lives in
+  `disabled_providers` / `enabled_providers` on the General tab).
+
 ## [4.4.1] - 2026-08-24
 
 ### Added

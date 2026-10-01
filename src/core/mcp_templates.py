@@ -1,7 +1,5 @@
 # MCP Server Templates and Hub Catalog
 # ---------------------------------------------------------------------------
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -46,7 +44,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-github"],
         env_keys={"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_xxxxxxxxxxxx"},
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/github",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/github",
     ),
     MCPTemplate(
         id="brave-search",
@@ -56,7 +54,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-brave-search"],
         env_keys={"BRAVE_API_KEY": "BSAxxxxxxxxxxxx"},
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/brave-search",
     ),
     MCPTemplate(
         id="fetch",
@@ -64,7 +62,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         category="Data & Web",
         description="Fetch web pages, extract content, and convert HTML to clean markdown for reading.",
         transport_type="local",
-        command=["npx", "-y", "@modelcontextprotocol/server-fetch"],
+        command=["uvx", "mcp-server-fetch"],
         doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/fetch",
     ),
     MCPTemplate(
@@ -75,7 +73,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-postgres", "{connection_string}"],
         default_args=["postgresql://user:password@localhost:5432/my_database"],
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/postgres",
     ),
     MCPTemplate(
         id="sqlite",
@@ -85,7 +83,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         transport_type="local",
         command=["uvx", "mcp-server-sqlite", "--db-path", "{db_path}"],
         default_args=["/path/to/database.db"],
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/sqlite",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/sqlite",
     ),
     MCPTemplate(
         id="puppeteer",
@@ -94,7 +92,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         description="Headless browser automation to interact with dynamic web pages, take screenshots, and execute JavaScript.",
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-puppeteer"],
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer",
+        doc_url="https://github.com/modelcontextprotocol/servers-archived/tree/main/src/puppeteer",
     ),
     MCPTemplate(
         id="git",
@@ -113,7 +111,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         description="Dynamic, multi-step structured reasoning tool for complex problem solving and debugging.",
         transport_type="local",
         command=["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
-        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/sequential-thinking",
+        doc_url="https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking",
     ),
     MCPTemplate(
         id="context7",
@@ -121,7 +119,7 @@ MCP_REGISTRY: List[MCPTemplate] = [
         category="Developer Tools",
         description="Up-to-date documentation and API reference lookup engine for popular libraries.",
         transport_type="local",
-        command=["npx", "-y", "context7-mcp"],
+        command=["npx", "-y", "@upstash/context7-mcp"],
         doc_url="https://context7.com",
     ),
     MCPTemplate(
@@ -158,7 +156,7 @@ def instantiate_opencode_mcp(
     if template.transport_type == "remote":
         res: Dict[str, Any] = {
             "type": "remote",
-            "url": url_value.strip() or template.url,
+            "url": url_value.strip(),
             "enabled": True,
         }
         return res
@@ -177,7 +175,10 @@ def instantiate_opencode_mcp(
     }
     clean_env = {k: v.strip() for k, v in env_values.items() if v.strip()}
     if clean_env:
-        config["env"] = clean_env
+        # opencode's McpLocalConfig names this field "environment" (the live
+        # schema at https://opencode.ai/config.json sets additionalProperties:
+        # false, so "env" is dropped silently).
+        config["environment"] = clean_env
 
     return config
 
@@ -196,7 +197,7 @@ def instantiate_openclaude_mcp(
     if template.transport_type == "remote":
         return {
             "type": "sse",
-            "url": url_value.strip() or template.url,
+            "url": url_value.strip(),
         }
 
     cmd_list = []

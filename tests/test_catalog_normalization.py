@@ -2,6 +2,15 @@ import pytest
 import json
 from conftest import app
 
+
+@pytest.fixture(autouse=True)
+def _isolated_catalog_files(tmp_path, monkeypatch):
+    """These tests must not pick up the developer's saved custom models or
+    pattern rules, which ModelCatalog loads from the real config dir (CAT-17)."""
+    monkeypatch.setattr(app, "CUSTOM_MODELS_FILE", tmp_path / "custom_models.json")
+    monkeypatch.setattr(app, "PATTERN_RULES_FILE", tmp_path / "pattern_rules.json")
+
+
 @pytest.fixture
 def catalog():
     c = app.ModelCatalog()
@@ -171,3 +180,60 @@ def test_from_spec_uses_humanized_name_when_missing():
     fmt = app.ModelFormat.from_spec("prov", "claude-opus-4.8-thinking",
                                     {"name": "My Custom Name"})
     assert fmt.name == "My Custom Name"
+
+
+# ---------------------------------------------------------------------------
+# CAT-03 / CAT-04: ':' is a model tag, never a namespace separator
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("input_id, expected_normalized_id", [
+    # ':<tag>' / ':<size>' belongs to the model id and is preserved, so
+    # unrelated families never collapse onto one key.
+    ("deepseek-r1:free", "deepseek-r1:free"),
+    ("qwen2.5-coder:32b", "qwen2.5-coder:32b"),
+    ("amazon.nova-micro-v1:0", "amazon.nova-micro-v1:0"),
+    ("x:thinking", "x:thinking"),
+    # A leading path is still a namespace.
+    ("df/claude-opus-4.8", "claude-opus-4.8"),
+    ("opencode/deepseek-r1:free", "deepseek-r1:free"),
+])
+def test_normalize_keeps_colon_tags(input_id, expected_normalized_id):
+    assert app._normalize_model_id(input_id) == expected_normalized_id
+
+
+def test_colon_tag_does_not_auto_resolve_to_another_family(tmp_path, monkeypatch):
+    """An unknown ':free' id stays unknown instead of matching a sibling."""
+    monkeypatch.setattr(app, "CUSTOM_MODELS_FILE", tmp_path / "custom_models.json")
+    monkeypatch.setattr(app, "PATTERN_RULES_FILE", tmp_path / "pattern_rules.json")
+    c = app.ModelCatalog()
+    c.load_text(json.dumps({"openrouter": {"models": {
+        "deepseek/deepseek-r1": {"name": "DeepSeek R1"},
+        "some/unrelated-model": {"name": "Unrelated"},
+    }}}))
+    assert c.find_model("deepseek-r1:free") == []
+    # The bare id still resolves.
+    assert [m.model_id for m in c.find_model("deepseek-r1")] == ["deepseek/deepseek-r1"]
+
+
+@pytest.mark.parametrize("input_id, expected_label", [
+    ("qwen2.5-coder:32b", "Qwen2.5 Coder 32B"),
+    ("llama3.1:8b", "Llama3.1 8B"),
+    ("gpt-oss:20b", "GPT Oss 20B"),
+    ("deepseek-r1:free", "DeepSeek R1 Free"),
+    ("amazon.nova-micro-v1:0", "Amazon.nova Micro V1 0"),
+])
+def test_humanize_keeps_family_for_colon_ids(input_id, expected_label):
+    assert app.humanize_model_id(input_id) == expected_label
+
+
+def test_colon_id_name_is_persisted_not_truncated(tmp_path, monkeypatch):
+    """The derived name written into the config keeps the model family."""
+    monkeypatch.setattr(app, "CUSTOM_MODELS_FILE", tmp_path / "custom_models.json")
+    monkeypatch.setattr(app, "PATTERN_RULES_FILE", tmp_path / "pattern_rules.json")
+    c = app.ModelCatalog()
+    c.load_text(json.dumps({"openai": {"models": {"gpt-4o": {"limit": {"context": 128000}}}}}))
+    c.save_pattern_rules([{"pattern": "qwen2.5-coder*", "reference_provider": "openai",
+                           "reference_model": "gpt-4o"}])
+    providers = {"myco": {"models": {"qwen2.5-coder:32b": {}}}}
+    app.apply_catalog_to_config(c, providers)
+    assert providers["myco"]["models"]["qwen2.5-coder:32b"]["name"] == "Qwen2.5 Coder 32B"

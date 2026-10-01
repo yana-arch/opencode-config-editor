@@ -11,6 +11,41 @@ Tất cả các thay đổi đáng chú ý của dự án được ghi lại tro
 và dự án tuân theo [Semantic Versioning](https://semver.org/lang/vi/).
 
 
+## [Unreleased]
+
+### Added
+- **Xoá mềm provider (opencode + openclaude)**: *Remove* chuyển provider sang file riêng của
+  editor `~/.config/opencode-config-editor/deleted-providers.json` (quyền 0600 vì chứa API key)
+  thay vì đánh dấu trong file cấu hình của agent (opencode lặng lẽ bỏ qua key lạ nên provider
+  "đã xoá" vẫn chạy). Provider biến mất khỏi file cấu hình ở lần Save kế tiếp. Bật
+  **Show deleted** để *Restore* (bản trong thùng rác chỉ bị dọn sau khi Save thành công) hoặc
+  *Delete permanently* (không hoàn tác được).
+
+### Fixed
+- opencode: sửa key trực tiếp trong ô *Provider* giờ đổi tên đúng chỗ thay vì nhân đôi provider;
+  key rỗng hoặc trùng (kể cả provider đang bị ẩn bởi ô tìm kiếm) bị từ chối.
+- opencode: chỉnh `npm`/*Name* ngay trong bảng không còn bị mất khi bảng dựng lại (tìm kiếm,
+  *Models...*, *Options...*, *Add*, *Import*, *Show deleted*).
+- opencode: Save không còn ghi `"npm": ""` vào provider vốn không có `npm`.
+- opencode: tìm kiếm provider không còn lỗi khi có entry không phải object (vd. `null`).
+- opencode: Save sau khi sửa Raw JSON không còn tạo lại provider đã xoá trong Raw.
+- openclaude: xoá hết provider không còn để lại `activeProviderProfileId` trỏ tới profile
+  không tồn tại.
+- **Ổn định & CI**: mọi import gom về `src/core/header.py` (CI `ruff check` hết đỏ); mở được lại hộp thoại *Add Custom Model* (thiếu `QGridLayout`); app import được khi không có PySide6; test không còn ghi vào `~/.config` thật hay bật popup lên màn hình.
+- **JSONC**: bỏ dấu phẩy thừa không còn sửa nội dung chuỗi (`[^,]` → `[^]`); chấp nhận file có BOM; trạng thái plugin cũ ở `~/.cache` được chuyển sang; Remove plugin chỉ có hiệu lực khi Save; openclaude hỏi trước khi Save xoá comment.
+- **MCP Hub**: opencode dùng `environment` thay cho `env`; sửa gói Fetch/Context7; chặn Install khi thiếu tham số/URL; che token trong preview; hỏi trước khi ghi đè server (cả menu Tools và tab openclaude); `sse` giữ nguyên `url`.
+- **Tab MCP / Fetch from API**: sửa ô Command/URL được lưu lại; không lưu URL catalog làm `baseURL`; nối `/v1`, `/v1beta` đúng; Cancel trong dialog Models thật sự huỷ; import Claude/Cursor `mcpServers` được chuyển đổi.
+- **Universal Config Converter**: Apply gộp sâu (không xoá `apiKey`/`models`), không ghi đè `plugin` khi chỉ nhập MCP, hỏi trước khi bỏ chỉnh sửa chưa lưu, đọc/ghi OpenClaude thật, Save to File gộp và ghi atomic, ánh xạ đúng MCP và quyền.
+- **Health Check**: không treo/crash khi đóng hoặc chạy hai lần; hỗ trợ `{env:}`/`{file:}`; provider built-in không cần `npm`; không gửi key openai-compatible tới api.openai.com; không lộ key trong thông báo lỗi.
+- **Model Catalog**: khớp chính xác id trước, kết quả ổn định giữa các lần chạy; tag `:free`/`:0`/`:thinking` không gộp model khác họ; không ghi đè cache bằng dữ liệu sai; custom model không làm ẩn catalog; pattern rule tự tham chiếu không còn đệ quy vô hạn.
+- **Tab opencode**: không ghi `steps: 0`, quyền chỉ `ask/allow/deny`, chịu được `permission` dạng chuỗi, giữ `share`/`autoupdate: false`/`server.cors`/`plugin_enabled`, lưu chỉnh sửa spinbox Runtime, chỉnh Raw JSON không bị tab form ghi đè.
+- **Cửa sổ chính**: ô bí mật ẩn lại đúng và không lưu dấu `*`; Validator không crash khi `mcp` không phải object; cache schema hết hạn sau 24 giờ.
+
+### Removed
+- opencode: bỏ hai nút giữ chỗ *Enable All* / *Disable All* ở tab Providers — chúng không làm
+  gì và báo sai rằng provider không có trạng thái bật/tắt (bật/tắt provider nằm ở
+  `disabled_providers` / `enabled_providers` trong tab General).
+
 ## [4.4.1] - 2026-08-24
 
 ### Added

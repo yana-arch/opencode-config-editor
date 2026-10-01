@@ -35,6 +35,13 @@ class PluginsTab(QWidget):
         self.state_store = PluginStateStore()
         self.cbs = {}  # name -> QCheckBox
         self._entries = {}  # name -> full_entry (str or [name, opts])
+        # Names removed from the table since the last Save. The store is only
+        # rewritten by collect(), so Undo/Reload still restore these entries.
+        self._removed = set()
+        self._visible_cbs = {}  # name -> checkbox for rows currently in the table
+        # name -> bool, the user's in-session choice. Repopulating the table
+        # (e.g. clearing a filter) must not lose an unsaved toggle.
+        self._checked = {}
 
         layout = QVBoxLayout(self)
 
@@ -104,11 +111,24 @@ class PluginsTab(QWidget):
         if self.app.cfg:
             disabled_entries = self.state_store.get_entries(self.app.cfg.path)
             for name, entry in sorted(disabled_entries.items()):
-                if name not in seen_names:
+                if name not in seen_names and name not in self._removed:
                     seen_names.add(name)
                     entries.append(entry)
 
         return entries
+
+    def _active_names(self) -> set:
+        """Names currently present in the config's plugin[] list."""
+        return {_name_of_plugin(e) for e in self._get_raw_plugins()} - {""}
+
+    def _disabled_names(self) -> set:
+        """Remembered-disabled names that are not enabled in the config.
+
+        A plugin listed in `plugin[]` wins over any store entry (which may come
+        from a stale legacy file), so migrating old state can never silently
+        re-disable a plugin the user has since re-enabled."""
+        disabled = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+        return set(disabled) - self._active_names() - self._removed
 
     def _filter_plugins(self, text: str):
         """Filter plugins by search text matching name or options."""
@@ -118,7 +138,7 @@ class PluginsTab(QWidget):
 
         text = text.lower()
         all_entries = self._display_entries()
-        disabled_names = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+        disabled_names = self._disabled_names()
 
         filtered = []
         for e in all_entries:
@@ -133,33 +153,36 @@ class PluginsTab(QWidget):
     def _update_table(self):
         """Update table with full current entries list."""
         all_entries = self._display_entries()
-        disabled_names = self.state_store.get_disabled(self.app.cfg.path) if self.app.cfg else set()
+        disabled_names = self._disabled_names()
         pairs = [(e, _name_of_plugin(e) not in disabled_names) for e in all_entries]
         self._populate_table(pairs)
 
     def _populate_table(self, pairs: List[Tuple[Any, bool]]):
-        """Populate table widget rows."""
+        """Populate table widget rows. `_entries` keeps every known plugin, so a
+        filtered-out row is still collected on Save."""
         self.table.blockSignals(True)
         self.table.setRowCount(len(pairs))
-        self.cbs = {}
-        self._entries = {}
+        new_cbs = {}
 
         for row, (entry, enabled) in enumerate(pairs):
             name = _name_of_plugin(entry)
             opts = _opts_of_plugin(entry)
             self._entries[name] = entry
+            enabled = self._checked.get(name, enabled)
 
             # Col 0: Enabled checkbox
             cb = QCheckBox()
             cb.setChecked(enabled)
-            cb.stateChanged.connect(self.app.mark_dirty)
+            cb.stateChanged.connect(
+                lambda _state, n=name, box=cb: self._checked.__setitem__(n, box.isChecked()))
+            self._checked.setdefault(name, enabled)
             cell = QWidget()
             cell_layout = QHBoxLayout(cell)
             cell_layout.setContentsMargins(0, 0, 0, 0)
             cell_layout.setAlignment(Qt.AlignCenter)
             cell_layout.addWidget(cb)
             self.table.setCellWidget(row, 0, cell)
-            self.cbs[name] = cb
+            new_cbs[name] = cb
 
             # Col 1: Plugin name
             name_item = QTableWidgetItem(name)
@@ -176,18 +199,28 @@ class PluginsTab(QWidget):
             cfg_btn.clicked.connect(lambda _, n=name: self._configure_plugin(n))
             self.table.setCellWidget(row, 3, cfg_btn)
 
+        # Only the visible rows get fresh checkboxes; hidden rows keep the
+        # checkbox object (and its checked state) from before the filter.
+        merged = {n: cb for n, cb in self.cbs.items() if n not in new_cbs}
+        merged.update(new_cbs)
+        self.cbs = merged
+        self._visible_cbs = new_cbs
+
+
         self.table.blockSignals(False)
         self._update_status()
 
     def _update_status(self):
         total = self.table.rowCount()
-        en = sum(1 for cb in self.cbs.values() if cb.isChecked())
+        en = sum(1 for cb in self._visible_cbs.values() if cb.isChecked())
         self.status_label.setText(
             f"{total} plugins ({en} enabled). Disabled plugins are remembered in cache with options intact."
         )
 
     def refresh(self):
-        """Refresh table with current data."""
+        """Refresh table with current data. Staged removals are dropped, so
+        Undo/Reload brings a removed plugin back from the state store."""
+        self._removed.clear()
         self._update_table()
 
     def _on_double_click(self, row: int, col: int):
@@ -255,6 +288,7 @@ class PluginsTab(QWidget):
         cell_layout.addWidget(cb)
         self.table.setCellWidget(row, 0, cell)
         self.cbs[name] = cb
+        self._visible_cbs[name] = cb
 
         self.table.setItem(row, 1, QTableWidgetItem(name))
         opts_item = QTableWidgetItem(_format_opts_summary(opts))
@@ -310,6 +344,7 @@ class PluginsTab(QWidget):
                 cell_layout.addWidget(cb)
                 self.table.setCellWidget(row, 0, cell)
                 self.cbs[name] = cb
+                self._visible_cbs[name] = cb
 
                 self.table.setItem(row, 1, QTableWidgetItem(name))
                 opts_item = QTableWidgetItem(_format_opts_summary(opts))
@@ -353,10 +388,11 @@ class PluginsTab(QWidget):
             QMessageBox.warning(self, "Export Error", str(e))
 
     def _set_all_enabled(self, enabled: bool):
-        """Enable/disable all plugins."""
+        """Enable/disable all plugins, including any hidden by a filter."""
         self.app.snapshot_state()
-        for cb in self.cbs.values():
+        for name, cb in self.cbs.items():
             cb.setChecked(enabled)
+            self._checked[name] = enabled
         self.app.mark_dirty()
         self._update_status()
 
@@ -384,8 +420,9 @@ class PluginsTab(QWidget):
                 self.table.removeRow(row)
             self.cbs.pop(name, None)
             self._entries.pop(name, None)
-            if self.app.cfg:
-                self.state_store.remove_entry(self.app.cfg.path, name)
+            self._visible_cbs.pop(name, None)
+            self._checked.pop(name, None)
+            self._removed.add(name)
 
         self.app.mark_dirty()
         self._update_status()
@@ -399,13 +436,20 @@ class PluginsTab(QWidget):
         return -1
 
     def collect(self, data: dict):
-        """Collect data from UI into config dict, preserving options tuples."""
+        """Collect data from UI into config dict, preserving options tuples.
+
+        The table only ever holds the rows a search filter left visible, so the
+        state comes from `_entries` / `_checked` (all known plugins), never from
+        the visible `cbs`.
+        """
+        disabled_names = self._disabled_names()
         active = []
         disabled_dict = {}
 
-        for name, cb in self.cbs.items():
-            entry = self._entries.get(name, name)
-            if cb.isChecked():
+        for name, entry in self._entries.items():
+            if name in self._removed:
+                continue
+            if self._checked.get(name, True) and name not in disabled_names:
                 active.append(entry)
             else:
                 disabled_dict[name] = entry
@@ -413,5 +457,6 @@ class PluginsTab(QWidget):
         data["plugin"] = active
         if self.app.cfg:
             self.state_store.set_disabled(self.app.cfg.path, disabled_dict)
+        self._removed.clear()
 
 

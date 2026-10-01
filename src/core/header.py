@@ -30,11 +30,13 @@ import urllib.parse
 import ipaddress
 import socket
 import html
+import csv
+import shlex
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from PySide6.QtCore import (
@@ -51,7 +53,7 @@ try:
         QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QSplitter,
         QComboBox, QMessageBox, QFileDialog, QDialogButtonBox, QGroupBox,
         QHeaderView, QToolBar, QDialog, QFrame, QInputDialog,
-        QScrollArea
+        QScrollArea, QGridLayout, QProgressBar
     )
     HAS_QT = True
 except ImportError as _e:
@@ -79,6 +81,7 @@ except ImportError as _e:
     QListWidget = QListWidgetItem = QTreeWidget = QTreeWidgetItem = QSplitter = _DummyQt
     QComboBox = QMessageBox = QFileDialog = QDialogButtonBox = QGroupBox = _DummyQt
     QHeaderView = QToolBar = QDialog = QFrame = QInputDialog = QScrollArea = _DummyQt
+    QGridLayout = QProgressBar = _DummyQt
 
 try:
     import jsonschema
@@ -95,6 +98,9 @@ TUI_SCHEMA_URL = "https://opencode.ai/tui.json"
 SCHEMA_CACHE = USER_CONFIG_DIR / "config-schema.json"
 TUI_SCHEMA_CACHE = USER_CONFIG_DIR / "tui-schema.json"
 PLUGIN_STATE_CACHE = USER_CONFIG_DIR / "plugin-state.json"
+# Soft-deleted providers (opencode + openclaude), kept OUT of the agent config:
+# {str(config_path): {provider_key: entry}}. Holds API keys; written 0600.
+PROVIDER_TRASH_FILE = USER_CONFIG_DIR / "deleted-providers.json"
 SETTINGS_FILE = USER_CONFIG_DIR / "settings.ini"
 CATALOG_CACHE = USER_CONFIG_DIR / "catalog.json"
 CUSTOM_MODELS_FILE = USER_CONFIG_DIR / "custom_models.json"

@@ -43,6 +43,10 @@ xác thực theo schema, import/export và nhiều tiện ích khác.
   Cả hai đều tự lưu `options.baseURL` + `options.apiKey` và chọn `npm` phù hợp; cột **Status**
   đánh dấu `new`/`existing`, spec đã cấu hình không bị ghi đè, tuỳ chọn **Sync** để xoá model
   API không còn liệt kê, và model mới được normalize theo catalog ngay sau khi thêm.
+- **Xoá mềm provider**: *Remove* chuyển provider sang file riêng của editor
+  `~/.config/opencode-config-editor/deleted-providers.json` (quyền 0600 vì chứa API key) thay
+  vì ghi cờ vào `opencode.json`; provider biến mất khỏi file cấu hình ở lần Save kế tiếp. Bật
+  **Show deleted** để *Restore* hoặc *Delete permanently* (không hoàn tác được).
 - **Undo/redo** cho mọi thao tác (giới hạn 100 bước).
 - **Bật/tắt hàng loạt** cho plugin và MCP server.
 
@@ -97,14 +101,14 @@ hoặc tìm "OpenCode Config Editor" trong menu ứng dụng.
 **Tuỳ biến cài đặt:**
 
 ```bash
-# Cài từ repo khác
-REPO=<owner/repo> sudo bash install.sh --remote
+# Cài từ repo khác (dùng cờ để hoạt động qua sudo)
+sudo bash install.sh --remote --repo <owner/repo>
 
 # Cài phiên bản cụ thể (mặc định: mới nhất)
-VERSION=4.0.1 sudo bash install.sh --remote
+sudo bash install.sh --remote --version 4.0.1
 
 # Bỏ qua cài đặt phụ thuộc
-NO_DEPS=1 sudo bash install.sh --remote
+sudo bash install.sh --remote --no-deps
 ```
 
 **Xem trợ giúp đầy đủ:** `bash install.sh --help`
@@ -174,7 +178,9 @@ Thư mục cấu hình đổi được qua `OPENCLAUDE_CONFIG_DIR` (hoặc `CLAU
   `enabled/disabledMcpjsonServers`). Ô nhập hiện giá trị **kế thừa** dạng placeholder xám để
   biết giá trị nào đến từ lớp khác.
 - **Agent Models** — `providerProfiles` (apiKey được che), chọn provider đang hoạt động, chuỗi
-  fallback, agent routing.
+  fallback, agent routing. *Remove selected* chuyển provider sang
+  `~/.config/opencode-config-editor/deleted-providers.json` thay vì giữ trong
+  `~/.openclaude.json`; bật **Show deleted** để *Restore selected* hoặc *Delete permanently*.
 - **MCP** — 4 scope: `user` → global, `project` → `.mcp.json`, `local` →
   `projects[file dict].mcpServers`, `policy` → chỉ đọc. Sửa được transport (stdio/http),
   command/url, **args**, env và headers (env/headers được che vì thường chứa API key).

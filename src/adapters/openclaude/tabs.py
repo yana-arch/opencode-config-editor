@@ -310,8 +310,16 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         self._had_active = False    # global file already had activeProviderProfileId
         layout = QVBoxLayout(self)
 
-        layout.addWidget(QLabel("Providers — providerProfiles in ~/.openclaude.json "
-                                "(apiKey is masked; other fields like id/authScheme are preserved):"))
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(QLabel("Providers — providerProfiles in ~/.openclaude.json "
+                                    "(apiKey is masked; other fields like id/authScheme are preserved):"))
+        top_layout.addStretch()
+        self.show_trash_chk = QCheckBox("Show deleted")
+        self.show_trash_chk.setToolTip(f"Removed providers are kept in {PROVIDER_TRASH_FILE}")
+        self.show_trash_chk.toggled.connect(lambda _: self._reload_trash_rows())
+        top_layout.addWidget(self.show_trash_chk)
+        layout.addLayout(top_layout)
+
         self.models_table = QTableWidget(0, len(self.COLS))
         self.models_table.setHorizontalHeaderLabels(self.COLS)
         self.models_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -321,8 +329,16 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         add_m.clicked.connect(lambda: self._add_model_row())
         del_m = QPushButton("Remove selected")
         del_m.clicked.connect(self._remove_model_row)
+        self.restore_btn = QPushButton("Restore selected")
+        self.restore_btn.clicked.connect(self._restore_trash_rows)
+        self.purge_btn = QPushButton("Delete permanently")
+        self.purge_btn.clicked.connect(self._purge_trash_rows)
+        for btn in (self.restore_btn, self.purge_btn):
+            btn.setEnabled(False)    # act on deleted rows; enabled with "Show deleted"
         mbtn.addWidget(add_m)
         mbtn.addWidget(del_m)
+        mbtn.addWidget(self.restore_btn)
+        mbtn.addWidget(self.purge_btn)
         mbtn.addStretch()
         layout.addLayout(mbtn)
 
@@ -368,9 +384,22 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         self._mark_edited()
 
     # --- provider rows (providerProfiles) ---
+    # Deleted (trash) rows are display-only and sit below the live rows; their
+    # name item carries the trash key under this role.
+    TRASH_ROLE = Qt.UserRole + 1
+
+    def _flag_of(self, r):
+        """Trash key of a display-only deleted row, else None (live row)."""
+        item = self.models_table.item(r, 0)
+        return item.data(self.TRASH_ROLE) if item else None
+
+    def _first_trash_row(self):
+        n = self.models_table.rowCount()
+        return next((r for r in range(n) if self._flag_of(r)), n)
+
     def _add_model_row(self, profile=None):
         profile = profile if isinstance(profile, dict) else {}
-        r = self.models_table.rowCount()
+        r = self._first_trash_row()          # live rows stay above deleted ones
         self.models_table.insertRow(r)
         name_item = QTableWidgetItem(str(profile.get("name", "")))
         # Preserve the original profile dict (id, authHeader, authScheme, ...).
@@ -384,9 +413,185 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         self.models_table.setCellWidget(r, 4, masked)
         self._edited()
 
+    @staticmethod
+    def _legacy_row(key, spec):
+        """Row shape (_add_model_row input) for a legacy agentModels entry."""
+        spec = spec if isinstance(spec, dict) else {}
+        row = dict(spec)   # keep any extra legacy keys
+        row.update({"name": key, "provider": spec.get("provider", ""),
+                    "baseUrl": spec.get("base_url", ""), "model": spec.get("model", ""),
+                    "apiKey": spec.get("api_key", ""), "_legacy_agentModels": True})
+        return row
+
+    def _row_entry(self, r):
+        """(kind, name, value) for live row r, exactly as collect() writes it:
+        ("legacy", name, agentModels spec) or ("profile", name, profile dict).
+        None for a row without a name (collect skips those)."""
+        name_item = self.models_table.item(r, 0)
+        name = name_item.text().strip() if name_item else ""
+        if not name:
+            return None
+        orig = self.preserved(name_item)
+        provider = self._cell(r, 1)
+        base_url = self._cell(r, 2)
+        model = self._cell(r, 3)
+        widget = self.models_table.cellWidget(r, 4)
+        api_key = widget.value().strip() if widget else ""
+
+        if orig.pop("_legacy_agentModels", False):
+            spec = dict(orig)  # preserve extra legacy keys
+            for mirror in ("name", "provider", "baseUrl", "model", "apiKey"):
+                spec.pop(mirror, None)   # UI mirrors, not schema keys
+            self._set_or_pop(spec, "base_url", base_url)
+            self._set_or_pop(spec, "model", model)
+            self._set_or_pop(spec, "api_key", api_key)
+            return "legacy", name, spec
+
+        prof = dict(orig)
+        prof["name"] = name
+        if not prof.get("id"):
+            prof["id"] = f"provider_{os.urandom(6).hex()}"
+        self._set_or_pop(prof, "provider", provider)
+        self._set_or_pop(prof, "baseUrl", base_url)
+        self._set_or_pop(prof, "model", model)
+        self._set_or_pop(prof, "apiKey", api_key)
+        return "profile", name, prof
+
+    def _trash_entry(self, r):
+        """(trash_key, entry) for live row r; the entry is _add_model_row input."""
+        got = self._row_entry(r)
+        if got is None:
+            return None
+        kind, name, value = got
+        if kind == "legacy":
+            return f"agentModels:{name}", self._legacy_row(name, value)
+        return str(value["id"]), value
+
+    def _live_keys(self):
+        keys = set()
+        for r in range(self.models_table.rowCount()):
+            item = self.models_table.item(r, 0)
+            if item is None or self._flag_of(r):
+                continue
+            orig = self.preserved(item)
+            if orig.get("_legacy_agentModels"):
+                keys.add(f"agentModels:{item.text().strip()}")
+            elif orig.get("id"):
+                keys.add(str(orig["id"]))
+        return keys
+
+    def _trashed(self):
+        """Trash entries of the global file whose key is not a live row."""
+        layered = self._layered()
+        if layered is None:
+            return {}
+        live = self._live_keys()
+        return {k: v for k, v in ProviderTrashStore().entries(layered.global_file).items()
+                if k not in live}
+
+    def _append_trash_row(self, key, entry):
+        entry = entry if isinstance(entry, dict) else {}
+        r = self.models_table.rowCount()
+        self.models_table.insertRow(r)
+        for c, fld in enumerate(("name", "provider", "baseUrl", "model")):
+            item = QTableWidgetItem(str(entry.get(fld, "")))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            font = item.font()
+            font.setItalic(True)
+            item.setFont(font)
+            item.setForeground(Qt.gray)
+            self.models_table.setItem(r, c, item)
+        self.models_table.item(r, 0).setData(self.TRASH_ROLE, key)
+        masked = MaskedLineEdit(str(entry.get("apiKey", "")), field_name="apiKey")
+        masked.setEnabled(False)
+        self.models_table.setCellWidget(r, 4, masked)
+
+    def _reload_trash_rows(self):
+        """Sync the display-only deleted rows with the trash file. Live rows (and
+        their unsaved edits) are untouched and the tab is never marked dirty."""
+        show = self.show_trash_chk.isChecked()
+        for btn in (self.restore_btn, self.purge_btn):
+            btn.setEnabled(show)
+        prev = self.models_table.blockSignals(True)
+        try:
+            for r in reversed(range(self.models_table.rowCount())):
+                if self._flag_of(r):
+                    self.models_table.removeRow(r)
+            if show:
+                for key, entry in sorted(self._trashed().items()):
+                    self._append_trash_row(key, entry)
+        finally:
+            self.models_table.blockSignals(prev)
+
+    def _selected_rows(self):
+        rows = {i.row() for i in self.models_table.selectedItems()}
+        if not rows and self.models_table.currentRow() >= 0:
+            rows = {self.models_table.currentRow()}
+        return sorted(rows, reverse=True)
+
     def _remove_model_row(self):
-        if self.remove_current(self.models_table):
+        """Soft delete: move each selected provider (current, edited values) into
+        the trash file, then drop its row. It leaves the global file on Save."""
+        layered = self._layered()
+        rows = [r for r in self._selected_rows() if not self._flag_of(r)]
+        if layered is None or not rows:
+            return
+        store = ProviderTrashStore()
+        removed = False
+        for r in rows:    # descending, so earlier indices stay valid
+            got = self._trash_entry(r)
+            if got is not None:
+                try:
+                    store.put(layered.global_file, *got)
+                except (OSError, TypeError, ValueError) as e:
+                    QMessageBox.critical(self, "Remove provider",
+                                         f"Could not save the provider to the trash file; "
+                                         f"it was not removed:\n{e}")
+                    break
+            self.models_table.removeRow(r)
+            removed = True
+        if removed:
             self._edited()
+            self._reload_trash_rows()
+
+    def _selected_trash_keys(self):
+        return [k for k in (self._flag_of(r) for r in self._selected_rows()) if k]
+
+    def _restore_trash_rows(self):
+        """Turn selected deleted rows back into live rows. The trash entry stays
+        until a successful save prunes it, so restore-then-discard loses nothing."""
+        layered = self._layered()
+        keys = self._selected_trash_keys()
+        if layered is None or not keys:
+            return
+        trashed = self._trashed()       # excludes keys that are live again
+        for key in keys:
+            if key in trashed:
+                self._add_model_row(trashed[key])     # marks the tab edited
+        skipped = sum(key not in trashed for key in keys)
+        self._reload_trash_rows()
+        if skipped:
+            QMessageBox.warning(self, "Restore provider",
+                                f"{skipped} selected provider(s) not restored: already "
+                                "present, or no longer in the trash file.")
+
+    def _purge_trash_rows(self):
+        """Permanently drop selected deleted rows from the trash file."""
+        layered = self._layered()
+        keys = self._selected_trash_keys()
+        if layered is None or not keys:
+            return
+        if not _confirm(self, "Delete permanently",
+                        f"Permanently delete {len(keys)} provider(s) from the trash?\n\n"
+                        "This cannot be undone."):
+            return
+        store = ProviderTrashStore()
+        try:
+            for key in keys:
+                store.discard(layered.global_file, key)
+        except OSError as e:
+            QMessageBox.critical(self, "Delete permanently", str(e))
+        self._reload_trash_rows()
 
     # --- agentRouting rows ---
     def _add_route_row(self, agent="", key=""):
@@ -422,12 +627,7 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
             agent_models = data.get("agentModels") if isinstance(data.get("agentModels"), dict) else {}
             self._had_agent_models = "agentModels" in data
             for key, spec in agent_models.items():
-                spec = spec if isinstance(spec, dict) else {}
-                row = dict(spec)   # keep any extra legacy keys
-                row.update({"name": key, "provider": spec.get("provider", ""),
-                            "baseUrl": spec.get("base_url", ""), "model": spec.get("model", ""),
-                            "apiKey": spec.get("api_key", ""), "_legacy_agentModels": True})
-                self._add_model_row(row)
+                self._add_model_row(self._legacy_row(key, spec))
 
             chain = data.get("providerFallbackChain")
             self._set_text(self.fallback_edit,
@@ -452,6 +652,7 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
             routing = data.get("agentRouting") if isinstance(data.get("agentRouting"), dict) else {}
             for agent, key in routing.items():
                 self._add_route_row(str(agent), str(key))
+            self._reload_trash_rows()
         finally:
             self._loading = False
             self._dirty = False
@@ -462,40 +663,20 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
         seen_names = set()
         dupes = set()
         for r in range(self.models_table.rowCount()):
-            name_item = self.models_table.item(r, 0)
-            name = name_item.text().strip() if name_item else ""
+            if self._flag_of(r):
+                continue             # deleted rows are display-only
+            name = self._cell(r, 0)
             if not name:
                 continue
             if name in seen_names:
                 dupes.add(name)      # reported below; first row wins
                 continue
             seen_names.add(name)
-            orig = self.preserved(name_item) if name_item else {}
-            provider = self._cell(r, 1)
-            base_url = self._cell(r, 2)
-            model = self._cell(r, 3)
-            widget = self.models_table.cellWidget(r, 4)
-            api_key = widget.value().strip() if widget else ""
-
-            if orig.pop("_legacy_agentModels", False):
-                spec = dict(orig)  # preserve extra legacy keys
-                for mirror in ("name", "provider", "baseUrl", "model", "apiKey"):
-                    spec.pop(mirror, None)   # UI mirrors, not schema keys
-                self._set_or_pop(spec, "base_url", base_url)
-                self._set_or_pop(spec, "model", model)
-                self._set_or_pop(spec, "api_key", api_key)
-                legacy_models[name] = spec
-                continue
-
-            prof = dict(orig)
-            prof["name"] = name
-            if not prof.get("id"):
-                prof["id"] = f"provider_{os.urandom(6).hex()}"
-            self._set_or_pop(prof, "provider", provider)
-            self._set_or_pop(prof, "baseUrl", base_url)
-            self._set_or_pop(prof, "model", model)
-            self._set_or_pop(prof, "apiKey", api_key)
-            profiles.append(prof)
+            kind, _, value = self._row_entry(r)
+            if kind == "legacy":
+                legacy_models[name] = value
+            else:
+                profiles.append(value)
 
         # Only write providerProfiles when the file already had it or we have rows,
         # so an untouched global file isn't polluted with an empty list.
@@ -506,8 +687,8 @@ class OpenclaudeAgentModelsTab(OpenclaudeTab):
 
         known_ids = {p.get("id") for p in profiles if isinstance(p, dict)}
         active = self.active_combo.currentData() or ""
-        if active and known_ids and active not in known_ids:
-            active = ""                     # profile was deleted; don't dangle
+        if active and active not in known_ids:
+            active = ""                     # profile was removed; don't dangle
         if "activeProviderProfileId" in data or active:
             self._put(data, "activeProviderProfileId", active, "")
 
@@ -551,6 +732,9 @@ class OpenclaudeMcpTab(OpenclaudeTab):
 
     SCOPES = OPENCLAUDE_MCP_SCOPES          # from constants (single source)
     SOURCE_TYPES = ("github", "git", "url", "file", "directory", "npm")
+    # Transports addressed by a URL rather than a command: openclaude's
+    # McpServerConfigSchema requires `url` for both of these.
+    URL_TYPES = ("http", "sse")
 
     def __init__(self, app):
         super().__init__(app)
@@ -608,8 +792,21 @@ class OpenclaudeMcpTab(OpenclaudeTab):
         name_item = QTableWidgetItem(name)
         self.preserve(name_item, server)
         self.mcp_table.setItem(r, 0, name_item)
+        # Transport as a combo over the supported types so a typo like "SSE"
+        # or "htp" cannot produce an entry no schema member accepts. An
+        # unknown stored type is added to the list rather than dropped.
         typ = str(server.get("type") or ("http" if server.get("url") else "stdio"))
-        self.mcp_table.setItem(r, 1, QTableWidgetItem(typ))
+        choices = list(OPENCLAUDE_MCP_TYPES)
+        if typ and typ not in choices:
+            choices.append(typ)
+        combo = QComboBox()
+        combo.addItem("", "")
+        for t in choices:
+            combo.addItem(t, t)
+        idx = combo.findData(typ)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.currentIndexChanged.connect(self._edited)
+        self.mcp_table.setCellWidget(r, 1, combo)
         target = server.get("command") if isinstance(server.get("command"), str) else \
             "" if not server.get("url") else str(server.get("url"))
         self.mcp_table.setItem(r, 2, QTableWidgetItem(str(target or "")))
@@ -645,9 +842,24 @@ class OpenclaudeMcpTab(OpenclaudeTab):
             cfg = dlg.result_server_config
             if not key or not cfg:
                 return
+            # Appending a row under an existing name would silently replace
+            # that server on save (env/args/headers and all), so ask first
+            # — same as the opencode MCP tab.
+            if key in self._collect_scope_table() and not _confirm(
+                self, "Overwrite Server",
+                f"Server '{key}' already exists. Overwrite?"
+            ):
+                return
             self._add_row(key, cfg)
             self._dirty_scopes.add(self._shown_scope)
             self._mark_edited()
+
+    def _transport(self, r):
+        """The transport of row `r` (combo cell, '' when unset)."""
+        w = self.mcp_table.cellWidget(r, 1)
+        if w is not None:
+            return w.currentData() or ""
+        return self._cell(r, 1)
 
     def _cell(self, r, c):
         return self.cell_text(self.mcp_table, r, c)
@@ -693,7 +905,7 @@ class OpenclaudeMcpTab(OpenclaudeTab):
             if not name:
                 continue
             srv = dict(self.preserved(nitem))
-            typ = self._cell(r, 1)
+            typ = self._transport(r)
             target = self._cell(r, 2)
             args_text = self._cell(r, 3)
             env_w = self.mcp_table.cellWidget(r, 4)
@@ -704,7 +916,7 @@ class OpenclaudeMcpTab(OpenclaudeTab):
                 srv["type"] = typ
             else:
                 srv.pop("type", None)
-            if typ == "http":
+            if typ in self.URL_TYPES:
                 srv["url"] = target
                 srv.pop("command", None)
             elif target:

@@ -358,6 +358,52 @@ class MainWindow(QMainWindow):
             self.tabs.addTab(tab, title)
 
         self.setCentralWidget(self.tabs)
+        self._prev_tab = self.tabs.currentWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _sync_raw_into_config(self) -> bool:
+        """Apply valid Raw JSON text to the config it belongs to.
+
+        Without this the Raw editor and the form tabs disagree: whichever was
+        edited last was silently discarded at save time (OC-08).
+        """
+        if not self.tab_raw._modified:
+            return True
+        cfg = self.cfg_tui if self._raw_kind == "tui" else self.cfg_oc
+        if cfg is None:
+            return True
+        try:
+            parsed = json.loads(self.tab_raw.editor.toPlainText())
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        cfg.data.clear()
+        cfg.data.update(parsed)
+        self.tab_raw._modified = False
+        return True
+
+    def _on_tab_changed(self, _index):
+        """Keep the Raw editor and the form tabs consistent on every switch."""
+        prev, cur = self._prev_tab, self.tabs.currentWidget()
+        self._prev_tab = cur
+        if prev is None or cur is None or prev is cur:
+            return
+        if not hasattr(self, "tab_raw") or self.tab_raw is None:
+            return
+        oc_tabs = list(getattr(self, "_oc_tabs", []))
+        if prev is self.tab_raw and self._raw_kind == "opencode":
+            # Leaving Raw: its text becomes the base, and the form tabs must
+            # not keep the values they were showing before the raw edit.
+            if self._sync_raw_into_config() and self.cfg_oc:
+                for tab in oc_tabs:
+                    tab.refresh()
+        elif (prev in oc_tabs and self._raw_kind == "opencode"
+              and not self.tab_raw._modified):
+            # Leaving a form tab: let the Raw editor show what was just edited
+            # here, so a later raw edit is based on it rather than on a stale
+            # document.
+            self.tab_raw.refresh()
 
     def _build_status_bar(self):
         """Build status bar"""
@@ -564,17 +610,10 @@ class MainWindow(QMainWindow):
         return "opencode"
 
     def _collect_oc(self) -> dict:
-        if self.tab_raw._modified and self._raw_kind == "opencode":
-            try:
-                base = json.loads(self.tab_raw.editor.toPlainText())
-                if isinstance(base, dict):
-                    data = base
-                else:
-                    data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
-            except json.JSONDecodeError:
-                data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
-        else:
-            data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
+        # A raw edit is folded into cfg.data first, then the form tabs collect
+        # on top of it. Neither side overwrites the other (OC-08).
+        self._sync_raw_into_config()
+        data = dict(self.cfg_oc.data) if isinstance(self.cfg_oc.data, dict) else {}
         for tab in self._oc_tabs:
             try:
                 tab.collect(data)
@@ -583,17 +622,8 @@ class MainWindow(QMainWindow):
         return data
 
     def _collect_tui(self) -> dict:
-        if self.tab_raw._modified and self._raw_kind == "tui":
-            try:
-                base = json.loads(self.tab_raw.editor.toPlainText())
-                if isinstance(base, dict):
-                    data = base
-                else:
-                    data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
-            except json.JSONDecodeError:
-                data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
-        else:
-            data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
+        self._sync_raw_into_config()
+        data = dict(self.cfg_tui.data) if isinstance(self.cfg_tui.data, dict) else {}
         self.tab_tui.collect(data)
         return data
 
@@ -892,7 +922,10 @@ class MainWindow(QMainWindow):
 
     def _manage_custom_catalog(self):
         """Open the Custom Models & Matching Rules manager dialog."""
-        self._ensure_catalog()
+        # Only load a catalog when none is loaded: _ensure_catalog() would
+        # otherwise throw away the catalog the user just loaded (CAT-06).
+        if not self.model_catalog.loaded() and not self._ensure_catalog():
+            return
         dlg = CustomCatalogManagerDialog(self, self.model_catalog)
         dlg.exec()
         self._update_catalog_status()
@@ -989,30 +1022,28 @@ class MainWindow(QMainWindow):
         providers = {}
         if hasattr(self, "cfg") and self.cfg and isinstance(self.cfg.data, dict):
             providers = section(self.cfg.data, "provider")
-        dlg = ProviderHealthCheckDialog(self, providers=providers)
+        # Project-scoped {file:...} API keys resolve against the config's dir.
+        cfg_path = str(self.cfg_oc.path) if self.cfg_oc else ""
+        dlg = ProviderHealthCheckDialog(self, providers=providers, config_path=cfg_path)
         dlg.exec()
 
     def _show_mcp_hub(self):
-        """Show MCP Server Hub & Templates dialog"""
-        mode = "openclaude" if getattr(self, "adapter_name", "") == "openclaude" else "opencode"
-        dlg = MCPTemplateHubDialog(self, target_mode=mode)
-        if dlg.exec() == QDialog.Accepted:
-            key = dlg.result_server_key
-            cfg = dlg.result_server_config
-            if not key or not cfg:
-                return
-            if mode == "opencode" and hasattr(self, "cfg") and self.cfg:
-                mcp = self.cfg.data.setdefault("mcp", {})
-                mcp[key] = cfg
-                self.mark_dirty()
-                if hasattr(self, "tab_mcp"):
-                    self.tab_mcp.refresh()
-                QMessageBox.information(self, "Installed", f"MCP server '{key}' installed into OpenCode config.")
-            elif mode == "openclaude" and hasattr(self, "tab_openclaude_mcp"):
-                self.tab_openclaude_mcp._add_row(key, cfg)
-                self.tab_openclaude_mcp._dirty_scopes.add(self.tab_openclaude_mcp._shown_scope)
-                self.tab_openclaude_mcp._mark_edited()
-                QMessageBox.information(self, "Installed", f"MCP server '{key}' installed into OpenClaude config.")
+        """Show MCP Server Hub & Templates dialog.
+
+        The install itself is delegated to the active adapter's MCP tab, which
+        prompts before overwriting an existing server and snapshots the undo
+        stack (audit F3/F4).
+        """
+        if getattr(self, "tab_mcp", None) is not None:
+            self.tab_mcp._open_mcp_hub()
+            return
+        mcp_tab = getattr(self, "_agent_mcp_tab", None)
+        if mcp_tab is not None:
+            mcp_tab._open_mcp_hub()
+            return
+        QMessageBox.information(
+            self, "MCP Server Hub",
+            "The active adapter does not provide an MCP Servers tab.")
 
     def _show_config_converter(self):
         """Show Universal Config Converter & Importer/Exporter dialog"""

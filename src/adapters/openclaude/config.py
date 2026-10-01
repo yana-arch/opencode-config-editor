@@ -15,6 +15,19 @@
 #     drop-ins (sorted), and managed-mcp.json holds policy MCP servers.
 #   - projects[] key = normalize(cwd) with backslashes replaced by "/".
 
+def _needs_jsonc(raw: str) -> bool:
+    """True when `raw` only parses as JSONC (comments, BOM or trailing commas),
+    i.e. saving it back as plain json.dumps would drop something."""
+    if not raw:
+        return False
+    if raw.lstrip(" \t\r\n").startswith("\ufeff"):
+        return True
+    try:
+        json.loads(raw)
+        return False
+    except (ValueError, TypeError):
+        return True
+
 def default_managed_dir() -> Path:
     if sys.platform == "darwin":
         return Path("/Library/Application Support/ClaudeCode")
@@ -57,11 +70,17 @@ class LayeredConfigFile:
         # path-str -> error message for files that exist but are unparsable;
         # guards the form-save path against clobbering them with empty dicts.
         self.parse_errors = {}
+        # path-str -> True for files that needed loads_jsonc (comments/BOM);
+        # the form-save path asks before rewriting them without comments.
+        self.jsonc_files = set()
 
     def _read(self, path) -> dict:
         try:
             if Path(path).exists():
-                data = loads_jsonc(Path(path).read_text(encoding="utf-8"))
+                raw = Path(path).read_text(encoding="utf-8")
+                if _needs_jsonc(raw):
+                    self.jsonc_files.add(str(path))
+                data = loads_jsonc(raw)
                 return data if isinstance(data, dict) else {}
         except OSError as e:
             self.parse_errors[str(path)] = str(e)
@@ -71,6 +90,7 @@ class LayeredConfigFile:
 
     def load(self) -> bool:
         self.parse_errors = {}
+        self.jsonc_files = set()
         for name, path in self.layer_files.items():
             self.layers[name] = self._read(path)
         self.global_data = self._read(self.global_file)
@@ -121,7 +141,28 @@ class LayeredConfigFile:
 
     def save_global(self, data: dict) -> Tuple[bool, str]:
         """Atomically write the global ~/.openclaude.json (providers/routing/mcp)."""
-        return self._atomic_write(self.global_file, data, on_ok=lambda: setattr(self, "global_data", data))
+        ok, msg = self._atomic_write(self.global_file, data, on_ok=lambda: setattr(self, "global_data", data))
+        if ok:
+            self._prune_provider_trash(data)
+        return ok, msg
+
+    def _prune_provider_trash(self, data: dict):
+        """Drop trash entries for profiles present in the just-saved global file
+        (keys: profile id, or "agentModels:<name>" for legacy rows). Best-effort:
+        never changes the save result."""
+        present = set()
+        profiles = data.get("providerProfiles")
+        if isinstance(profiles, list):
+            present.update(str(p["id"]) for p in profiles if isinstance(p, dict) and p.get("id"))
+        legacy = data.get("agentModels")
+        if isinstance(legacy, dict):
+            present.update(f"agentModels:{k}" for k in legacy)
+        if not present:
+            return
+        try:
+            ProviderTrashStore().prune(self.global_file, present)
+        except Exception:
+            pass
 
     def save_project_mcp(self, data: dict) -> Tuple[bool, str]:
         """Atomically write the project-scope .mcp.json."""
@@ -134,6 +175,7 @@ class LayeredConfigFile:
             path.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
             self.parse_errors.pop(str(path), None)
+            self.jsonc_files.discard(str(path))
             if on_ok:
                 on_ok()
             return True, f"Saved to {path}"

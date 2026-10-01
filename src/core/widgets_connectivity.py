@@ -1,53 +1,98 @@
 # Connectivity & Health Check GUI Components
 # ---------------------------------------------------------------------------
-import json
-from typing import Dict, Optional
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
-    QMessageBox, QTextEdit, QGroupBox, QSplitter
-)
+
+# Exact npm packages whose endpoints can be tested with an API key, and the
+# matching fetch adapter. Package names are matched whole (not by substring) so
+# e.g. '@ai-sdk/google-vertex' is never probed against AI Studio.
+_KNOWN_PROVIDER_PACKAGES = {
+    "@ai-sdk/anthropic": "anthropic",
+    "@ai-sdk/openai": "openai",
+    "@ai-sdk/openai-compatible": "openai",
+    "@ai-sdk/google": "gemini",
+}
+
+# Default endpoint per first-party package, keyed by npm name (not by adapter)
+# so '@ai-sdk/openai-compatible' can be excluded.
+_PACKAGE_DEFAULT_URLS = {
+    "@ai-sdk/anthropic": "https://api.anthropic.com",
+    "@ai-sdk/openai": "https://api.openai.com/v1",
+    "@ai-sdk/google": "https://generativelanguage.googleapis.com",
+}
+
+# Default endpoint per adapter, for providers that are configured with just a
+# key (the docs' own 'provider.anthropic.options.apiKey' example has no npm
+# and no baseURL). The key is the provider id opencode ships under.
+_BUILTIN_PROVIDERS = {
+    "anthropic": ("anthropic", "https://api.anthropic.com"),
+    "openai": ("openai", "https://api.openai.com/v1"),
+    "google": ("gemini", "https://generativelanguage.googleapis.com"),
+}
+
+
+def resolve_provider_target(key: str, pdata: dict, config_dir: Optional[Path] = None):
+    """Work out which endpoint and adapter to test for one provider entry.
+
+    Returns (adapter, base_url, api_key, error). 'error' is non-empty when the
+    provider cannot be tested at all (no endpoint and no known package); the
+    placeholder variables in options are expanded here.
+    """
+    opts = pdata.get("options") if isinstance(pdata.get("options"), dict) else {}
+    base_url = resolve_config_placeholders(opts.get("baseURL", ""), config_dir)
+    api_key = resolve_config_placeholders(opts.get("apiKey", ""), config_dir)
+    npm = pdata.get("npm", "") or ""
+    if not isinstance(npm, str):
+        npm = ""
+
+    adapter = _KNOWN_PROVIDER_PACKAGES.get(npm)
+    if adapter is None and npm not in ("", None):
+        # Unknown package: only test it if it configures its own baseURL.
+        return "openai", base_url, api_key, ""
+
+    if adapter is None:
+        builtin = _BUILTIN_PROVIDERS.get(key)
+        if builtin is None:
+            return "openai", base_url, api_key, ""
+        adapter, default_url = builtin
+        return adapter, base_url or default_url, api_key, ""
+
+    # Only the first-party packages get a default endpoint. openai-compatible
+    # is excluded on purpose: it fronts other vendors (OpenRouter, Ollama,
+    # vLLM), so defaulting it to api.openai.com would ship the user's key to
+    # the wrong vendor. It must configure its own baseURL.
+    default_url = _PACKAGE_DEFAULT_URLS.get(npm)
+    return adapter, base_url or (default_url or ""), api_key, ""
 
 
 class ProviderPingWorker(QThread):
     """Background worker to test a provider connection without freezing the GUI."""
     finished_one = Signal(str, object)  # provider_key, ConnectionTestResult
 
-    def __init__(self, providers_to_test: Dict[str, dict]):
+    def __init__(self, providers_to_test: Dict[str, dict], config_dir: Optional[Path] = None):
         super().__init__()
         self.providers_to_test = providers_to_test
+        self.config_dir = config_dir
 
     def run(self):
         for key, pdata in self.providers_to_test.items():
+            if self.isInterruptionRequested():
+                return
             if not isinstance(pdata, dict):
                 continue
-            opts = pdata.get("options", {}) if isinstance(pdata.get("options"), dict) else {}
-            base_url = opts.get("baseURL", "")
-            api_key = opts.get("apiKey", "")
-            npm = pdata.get("npm", "")
 
-            # Guess adapter
-            adapter = "openai"
-            if "anthropic" in npm:
-                adapter = "anthropic"
-            elif "google" in npm:
-                adapter = "gemini"
+            adapter, base_url, api_key, error = resolve_provider_target(
+                key, pdata, self.config_dir
+            )
 
-            # If no base_url specified, use default for known npm
-            if not base_url:
-                if "anthropic" in npm:
-                    base_url = "https://api.anthropic.com"
-                elif "openai" in npm and not "openai-compatible" in npm:
-                    base_url = "https://api.openai.com/v1"
-                elif "google" in npm:
-                    base_url = "https://generativelanguage.googleapis.com"
-
-            if not base_url:
-                res = ConnectionTestResult(
-                    success=False,
-                    message="No baseURL configured for this provider.",
-                )
+            if error:
+                res = ConnectionTestResult(success=False, message=error)
+            elif not base_url:
+                npm = pdata.get("npm", "") or ""
+                if npm:
+                    msg = (f"'{npm}' cannot be tested: configure options.baseURL "
+                           "in the provider to test this endpoint.")
+                else:
+                    msg = "No baseURL configured for this provider."
+                res = ConnectionTestResult(success=False, message=msg)
             else:
                 res = test_provider_connection(
                     base_url=base_url,
@@ -62,13 +107,20 @@ class ProviderPingWorker(QThread):
 class ProviderHealthCheckDialog(QDialog):
     """Dialog to run live health checks on all configured providers."""
 
-    def __init__(self, parent=None, providers: Optional[dict] = None, auto_run: bool = True):
+    def __init__(self, parent=None, providers: Optional[dict] = None, auto_run: bool = True,
+                 config_path: Optional[str] = None):
         super().__init__(parent)
         self.setWindowTitle("⚡ Provider Connectivity & Health Check")
         self.setMinimumSize(780, 520)
         self.providers = providers or {}
         self.results: Dict[str, ConnectionTestResult] = {}
         self.worker: Optional[ProviderPingWorker] = None
+        # {file:} paths resolve relative to the config file being edited; the
+        # default is the global opencode config dir.
+        if config_path:
+            self.config_dir = Path(config_path).expanduser().parent
+        else:
+            self.config_dir = Path.home() / ".config" / "opencode"
 
         layout = QVBoxLayout(self)
 
@@ -135,9 +187,40 @@ class ProviderHealthCheckDialog(QDialog):
             self.run_tests()
 
     def _stop_worker(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait(1500)
+        """Stop the running worker cooperatively and wait for it to unwind.
+
+        QThread.terminate() is never used: killing a thread mid-request can
+        deadlock the interpreter's own locks and freeze the editor.
+        """
+        worker = self.worker
+        if not worker or not worker.isRunning():
+            self.worker = None
+            return
+        # Parent the thread to the dialog so Qt keeps it alive while it drains.
+        worker.setParent(self)
+        worker.requestInterruption()
+        try:
+            worker.finished_one.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        if worker.wait(3000):
+            # Fully unwound: safe to drop the last reference.
+            self.worker = None
+        # else: a request is still blocked (DNS, dropped SYN, silent server).
+        # Keep the reference and let _on_all_finished clear it, otherwise the
+        # QThread is destroyed while running and the process aborts.
+
+    def _busy(self) -> bool:
+        return bool(self.worker and self.worker.isRunning())
+
+    def _set_running(self, running: bool):
+        """Keep both start buttons disabled for the whole run."""
+        self.run_btn.setEnabled(not running)
+        self.retest_sel_btn.setEnabled(not running)
+        if running:
+            self.progress.show()
+        else:
+            self.progress.hide()
 
     def closeEvent(self, event):
         self._stop_worker()
@@ -165,9 +248,10 @@ class ProviderHealthCheckDialog(QDialog):
         if not self.providers:
             QMessageBox.information(self, "No Providers", "No providers configured to test.")
             return
+        if self._busy():
+            return
 
-        self.run_btn.setEnabled(False)
-        self.progress.show()
+        self._set_running(True)
         self.progress.setRange(0, len(self.providers))
         self.progress.setValue(0)
 
@@ -176,7 +260,7 @@ class ProviderHealthCheckDialog(QDialog):
             self.table.setItem(r, 2, QTableWidgetItem("-"))
             self.table.setItem(r, 3, QTableWidgetItem("-"))
 
-        self.worker = ProviderPingWorker(self.providers)
+        self.worker = ProviderPingWorker(self.providers, self.config_dir)
         self.worker.finished_one.connect(self._on_provider_tested)
         self.worker.finished.connect(self._on_all_finished)
         self.worker.start()
@@ -186,6 +270,8 @@ class ProviderHealthCheckDialog(QDialog):
         if not selected_rows:
             QMessageBox.information(self, "Selection", "Please select a provider row to test.")
             return
+        if self._busy():
+            return
 
         subset = {}
         for r in selected_rows:
@@ -194,7 +280,8 @@ class ProviderHealthCheckDialog(QDialog):
                 subset[key] = self.providers[key]
                 self.table.setItem(r, 1, QTableWidgetItem("Testing..."))
 
-        self.worker = ProviderPingWorker(subset)
+        self._set_running(True)
+        self.worker = ProviderPingWorker(subset, self.config_dir)
         self.worker.finished_one.connect(self._on_provider_tested)
         self.worker.finished.connect(self._on_all_finished)
         self.worker.start()
@@ -225,8 +312,8 @@ class ProviderHealthCheckDialog(QDialog):
         self._on_selection_changed()
 
     def _on_all_finished(self):
-        self.run_btn.setEnabled(True)
-        self.progress.hide()
+        self.worker = None
+        self._set_running(False)
 
     def _on_selection_changed(self):
         selected = self.table.selectedItems()
@@ -236,21 +323,27 @@ class ProviderHealthCheckDialog(QDialog):
         key = self.table.item(row, 0).text()
         res = self.results.get(key)
         if not res:
-            self.detail_text.setHtml(f"<h3>{key}</h3><p>Testing or not yet run...</p>")
+            self.detail_text.setHtml(
+                f"<h3>{html.escape(key)}</h3><p>Testing or not yet run...</p>"
+            )
             return
 
+        # Escape every provider-controlled value: raw errors look like
+        # '<urlopen error ...>', which setHtml() would swallow as a tag.
+        esc_key = html.escape(key)
         color = "green" if res.success else "red"
-        html = f"<h3>Provider: <span style='color:{color}'>{key}</span></h3>"
-        html += f"<p><b>Status:</b> {'SUCCESS' if res.success else 'FAILED'}</p>"
-        html += f"<p><b>Latency:</b> {res.latency_ms:.1f} ms</p>"
-        html += f"<p><b>Message:</b> {res.message}</p>"
+        out = f"<h3>Provider: <span style='color:{color}'>{esc_key}</span></h3>"
+        out += f"<p><b>Status:</b> {'SUCCESS' if res.success else 'FAILED'}</p>"
+        out += f"<p><b>Latency:</b> {res.latency_ms:.1f} ms</p>"
+        out += f"<p><b>Message:</b> {html.escape(res.message)}</p>"
 
         if res.models:
-            html += f"<h4>Discovered Models ({len(res.models)}):</h4><ul>"
+            out += f"<h4>Discovered Models ({len(res.models)}):</h4><ul>"
             for m in res.models:
-                html += f"<li><code>{m}</code></li>"
-            html += "</ul>"
+                out += f"<li><code>{html.escape(str(m))}</code></li>"
+            out += "</ul>"
         elif res.raw_error:
-            html += f"<h4>Diagnostic Log:</h4><pre style='background:#f5f5f5; padding:6px;'>{res.raw_error}</pre>"
+            out += ("<h4>Diagnostic Log:</h4>"
+                    f"<pre style='background:#f5f5f5; padding:6px;'>{html.escape(res.raw_error)}</pre>")
 
-        self.detail_text.setHtml(html)
+        self.detail_text.setHtml(out)

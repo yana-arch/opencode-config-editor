@@ -43,7 +43,12 @@ class JSONHighlighter(QSyntaxHighlighter):
 
 def strip_jsonc(text: str) -> str:
     """Strip JavaScript-style comments (//... and /*...*/) and trailing commas
-    from a JSON string without breaking string literals."""
+    from a JSON string without breaking string literals.
+
+    A trailing comma is dropped only when the next significant character
+    (outside strings and comments) is `}` or `]`, so anything json.loads
+    accepts round-trips to the same value.
+    """
     if not text:
         return ""
     out = []
@@ -51,6 +56,14 @@ def strip_jsonc(text: str) -> str:
     n = len(text)
     in_string = False
     escape = False
+    # Index in out[] holding a ',' that may turn out to be a trailing comma.
+    pending_comma = -1
+
+    def drop_pending_comma():
+        nonlocal pending_comma
+        if pending_comma >= 0:
+            out[pending_comma] = " "
+            pending_comma = -1
 
     while i < n:
         c = text[i]
@@ -66,6 +79,7 @@ def strip_jsonc(text: str) -> str:
         else:
             if c == '"':
                 in_string = True
+                pending_comma = -1  # a string value confirms the comma is not trailing
                 out.append(c)
                 i += 1
             elif c == '/' and i + 1 < n and text[i + 1] == '/':
@@ -77,20 +91,35 @@ def strip_jsonc(text: str) -> str:
                 while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
                     i += 1
                 i += 2
+            elif c == ',':
+                out.append(c)
+                pending_comma = len(out) - 1
+                i += 1
+            elif c in ' \t\r\n':
+                # Whitespace can never confirm a trailing comma on its own.
+                out.append(c)
+                i += 1
             else:
+                if c in '}]':
+                    drop_pending_comma()
+                else:
+                    pending_comma = -1
                 out.append(c)
                 i += 1
 
-    clean = "".join(out)
-    clean = re.sub(r',\s*(\}|\])', r'\1', clean)
-    return clean
+    return "".join(out)
 
 
 def loads_jsonc(text: str):
-    """Parse a JSON or JSONC string, accepting comments and trailing commas."""
+    """Parse a JSON or JSONC string, accepting a leading BOM, comments and
+    trailing commas."""
     if not isinstance(text, str):
         raise TypeError(f"Expected string, got {type(text)}")
+    if text.startswith("\ufeff"):
+        text = text[1:]
     return json.loads(strip_jsonc(text))
+
+
 
 
 def section(cfg_data, key: str) -> dict:
@@ -194,7 +223,8 @@ class ConfigFile:
     def load(self) -> bool:
         """Load config file with error handling"""
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
+            # utf-8-sig: a UTF-8 BOM (common from Windows editors) must still load.
+            with open(self.path, "r", encoding="utf-8-sig") as f:
                 raw = f.read()
             self.data = loads_jsonc(raw)
             self.error = None
@@ -205,6 +235,9 @@ class ConfigFile:
             return False
         except json.JSONDecodeError as e:
             self.error = f"Invalid JSON: {e}"
+            return False
+        except UnicodeDecodeError as e:
+            self.error = f"Not a UTF-8 text file: {e}"
             return False
         except OSError as e:
             self.error = f"Read error: {e}"
@@ -243,16 +276,28 @@ class ConfigFile:
             atomic_write_json(self.path, content)
 
             self.data = data
+            if self.kind == "opencode":
+                self._prune_provider_trash(data)
             return True, f"Saved to {self.path}"
         except OSError as e:
             return False, f"Save error: {e}"
+
+    def _prune_provider_trash(self, data: dict):
+        """Drop trash entries for providers present in the just-saved file
+        (restored, or re-added). Best-effort: never changes the save result."""
+        present = section(data, "provider").keys()
+        if not present:
+            return
+        try:
+            ProviderTrashStore().prune(self.path, present)
+        except Exception:
+            pass
 
     def export(self, path: Path) -> Tuple[bool, str]:
         """Export config to specified path"""
         try:
             content = json.dumps(self.data, indent=2, ensure_ascii=False) + "\n"
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+            atomic_write_json(path, content)
             return True, f"Exported to {path}"
         except OSError as e:
             return False, f"Export error: {e}"
@@ -262,9 +307,10 @@ class Validator:
 
     def __init__(self):
         self.schemas = {}  # kind -> schema dict
-        self.schema_error = None
-        self.last_schema_fetch = 0
+        self.last_schema_fetch = {}  # kind -> timestamp of last successful load
         self.schema_cache_duration = 86400  # 24 hours
+        self.schema_errors = {}  # kind -> error message
+        self.last_fetch_attempt = {}  # kind -> timestamp of last fetch attempt
 
     def _schema_source(self, kind: str) -> Tuple[str, Path]:
         """Return (url, cache_path) for the given config kind."""
@@ -286,43 +332,65 @@ class Validator:
             return None
 
         current_time = time.time()
-        if self.schemas.get(kind) is not None and (current_time - self.last_schema_fetch) < self.schema_cache_duration:
+        # Per-kind timestamps: a failed tui fetch must not suppress a valid
+        # cached opencode schema, and vice versa.
+        last_ok = self.last_schema_fetch.get(kind, 0)
+        last_try = self.last_fetch_attempt.get(kind, 0)
+
+        if self.schemas.get(kind) is not None and (current_time - last_ok) < self.schema_cache_duration:
             return self.schemas[kind]
 
-        if self.schema_error is not None and (current_time - self.last_schema_fetch) < 3600:  # 1 hour
-            return None
-
-        data = None
+        # Try the on-disk cache. It is always usable; it is only *authoritative*
+        # while fresh, so a stale cache still keeps validating when a fetch fails.
+        cached = None
         try:
-            # Try cache first
             if cache_path.exists():
-                data = json.loads(cache_path.read_text())
-                self.schemas[kind] = data
-                self.last_schema_fetch = current_time
-                return data
+                cached = json.loads(cache_path.read_text())
+                if not (isinstance(cached, dict) and cached):
+                    cached = None
         except Exception:
-            pass
+            cached = None
+
+        # Avoid hammering a failed endpoint, but keep serving the last valid
+        # disk cache during the backoff window.
+        if self.schema_errors.get(kind) and (current_time - last_try) < 3600:
+            return cached
+
+        if cached is not None and (current_time - cache_path.stat().st_mtime) < self.schema_cache_duration:
+            self.schemas[kind] = cached
+            self.last_schema_fetch[kind] = current_time
+            self.schema_errors.pop(kind, None)
+            return cached
 
         # Fetch from network
         try:
             req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
             with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read().decode("utf-8"))
+                fetched = json.loads(r.read().decode("utf-8"))
+
+            # Accept both ordinary object schemas and the real opencode schema,
+            # whose root delegates through $ref/$defs and has no root `type`.
+            is_schema = (isinstance(fetched, dict) and bool(fetched) and
+                         (fetched.get("type") == "object" or "$ref" in fetched or "$defs" in fetched))
+            if not is_schema:
+                raise ValueError("response is not a JSON Schema object")
 
             # Save to cache
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
-                cache_path.write_text(json.dumps(data))
+                cache_path.write_text(json.dumps(fetched))
             except OSError:
                 pass
 
-            self.schemas[kind] = data
-            self.last_schema_fetch = current_time
-            return data
+            self.schemas[kind] = fetched
+            self.last_schema_fetch[kind] = current_time
+            self.schema_errors.pop(kind, None)
+            return fetched
         except Exception as e:
-            self.schema_error = f"Could not fetch schema: {e}"
-            self.last_schema_fetch = current_time
-            return None
+            self.schema_errors[kind] = f"Could not fetch schema: {e}"
+            self.last_fetch_attempt[kind] = current_time
+            # Keep serving the last good schema rather than dropping validation.
+            return cached
 
     def validate(self, data: dict, kind: str, known_keys: set = None) -> Tuple[bool, List[str], List[str]]:
         """Validate config.
@@ -367,6 +435,8 @@ class Validator:
 
         if "mcp" in data and not isinstance(data["mcp"], dict):
             errors.append("'mcp' must be an object.")
+            # Non-dict 'mcp' is already a hard error; iterating it would raise.
+            return False, errors
 
         if "plugin" in data and not isinstance(data["plugin"], list):
             errors.append("'plugin' must be an array.")
@@ -396,6 +466,46 @@ def _path_of(e) -> str:
     except Exception:
         return "?"
 
+
+def _merge_legacy_plugin_state(new_path: Path, legacy_name: str) -> None:
+    """Fold the v4.4.0 ~/.cache plugin-state file into the current store.
+
+    Entries already present in `new_path` win. The legacy file is renamed to
+    `<name>.migrated` (never deleted) so the merge is idempotent and a failure
+    leaves the original data in place. Best-effort: never raises.
+    """
+    legacy = Path.home() / ".cache" / APP_NAME / legacy_name
+    try:
+        if not legacy.is_file():
+            return
+        old = loads_jsonc(legacy.read_text(encoding="utf-8"))
+        current = (loads_jsonc(new_path.read_text(encoding="utf-8"))
+                   if new_path.is_file() else {})
+        if not isinstance(old, dict) or not isinstance(current, dict):
+            return
+        merged = dict(current)
+        changed = False
+        for cfg_path, bucket in old.items():
+            if not isinstance(bucket, dict):
+                continue
+            target = merged.get(cfg_path)
+            if not isinstance(target, dict):
+                merged[cfg_path] = dict(bucket)
+                changed = True
+                continue
+            for name, entry in bucket.items():
+                if name not in target:
+                    target[name] = entry
+                    changed = True
+        if changed:
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                new_path, json.dumps(merged, indent=2, ensure_ascii=False) + "\n")
+        legacy.replace(legacy.with_name(legacy.name + ".migrated"))
+    except Exception:
+        pass
+
+
 class PluginStateStore:
     """Remember disabled opencode plugins in the editor cache, keying each by name and
     storing its full entry so re-enabling restores tuple-form options verbatim."""
@@ -403,6 +513,7 @@ class PluginStateStore:
     def __init__(self):
         self.path = PLUGIN_STATE_CACHE
         self._data = {}
+        _merge_legacy_plugin_state(self.path, "plugin-state.json")
         self._load()
 
     def _load(self):
@@ -490,6 +601,81 @@ class PluginStateStore:
             self._data[key] = d
         self._save()
 
+class ProviderTrashStore:
+    """Soft-deleted providers, kept in the editor's own app-data dir instead of
+    the agent config: {str(config_path): {provider_key: entry}}.
+
+    Unlike PluginStateStore this file is the ONLY copy of deleted provider data
+    (API keys included), so: it is re-read on every operation (two windows
+    never clobber each other), written atomically via mkstemp (mode 0600), and
+    write errors raise OSError. An unreadable/invalid file reads as empty but
+    every mutation raises and leaves it untouched; it is never overwritten.
+    """
+
+    def __init__(self, path=None):
+        self.path = Path(path) if path else PROVIDER_TRASH_FILE
+
+    def _read(self) -> dict:
+        """Whole store; {} when absent. Raises OSError when unreadable/invalid."""
+        try:
+            raw = self.path.read_bytes()
+        except FileNotFoundError:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError as e:     # JSONDecodeError / UnicodeDecodeError
+            raise OSError(f"Invalid trash file {self.path}: {e}") from e
+        if not isinstance(data, dict):
+            raise OSError(f"Invalid trash file {self.path}: root is not a JSON object")
+        return data
+
+    def _write(self, data: dict):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(self.path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+    def entries(self, cfg_path) -> dict:
+        """Deep copy of {key: entry} for one config file ({} on any read problem)."""
+        try:
+            bucket = self._read().get(str(cfg_path))
+        except OSError:
+            return {}
+        return copy.deepcopy(bucket) if isinstance(bucket, dict) else {}
+
+    def put(self, cfg_path, key: str, entry):
+        data = self._read()
+        bucket = data.setdefault(str(cfg_path), {})
+        if not isinstance(bucket, dict):
+            raise OSError(f"Invalid trash file {self.path}: entry for {cfg_path} is not an object")
+        bucket[key] = entry
+        self._write(data)
+
+    def discard(self, cfg_path, key: str):
+        data = self._read()
+        bucket = data.get(str(cfg_path))
+        if not isinstance(bucket, dict) or key not in bucket:
+            return
+        del bucket[key]
+        if not bucket:
+            del data[str(cfg_path)]
+        self._write(data)
+
+    def prune(self, cfg_path, present_keys) -> int:
+        """Drop entries whose key is in `present_keys`; write only on change."""
+        data = self._read()
+        bucket = data.get(str(cfg_path))
+        if not isinstance(bucket, dict):
+            return 0
+        present = set(present_keys)
+        stale = [k for k in bucket if k in present]
+        if not stale:
+            return 0
+        for k in stale:
+            del bucket[k]
+        if not bucket:
+            del data[str(cfg_path)]
+        self._write(data)
+        return len(stale)
+
 class TuiPluginStateStore:
     """Remember disabled tui plugins in the editor cache, keying each by name and
     storing its full entry so re-enabling restores tuple-form options verbatim."""
@@ -497,6 +683,7 @@ class TuiPluginStateStore:
     def __init__(self):
         self.path = USER_CONFIG_DIR / "tui-plugin-state.json"
         self._data = {}
+        _merge_legacy_plugin_state(self.path, "tui-plugin-state.json")
         self._load()
 
     def _load(self):

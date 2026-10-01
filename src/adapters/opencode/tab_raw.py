@@ -54,7 +54,36 @@ class RawJsonTab(QWidget):
     def _modified(self, val):
         self.__modified = val
 
+    def _commit_pending(self):
+        """Parse the editor text into the config it belongs to before switching
+        away, so a raw edit is not silently thrown away (OC-16)."""
+        if not self._modified:
+            return True
+        kind = self.app._raw_kind
+        text = self.editor.toPlainText()
+        if not text.strip():
+            return True
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(
+                self, "Raw JSON", f"Invalid JSON, keeping the previous values:\n\n{e}")
+            return False
+        cfg = self.app.cfg_tui if kind == "tui" else self.app.cfg_oc
+        if cfg is None or not isinstance(parsed, dict):
+            return True
+        cfg.data.clear()
+        cfg.data.update(parsed)
+        return True
+
     def _switch_file(self):
+        prev = self.app._raw_kind
+        if prev != self.file_combo.currentData() and not self._commit_pending():
+            # the text belongs to the previous file: put the combo back
+            self.file_combo.blockSignals(True)
+            self.file_combo.setCurrentIndex(max(0, self.file_combo.findData(prev)))
+            self.file_combo.blockSignals(False)
+            return
         self.app._raw_kind = self.file_combo.currentData()
         self.refresh()
 

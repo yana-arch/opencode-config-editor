@@ -1,14 +1,8 @@
 # Universal Cross-Config Converter GUI Dialog
 # ---------------------------------------------------------------------------
-import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QComboBox, QCheckBox, QTextEdit, QGroupBox, QSplitter,
-    QFileDialog, QMessageBox, QTabWidget, QWidget, QApplication
-)
+
+
+_OMP_COMPONENTS = ("providers", "mcp_servers", "plugins", "permissions", "prompts", "settings")
 
 
 class CrossConfigConverterDialog(QDialog):
@@ -20,6 +14,8 @@ class CrossConfigConverterDialog(QDialog):
         self.setMinimumSize(920, 620)
         self.app_context = app_context
         self.source_data: Dict[str, Any] = {}
+        self.source_valid = False
+        self.unmapped_keys: List[str] = []
         self.converted_data: Dict[str, Any] = {}
 
         layout = QVBoxLayout(self)
@@ -109,6 +105,11 @@ class CrossConfigConverterDialog(QDialog):
         self.out_editor = QTextEdit()
         self.out_editor.setReadOnly(True)
         out_lay.addWidget(self.out_editor)
+        self.unmapped_label = QLabel("")
+        self.unmapped_label.setWordWrap(True)
+        self.unmapped_label.setStyleSheet("color: #b26a00;")
+        self.unmapped_label.setVisible(False)
+        out_lay.addWidget(self.unmapped_label)
 
         out_btns = QHBoxLayout()
         copy_btn = QPushButton("📋 Copy Result")
@@ -153,14 +154,19 @@ class CrossConfigConverterDialog(QDialog):
             else:
                 self.src_editor.setPlainText("{\n  \"provider\": {}\n}")
         elif src_type == "active_openclaude":
-            if self.app_context and hasattr(self.app_context, "cf"):
-                # Layered config file
-                cf = self.app_context.cf
-                combined = {
-                    "settings": cf.effective(),
-                    "global": cf.global_data,
-                    "project_mcp": cf.project_mcp,
-                }
+            layered = getattr(self.app_context, "oc_layered", None) if self.app_context else None
+            if layered is not None:
+                combined = dict(layered.global_data or {})
+                for key, val in (layered.effective() or {}).items():
+                    combined.setdefault(key, val)
+                # .mcp.json holds {"mcpServers": {...}}; merge just the servers,
+                # or they end up double-nested under mcpServers.mcpServers.
+                project_servers = (layered.project_mcp or {}).get("mcpServers")
+                if isinstance(project_servers, dict) and project_servers:
+                    existing = combined.get("mcpServers")
+                    combined["mcpServers"] = (
+                        {**existing, **project_servers} if isinstance(existing, dict) else dict(project_servers)
+                    )
                 self.src_editor.setPlainText(json.dumps(combined, indent=2, ensure_ascii=False))
             else:
                 self.src_editor.setPlainText("{\n  \"mcpServers\": {}\n}")
@@ -187,20 +193,38 @@ class CrossConfigConverterDialog(QDialog):
         text = self.src_editor.toPlainText().strip()
         if not text:
             self.source_data = {}
+            self.converted_data = {}
+            self.source_valid = False
             self.out_editor.clear()
             return
         try:
-            self.source_data = loads_jsonc(text)
-            self._run_conversion()
+            data = loads_jsonc(text)
         except Exception:
+            self.source_valid = False
+            self.source_data = {}
+            self.converted_data = {}
             self.out_editor.setPlainText("// Invalid JSON input in source editor")
+            return
+        if not isinstance(data, dict):
+            self.source_valid = False
+            self.source_data = {}
+            self.converted_data = {}
+            self.out_editor.setPlainText("// Source JSON must be an object")
+            return
+        self.source_valid = True
+        self.source_data = data
+        self._run_conversion()
 
     def _get_selected_components(self) -> List[str]:
         return [k for k, chk in self.comp_checks.items() if chk.isChecked()]
 
     def _run_conversion(self):
         if not self.source_data:
+            self.converted_data = {}
+            self.unmapped_keys = []
             self.out_editor.clear()
+            self.unmapped_label.setText("")
+            self.unmapped_label.setVisible(False)
             return
 
         target_fmt = self.tgt_format_combo.currentData()
@@ -222,6 +246,8 @@ class CrossConfigConverterDialog(QDialog):
 
         # 2. Convert OMP bundle to target format
         if target_fmt == "omp":
+            # OMP is the intermediate format itself: honour the component filter
+            omp_bundle = {k: v for k, v in omp_bundle.items() if k not in _OMP_COMPONENTS or k in comps}
             self.converted_data = omp_bundle
         elif target_fmt == "claude_desktop":
             mcp_data = import_from_omp(omp_bundle, "openclaude_global", comps)
@@ -229,7 +255,28 @@ class CrossConfigConverterDialog(QDialog):
         else:
             self.converted_data = import_from_omp(omp_bundle, target_fmt, comps)
 
+        self.unmapped_keys = self._find_unmapped_keys(src_fmt)
+        if self.unmapped_keys:
+            self.unmapped_label.setText(
+                "Not transferred (no mapping for this target): " + ", ".join(self.unmapped_keys)
+            )
+            self.unmapped_label.setVisible(True)
+        else:
+            self.unmapped_label.setText("")
+            self.unmapped_label.setVisible(False)
         self.out_editor.setPlainText(json.dumps(self.converted_data, indent=2, ensure_ascii=False))
+
+    def _find_unmapped_keys(self, src_fmt: str) -> List[str]:
+        """Top-level source keys the conversion has no mapping for."""
+        handled = {
+            "opencode": {"provider", "mcp", "plugin", "permission", "instructions", "tui"},
+            "openclaude_global": {"mcpServers", "providerProfiles"},
+            "openclaude_settings": {"permissions", "env"},
+            "claude_desktop": {"mcpServers"},
+        }.get(src_fmt, set())
+        if src_fmt == "omp":
+            handled = set(_OMP_COMPONENTS)
+        return sorted(str(k) for k in self.source_data if str(k) not in handled)
 
     def _copy_result(self):
         text = self.out_editor.toPlainText()
@@ -238,6 +285,9 @@ class CrossConfigConverterDialog(QDialog):
             QMessageBox.information(self, "Copied", "Converted configuration copied to clipboard.")
 
     def _save_to_file(self):
+        if not self.source_valid or not self.converted_data:
+            QMessageBox.warning(self, "No Data", "Nothing to save: fix the source JSON first.")
+            return
         target_fmt = self.tgt_format_combo.currentData()
         default_name = f"{target_fmt}-config.json"
         path, _ = QFileDialog.getSaveFileName(
@@ -246,13 +296,24 @@ class CrossConfigConverterDialog(QDialog):
         )
         if not path:
             return
+        target = Path(path)
         try:
-            Path(path).write_text(self.out_editor.toPlainText(), encoding="utf-8")
+            payload = json.loads(json.dumps(self.converted_data))
+            # Merge into an existing file so unrelated keys (app state, other
+            # sections) survive; only keys the conversion produced are written.
+            if target.is_file():
+                existing = loads_jsonc(target.read_text(encoding="utf-8"))
+                if isinstance(existing, dict):
+                    payload = deep_merge(existing, copy.deepcopy(payload))
+            atomic_write_json(target, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
             QMessageBox.information(self, "Saved", f"Exported successfully to {path}")
         except Exception as e:
             QMessageBox.warning(self, "Save Error", f"Failed to save file: {e}")
 
     def _apply_to_active(self):
+        if not self.source_valid:
+            QMessageBox.warning(self, "No Data", "Fix the source JSON before applying.")
+            return
         if not self.converted_data:
             QMessageBox.warning(self, "No Data", "No converted data to apply.")
             return
@@ -260,43 +321,61 @@ class CrossConfigConverterDialog(QDialog):
         if not self.app_context:
             QMessageBox.warning(self, "Error", "No active editor instance found.")
             return
-
         target_fmt = self.tgt_format_combo.currentData()
+
+        # Apply merges into in-memory data (or writes straight to disk for OpenClaude) and
+        # then reloads the tabs. Any pending form/Raw edit lives only in the tab widgets
+        # until Save, so refresh would silently drop it. Settle those edits first.
+        if target_fmt == "opencode":
+            unsaved = (
+                bool(getattr(self.app_context, "dirty_oc", False))
+                or bool(getattr(self.app_context, "dirty_tui", False))
+                or bool(getattr(getattr(self.app_context, "tab_raw", None), "_modified", False))
+            )
+        else:
+            unsaved = (
+                bool(getattr(self.app_context, "oc_form_dirty", False))
+                or bool(getattr(getattr(self.app_context, "_agent_raw_tab", None), "_modified", False))
+            )
+        if unsaved:
+            action = _confirm_unsaved(self.app_context, "apply the converted configuration")
+            if action == "cancel":
+                return
+            if action == "save":
+                self.app_context._save()
 
         if target_fmt == "opencode" and getattr(self.app_context, "cfg", None):
             if not _confirm(self, "Apply Config", "Merge converted settings into current OpenCode configuration?"):
                 return
-            self.app_context.snapshot_state()
-            for k, v in self.converted_data.items():
-                if isinstance(v, dict) and isinstance(self.app_context.cfg.data.get(k), dict):
-                    self.app_context.cfg.data[k].update(v)
-                else:
-                    self.app_context.cfg.data[k] = v
-            self.app_context.mark_dirty()
-            if hasattr(self.app_context, "refresh_all_tabs"):
-                self.app_context.refresh_all_tabs()
+            self.app_context.snapshot_state("opencode")
+            self.app_context.cfg.data = deep_merge(
+                self.app_context.cfg.data, copy.deepcopy(self.converted_data)
+            )
+            self.app_context.mark_dirty("opencode")
+            self.app_context.refresh_tabs()
             QMessageBox.information(self, "Success", "Applied converted settings to OpenCode configuration.")
             self.accept()
 
-        elif "openclaude" in target_fmt and hasattr(self.app_context, "cf"):
+        elif "openclaude" in target_fmt:
+            layered = getattr(self.app_context, "oc_layered", None)
+            if layered is None:
+                QMessageBox.information(
+                    self, "Format Mismatch",
+                    f"Please export to file or copy result to use with {target_fmt}.",
+                )
+                return
             if not _confirm(self, "Apply Config", "Apply converted settings into current OpenClaude configuration?"):
                 return
-            cf = self.app_context.cf
             if target_fmt == "openclaude_global":
-                for k, v in self.converted_data.items():
-                    if isinstance(v, dict) and isinstance(cf.global_data.get(k), dict):
-                        cf.global_data[k].update(v)
-                    else:
-                        cf.global_data[k] = v
-                cf.save_global(cf.global_data)
-            elif target_fmt == "openclaude_settings":
-                user_layer = cf.layers.get("user", {})
-                for k, v in self.converted_data.items():
-                    if isinstance(v, dict) and isinstance(user_layer.get(k), dict):
-                        user_layer[k].update(v)
-                    else:
-                        user_layer[k] = v
-                cf.save_layer("user", user_layer)
+                merged = deep_merge(dict(layered.global_data or {}), copy.deepcopy(self.converted_data))
+                ok, msg = layered.save_global(merged)
+            else:
+                merged = deep_merge(dict(layered.layer("user") or {}), copy.deepcopy(self.converted_data))
+                ok, msg = layered.save_layer("user", merged)
+            if not ok:
+                QMessageBox.warning(self, "Save Error", msg)
+                return
+            self.app_context.refresh_tabs()
             QMessageBox.information(self, "Success", "Applied converted settings to OpenClaude configuration.")
             self.accept()
         else:

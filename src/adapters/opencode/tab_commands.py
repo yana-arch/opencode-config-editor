@@ -59,8 +59,8 @@ class CommandsTab(QWidget):
             top.addWidget(b)
         lay.addLayout(top)
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Name", "Description", "Agent", "Model"])
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Name", "Description", "Agent", "Model", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         lay.addWidget(self.table)
@@ -112,14 +112,22 @@ class CommandsTab(QWidget):
 
     def _add(self):
         dlg = CommandEditDialog(self)
-        if dlg.exec() and dlg.values()["name"] and dlg.values()["template"]:
-            v = dlg.values()
-            name = v.pop("name")
-            self.app.snapshot_state()
-            commands = self.app.cfg.data.setdefault("command", {})
-            commands[name] = {k: val for k, val in v.items() if val not in (None, "")}
-            self.app.mark_dirty()
-            self.refresh()
+        if not dlg.exec():
+            return
+        v = dlg.values()
+        name = v.pop("name")
+        if not name or not v.get("template"):
+            return
+        if name in self._commands():
+            QMessageBox.information(
+                self, "Command", f"A command named '{name}' already exists.\n"
+                "Use Edit to change it.")
+            return
+        self.app.snapshot_state()
+        commands = self.app.cfg.data.setdefault("command", {})
+        commands[name] = {k: val for k, val in v.items() if val not in (None, "")}
+        self.app.mark_dirty()
+        self.refresh()
 
     def _edit(self, name=None):
         if name is None:
@@ -128,17 +136,24 @@ class CommandsTab(QWidget):
                 return
         cfg = dict(self._commands().get(name, {}))
         dlg = CommandEditDialog(self, name=name, cfg=cfg)
-        if dlg.exec() and dlg.values()["template"]:
-            v = dlg.values()
-            newname = v.pop("name") or name
-            self.app.snapshot_state()
-            commands = self.app.cfg.data.setdefault("command", {})
-            merged = {k: val for k, val in v.items() if val not in (None, "")}
-            if newname != name:
-                commands.pop(name, None)
-            commands[newname] = merged
-            self.app.mark_dirty()
-            self.refresh()
+        if not dlg.exec():
+            return
+        v = dlg.values()
+        if not v.get("template"):
+            return
+        newname = v.pop("name") or name
+        if newname != name and newname in self._commands():
+            QMessageBox.information(
+                self, "Command", f"A command named '{newname}' already exists.")
+            return
+        self.app.snapshot_state()
+        commands = self.app.cfg.data.setdefault("command", {})
+        merged = {k: val for k, val in v.items() if val not in (None, "")}
+        if newname != name:
+            commands.pop(name, None)
+        commands[newname] = merged
+        self.app.mark_dirty()
+        self.refresh()
 
     def _remove(self, name=None):
         if name is None:
